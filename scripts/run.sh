@@ -1,6 +1,8 @@
-# export OPENAI_API_KEY=""
+# export P2C_PROVIDER="codex"  # or "claude"
+# export P2C_CODEX_CMD="codex exec"
+# export P2C_CLAUDE_CMD="claude -p"
 
-GPT_VERSION="o3-mini"
+MODEL_NAME="codex"
 
 PAPER_NAME="Transformer"
 PDF_PATH="../examples/Transformer.pdf" # .pdf
@@ -25,7 +27,7 @@ echo "------- PaperCoder -------"
 
 python ../codes/1_planning.py \
     --paper_name $PAPER_NAME \
-    --gpt_version ${GPT_VERSION} \
+    --gpt_version ${MODEL_NAME} \
     --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR}
 
@@ -38,13 +40,13 @@ cp -rp ${OUTPUT_DIR}/planning_config.yaml ${OUTPUT_REPO_DIR}/config.yaml
 
 python ../codes/2_analyzing.py \
     --paper_name $PAPER_NAME \
-    --gpt_version ${GPT_VERSION} \
+    --gpt_version ${MODEL_NAME} \
     --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR}
 
 python ../codes/3_coding.py  \
     --paper_name $PAPER_NAME \
-    --gpt_version ${GPT_VERSION} \
+    --gpt_version ${MODEL_NAME} \
     --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --output_repo_dir ${OUTPUT_REPO_DIR} \

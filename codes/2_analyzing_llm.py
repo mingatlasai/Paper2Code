@@ -212,16 +212,17 @@ for todo_file_name in tqdm(todo_file_lst):
     trajectories.append({'role': 'assistant', 'content': completion})
 
 
+    save_todo_file_name = todo_file_name.replace("/", "_")
+
     # save
-    with open(f'{artifact_output_dir}/{todo_file_name}_simple_analysis.txt', 'w', encoding='utf-8') as f:
+    with open(f'{artifact_output_dir}/{save_todo_file_name}_simple_analysis.txt', 'w', encoding='utf-8') as f:
         f.write(completion)
 
     done_file_lst.append(todo_file_name)
 
     # save for next stage(coding)
-    todo_file_name = todo_file_name.replace("/", "_") 
-    with open(f'{output_dir}/{todo_file_name}_simple_analysis_response.json', 'w', encoding='utf-8') as f:
+    with open(f'{output_dir}/{save_todo_file_name}_simple_analysis_response.json', 'w', encoding='utf-8') as f:
         json.dump(responses, f)
 
-    with open(f'{output_dir}/{todo_file_name}_simple_analysis_trajectories.json', 'w', encoding='utf-8') as f:
+    with open(f'{output_dir}/{save_todo_file_name}_simple_analysis_trajectories.json', 'w', encoding='utf-8') as f:
         json.dump(trajectories, f)

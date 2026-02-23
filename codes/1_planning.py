@@ -1,10 +1,10 @@
-from openai import OpenAI
 import json
 from tqdm import tqdm
 import argparse
 import os
 import sys
-from utils import print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from llm_backend import chat
+from utils import print_response
 
 parser = argparse.ArgumentParser()
 
@@ -16,8 +16,6 @@ parser.add_argument('--pdf_latex_path', type=str) # latex format
 parser.add_argument('--output_dir',type=str, default="")
 
 args    = parser.parse_args()
-
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 paper_name = args.paper_name
 gpt_version = args.gpt_version
@@ -214,23 +212,10 @@ training:
     }]
 
 def api_call(msg, gpt_version):
-    if "o3-mini" in gpt_version:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            reasoning_effort="high",
-            messages=msg
-        )
-    else:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            messages=msg
-        )
-
-    return completion 
+    return chat(msg, gpt_version)
 
 responses = []
 trajectories = []
-total_accumulated_cost = 0
 
 for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, config_msg]):
     current_stage = ""
@@ -247,14 +232,9 @@ for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, c
     trajectories.extend(instruction_msg)
 
     completion = api_call(trajectories, gpt_version)
-    
-    # response
     completion_json = json.loads(completion.model_dump_json())
 
-    # print and logging
     print_response(completion_json)
-    temp_total_accumulated_cost = print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost)
-    total_accumulated_cost = temp_total_accumulated_cost
 
     responses.append(completion_json)
 
@@ -262,9 +242,6 @@ for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, c
     message = completion.choices[0].message
     trajectories.append({'role': message.role, 'content': message.content})
 
-
-# save
-save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)
 
 os.makedirs(output_dir, exist_ok=True)
 

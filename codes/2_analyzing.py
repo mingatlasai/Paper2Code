@@ -1,9 +1,9 @@
-from openai import OpenAI
 import json
 import os
 from tqdm import tqdm
 import sys
-from utils import extract_planning, content_to_json, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from llm_backend import chat
+from utils import extract_planning, content_to_json, print_response
 import copy
 
 import argparse
@@ -18,8 +18,6 @@ parser.add_argument('--pdf_latex_path', type=str) # latex format
 parser.add_argument('--output_dir',type=str, default="")
 
 args    = parser.parse_args()
-
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 paper_name = args.paper_name
 gpt_version = args.gpt_version
@@ -136,24 +134,12 @@ You DON'T need to provide the actual code yet; focus on a thorough, clear analys
 
 
 def api_call(msg):
-    if "o3-mini" in gpt_version:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            reasoning_effort="high",
-            messages=msg
-        )
-    else:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            messages=msg
-        )
-    return completion
+    return chat(msg, gpt_version)
 
 
 artifact_output_dir=f'{output_dir}/analyzing_artifacts'
 os.makedirs(artifact_output_dir, exist_ok=True)
 
-total_accumulated_cost = load_accumulated_cost(f"{output_dir}/accumulated_cost.json")
 for todo_file_name in tqdm(todo_file_lst):
     responses = []
     trajectories = copy.deepcopy(analysis_msg)
@@ -171,8 +157,6 @@ for todo_file_name in tqdm(todo_file_lst):
     trajectories.extend(instruction_msg)
         
     completion = api_call(trajectories)
-    
-    # response
     completion_json = json.loads(completion.model_dump_json())
     responses.append(completion_json)
     
@@ -180,24 +164,20 @@ for todo_file_name in tqdm(todo_file_lst):
     message = completion.choices[0].message
     trajectories.append({'role': message.role, 'content': message.content})
 
-    # print and logging
     print_response(completion_json)
-    temp_total_accumulated_cost = print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost)
-    total_accumulated_cost = temp_total_accumulated_cost
+
+    save_todo_file_name = todo_file_name.replace("/", "_")
 
     # save
-    with open(f'{artifact_output_dir}/{todo_file_name}_simple_analysis.txt', 'w') as f:
+    with open(f'{artifact_output_dir}/{save_todo_file_name}_simple_analysis.txt', 'w') as f:
         f.write(completion_json['choices'][0]['message']['content'])
 
 
     done_file_lst.append(todo_file_name)
 
     # save for next stage(coding)
-    todo_file_name = todo_file_name.replace("/", "_") 
-    with open(f'{output_dir}/{todo_file_name}_simple_analysis_response.json', 'w') as f:
+    with open(f'{output_dir}/{save_todo_file_name}_simple_analysis_response.json', 'w') as f:
         json.dump(responses, f)
 
-    with open(f'{output_dir}/{todo_file_name}_simple_analysis_trajectories.json', 'w') as f:
+    with open(f'{output_dir}/{save_todo_file_name}_simple_analysis_trajectories.json', 'w') as f:
         json.dump(trajectories, f)
-
-save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)

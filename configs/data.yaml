@@ -1,0 +1,311 @@
+# Data logic analysis for THREADS reproduction.
+# Purpose: declare dataset roots, cohort registry, split strategy, task definitions,
+# canonical keys, and cache paths used by MetadataStore, Splitter, and evaluators.
+# Constraint: values are restricted to paper text + provided config.yaml.
+
+data:
+  version: "1.0"
+  reproduction_scope:
+    default_tier: "Tier B public-only high-fidelity"
+    supported_tiers:
+      - "Tier B public-only high-fidelity (TCGA/GTEx pretraining + public downstream cohorts)"
+      - "Tier C evaluation-first with existing embeddings"
+    not_reproducible_without_private_data:
+      - "Tier A full MBTG-47K (requires private MGH/BWH paired data)"
+
+  ids:
+    canonical_keys:
+      slide_id: "stable unique WSI identifier"
+      patient_id: "stable unique patient identifier"
+      task_id: "stable unique task identifier"
+      cohort_id: "stable unique cohort identifier"
+      split_id: "stable unique split identifier"
+    required_constraints:
+      - "slide_id maps to exactly one cohort_id"
+      - "patient_id may map to one or more slide_id"
+      - "task labels are indexed by task_id + (slide_id or patient_id based on unit)"
+      - "all persisted artifacts must preserve canonical ids unchanged"
+
+  paths:
+    roots:
+      raw_root: "data/raw"
+      interim_root: "data/interim"
+      processed_root: "data/processed"
+      external_root: "data/external"
+    tables:
+      slides: "data/processed/metadata/slides.parquet"
+      molecular: "data/processed/metadata/molecular.parquet"
+      labels_root: "data/processed/labels"
+      splits_root: "data/processed/splits"
+    caches:
+      tissue_masks_root: "data/processed/preprocess/tissue_masks"
+      tiles_root: "data/processed/preprocess/tiles"
+      feature_cache_root: "data/processed/features"
+      embedding_cache_root: "data/processed/embeddings"
+    run_artifacts_root: "outputs/runs"
+
+  preprocessing_contract:
+    # Mirrors config.yaml to keep MetadataStore/Splitter/eval assumptions consistent.
+    tissue_segmentation:
+      method: "FPN (segmentation-models-pytorch, fine-tuned in-house)"
+      checkpoint: null
+      fallback_policy: "allow deterministic classical fallback when checkpoint is unavailable"
+    tiling:
+      tile_size: 512
+      overlap: 0
+      magnification: "20x"
+      microns_per_pixel: 0.5
+      tissue_only: true
+    conch_input:
+      resize_to: 448
+      normalization: "ImageNet mean/std"
+
+  pretraining:
+    target_dataset:
+      name: "MBTG-47K"
+      total_pairs: 47171
+      sources:
+        - source_id: "MGH"
+          availability: "private"
+          pairs: 6899
+          molecular_type: "RNA"
+        - source_id: "BWH"
+          availability: "private"
+          pairs: 20556
+          molecular_type: "DNA panel variants"
+        - source_id: "TCGA"
+          availability: "public"
+          pairs: 10209
+          molecular_type: "RNA"
+        - source_id: "GTEx"
+          availability: "public"
+          pairs: 9507
+          molecular_type: "RNA"
+    public_reproduction_subset:
+      enabled: true
+      sources: ["TCGA", "GTEx"]
+
+  molecular_schema:
+    rna:
+      encoding_backbone: "scGPT (pancancer checkpoint)"
+      preprocess_policy:
+        expression_unit: "TPM"
+        transform: "log2(TPM)"
+        batch_effect_normalization: "none"
+      source_specific_gene_sets:
+        MGH:
+          genes_used: 54
+          availability: "private"
+        TCGA:
+          selected_genes_before_vocab_filter: 4917
+          genes_after_scgpt_vocab_filter: 4848
+        GTEx:
+          selected_genes_before_vocab_filter: 5000
+          genes_after_scgpt_vocab_filter: 4932
+    dna:
+      input_dim: 1673
+      definition:
+        genes: 239
+        per_gene_status_bins: 7
+      events:
+        cnv_categories: ["two_copy_deletion", "loss", "gain", "amplification"]
+        snv_indel_categories: ["small_coding_change", "large_coding_change", "non_coding_change"]
+
+  cohort_registry:
+    # Cohort-level registry used by MetadataStore and task builders.
+    pretraining_cohorts:
+      - cohort_id: "MBTG_MGH"
+        source: "MGH"
+        availability: "private"
+      - cohort_id: "MBTG_BWH"
+        source: "BWH"
+        availability: "private"
+      - cohort_id: "MBTG_TCGA"
+        source: "TCGA"
+        availability: "public"
+      - cohort_id: "MBTG_GTEX"
+        source: "GTEx"
+        availability: "public"
+
+    downstream_cohorts_public:
+      - "PANDA"
+      - "IMP"
+      - "BRACS"
+      - "EBRAINS"
+      - "BCNB"
+      - "MUT_HET_RCC"
+      - "CPTAC_BRCA"
+      - "CPTAC_CCRCC"
+      - "CPTAC_COAD"
+      - "CPTAC_GBM"
+      - "CPTAC_HNSC"
+      - "CPTAC_LSCC"
+      - "CPTAC_LUAD"
+      - "CPTAC_PDAC"
+      - "SURGEN"
+      - "MBC"
+      - "BOEHMK"
+      - "OV_BEVACIZUMAB"
+      - "NADT_PROSTATE"
+      - "POST_NAT_BRCA"
+      - "TCGA_GBMLGG"
+      - "TCGA_BRCA"
+      - "TCGA_LUNG"
+      - "TCGA_LUAD"
+      - "TCGA_PDAC"
+
+    downstream_cohorts_private:
+      - "MGB_BREAST"
+      - "MGB_LUNG"
+      - "GBM_TREATMENT_INTERNAL"
+
+  task_families:
+    # Family counts are paper-reported totals across full benchmark.
+    clinical_subtyping_and_grading:
+      n_tasks: 8
+      metric_by_type:
+        subtyping_multiclass: "balanced_accuracy"
+        grading_multiclass: "quadratic_weighted_kappa"
+        binary_subtyping_when_applicable: "auc_macro"
+    mutation_prediction:
+      n_tasks: 21
+      metric: "auc_macro"
+    ihc_status_prediction:
+      n_tasks: 12
+      metric: "auc_macro"
+    treatment_response_and_survival:
+      n_tasks: 13
+      metric_by_type:
+        classification: "auc_macro"
+        survival: "c_index"
+
+  task_registry_policy:
+    # Task definitions are materialized in labels tables referenced by task_id.
+    required_columns:
+      - "task_id"
+      - "cohort_id"
+      - "unit"          # slide_level | patient_level
+      - "task_type"     # classification | grading | survival | retrieval | prompting
+      - "target_name"
+      - "label_or_time"
+      - "event"         # survival only
+    unit_rules:
+      slide_level: "labels keyed by slide_id"
+      patient_level: "labels keyed by patient_id"
+    patient_level_embedding_rule: "union of patches from all WSIs per patient"
+
+  splits:
+    seed: 42
+    k_all:
+      official_splits_for: ["EBRAINS", "PANDA", "IMP"]
+      otherwise_policy: "5-fold CV (80:20) or 50 train-test splits depending on cohort size"
+      stratification: "label- and patient-stratified where applicable"
+      group_key: "patient_id"
+    few_shot:
+      enabled: true
+      k_values: [1, 2, 4, 8, 16, 32]
+      generation_policy:
+        multi_fold_tasks: "sample k per class from each training fold, keep test fold fixed"
+        single_fold_tasks: "bootstrap few-shot train samplings from single official fold"
+      omission_policy: "allow omission of k=32 when class counts are insufficient"
+    transferability:
+      enabled: true
+      train_on_full_source: true
+      test_on_full_target: true
+      test_bootstrap_replicates: 100
+
+  feature_cache:
+    backend: "hdf5_or_npz_with_parquet_index"
+    per_slide_record:
+      required_fields:
+        - "slide_id"
+        - "patient_id"
+        - "cohort_id"
+        - "extractor_id"      # conch_v1_5 | virchow | gigapath | ctranspath | resnet50_in
+        - "input_tile_size"
+        - "input_magnification"
+        - "feature_dim"
+        - "num_patches"
+        - "coords_path_or_inline"
+        - "features_path"
+        - "preprocess_signature"
+    expected_feature_dims:
+      conch_v1_5: 768
+      virchow: 2560
+      gigapath_patch: 1536
+      ctranspath: 768
+      resnet50_in: "implementation_defined"
+    io_requirements:
+      - "chunked read/write for memory safety"
+      - "deterministic ordering of patches and coordinates"
+      - "exist/read/write/delete by slide_id"
+
+  embedding_store:
+    output_dim: 1024
+    inference_policy:
+      use_all_patches: true
+      patient_level_strategy: "union of patches from all WSIs per patient"
+      precision: "bf16"
+    files:
+      slide_embeddings: "data/processed/embeddings/{run_id}/{split_id}/slide_embeddings.parquet"
+      patient_embeddings: "data/processed/embeddings/{run_id}/{split_id}/patient_embeddings.parquet"
+    required_columns:
+      - "entity_id"      # slide_id or patient_id
+      - "entity_type"    # slide | patient
+      - "task_id"
+      - "split_id"
+      - "embedding_dim"
+      - "embedding"
+
+  evaluator_data_contract:
+    linear_probe:
+      defaults:
+        C: 0.5
+        solver: "lbfgs"
+        max_iter: 10000
+        class_weight: "balanced"
+      input_requirements:
+        - "train/test embeddings joined with task labels via canonical ids"
+    survival_probe:
+      defaults:
+        model: "CoxNet"
+        max_iter: 10000
+        alpha_os: 0.07
+        alpha_pfs: 0.01
+        exceptions:
+          cptac_ccrcc_os_chief_alpha: 0.01
+          boehmk_pfs_prism_alpha: 0.02
+      input_requirements:
+        - "time and event columns present for all survival tasks"
+    retrieval:
+      distance: "L2"
+      top_k: [1, 5, 10]
+      metric: "mAP@k"
+    prompting:
+      classification: "nearest class molecular prototype by L2"
+      survival: "risk = dist(high-risk prompt) - dist(low-risk prompt)"
+
+  reporting_and_stats_contract:
+    multi_fold: "mean_and_standard_error"
+    single_fold: "95_percent_ci_via_nonparametric_bootstrap_100"
+    task_level_tests:
+      - "two_way_anova"
+      - "two_sided_tukey_hsd_adjusted"
+    across_tasks_tests:
+      - "mixed_effects_dataset_random_model_fixed"
+      - "pairwise_contrasts_tukey_adjusted"
+
+  quality_checks:
+    required_pre_run_assertions:
+      - "no patient leakage across train/test in any split"
+      - "task units match label keying (slide vs patient)"
+      - "embedding_dim equals 1024 for THREADS outputs"
+      - "tile extraction contract is 512 non-overlap at 20x tissue-only"
+      - "all random seeds logged with run metadata"
+      - "all outputs written under run_id-scoped artifact paths"
+
+  paper_ambiguities_exposed_as_config:
+    - "tissue segmentation checkpoint is unavailable (null)"
+    - "some pretraining hyperparameters are truncated in parsed source"
+    - "contrastive temperature is unspecified in provided config"
+    - "full private-data benchmark cannot be externally reproduced"

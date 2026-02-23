@@ -3,7 +3,7 @@ import json
 import sys
 import argparse
 
-from openai import OpenAI
+from llm_backend import chat
 
 try:
     from huggingface_hub import HfApi
@@ -26,14 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpt_version",
         type=str,
-        default="gpt-4.1-mini",
-        help="OpenAI chat model name used for name detection.",
+        default="codex",
+        help="Model label passed to the configured LLM backend.",
     )
     return parser.parse_args()
 
 
 args = parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 planning_config_path = os.path.join(
     args.output_dir, f"planning_config.yaml"
@@ -84,11 +83,7 @@ Detect the model name and dataset names in the configuration file so that they c
     },
 ]
 
-response = client.chat.completions.create(
-    model=args.gpt_version,
-    messages=messages,
-)
-
+response = chat(messages, args.gpt_version)
 answer = response.choices[0].message.content.strip()
 # print("Raw OpenAI answer:", answer)
 

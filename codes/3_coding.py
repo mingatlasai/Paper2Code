@@ -1,11 +1,11 @@
-from openai import OpenAI
 import json
 import os
 from tqdm import tqdm
 import re
 import sys
 import copy
-from utils import extract_planning, content_to_json, extract_code_from_content, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from llm_backend import chat
+from utils import extract_planning, content_to_json, extract_code_from_content, print_response
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -19,8 +19,6 @@ parser.add_argument('--output_dir',type=str, default="")
 parser.add_argument('--output_repo_dir',type=str, default="")
 
 args    = parser.parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
-
 paper_name = args.paper_name
 gpt_version = args.gpt_version
 paper_format = args.paper_format
@@ -134,18 +132,7 @@ Next, you must write only the "{todo_file_name}".
 
 
 def api_call(msg):
-    if "o3-mini" in gpt_version:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            reasoning_effort="high",
-            messages=msg
-        )
-    else:
-        completion = client.chat.completions.create(
-            model=gpt_version, 
-            messages=msg
-        )
-    return completion
+    return chat(msg, gpt_version)
     
 
 # testing for checking
@@ -165,7 +152,6 @@ for todo_file_name in todo_file_lst:
 artifact_output_dir=f'{output_dir}/coding_artifacts'
 os.makedirs(artifact_output_dir, exist_ok=True)
 
-total_accumulated_cost = load_accumulated_cost(f"{output_dir}/accumulated_cost.json")
 for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     responses = []
     trajectories = copy.deepcopy(code_msg)
@@ -180,9 +166,6 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     trajectories.extend(instruction_msg)
 
     completion = api_call(trajectories)
-    # print(completion.choices[0].message)
-    
-    # response
     completion_json = json.loads(completion.model_dump_json())
     responses.append(completion_json)
 
@@ -198,10 +181,7 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     save_todo_file_name = todo_file_name.replace("/", "_")
 
 
-    # print and logging
     print_response(completion_json)
-    temp_total_accumulated_cost = print_log_cost(completion_json, gpt_version, current_stage, output_dir, total_accumulated_cost)
-    total_accumulated_cost = temp_total_accumulated_cost
 
     # save artifacts
     with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w') as f:
@@ -211,7 +191,7 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     # extract code save 
     code = extract_code_from_content(message.content)
     if len(code) == 0:
-        code = message.content 
+        code = message.content
 
     done_file_dict[todo_file_name] = code
     if save_todo_file_name != todo_file_name:
@@ -220,5 +200,3 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
 
     with open(f"{output_repo_dir}/{todo_file_name}", 'w') as f:
         f.write(code)
-
-save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)

@@ -22,13 +22,13 @@ Our method outperforms strong baselines on both Paper2Code and PaperBench and pr
 ## ⚡ Quick Start
 - Note: The following command runs example paper ([Attention Is All You Need](https://arxiv.org/abs/1706.03762)).  
 
-### Using OpenAI API
-- 💵 Estimated cost for using o3-mini: $0.50–$0.70
+### Using Codex / Claude Code
+- Set `P2C_PROVIDER` to either `codex` or `claude`.
 
 ```bash
-pip install openai
-
-export OPENAI_API_KEY="<OPENAI_API_KEY>"
+export P2C_PROVIDER="codex"  # or "claude"
+export P2C_CODEX_CMD="codex exec"
+export P2C_CLAUDE_CMD="claude -p"
 
 cd scripts
 bash run.sh
@@ -60,15 +60,13 @@ outputs
 
 ### 🛠️ Environment Setup
 
-- 💡 To use the `o3-mini` version, make sure you have the latest `openai` package installed.
 - 📦 Install only what you need:
-  - For OpenAI API: `openai`
+  - For Codex / Claude Code CLI mode: no Python API key dependency is required.
   - For open-source models: `vllm`
       - If you encounter any issues installing vLLM, please refer to the [official vLLM repository](https://github.com/vllm-project/vllm).
 
 
 ```bash
-pip install openai 
 pip install vllm 
 ```
 
@@ -111,13 +109,14 @@ python ./s2orc-doc2json/doc2json/grobid2json/process_pdf.py \
 - Note: The following command runs example paper ([Attention Is All You Need](https://arxiv.org/abs/1706.03762)).  
   If you want to run PaperCoder on your own paper, please modify the environment variables accordingly.
 
-#### Using OpenAI API
-- 💵 Estimated cost for using o3-mini: $0.50–$0.70
+#### Using Codex / Claude Code
 
 
 ```bash
 # Using the PDF-based JSON format of the paper
-export OPENAI_API_KEY="<OPENAI_API_KEY>"
+export P2C_PROVIDER="codex"  # or "claude"
+export P2C_CODEX_CMD="codex exec"
+export P2C_CLAUDE_CMD="claude -p"
 
 cd scripts
 bash run.sh
@@ -125,7 +124,9 @@ bash run.sh
 
 ```bash
 # Using the LaTeX source of the paper
-export OPENAI_API_KEY="<OPENAI_API_KEY>"
+export P2C_PROVIDER="codex"  # or "claude"
+export P2C_CODEX_CMD="codex exec"
+export P2C_CLAUDE_CMD="claude -p"
 
 cd scripts
 bash run_latex.sh

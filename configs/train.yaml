@@ -1,0 +1,161 @@
+# Training logic analysis for THREADS reproduction.
+# Intended consumers:
+# - src/train/pretrain_module.py
+# - src/train/finetune_module.py
+# - src/train/callbacks_rankme.py
+#
+# Constraints:
+# - Strictly aligned with provided config.yaml and paper text in prompt.
+# - Do not invent missing values; keep unknowns as null.
+
+train:
+  version: "1.0"
+
+  runtime:
+    seed: 42
+    precision:
+      pretraining: "not explicitly specified in config.yaml"
+      finetuning: "bf16"
+      embedding_extraction_reference: "bf16"
+
+  stage_contracts:
+    pretrain_module:
+      class_path: "src/train/pretrain_module.py"
+      required_inputs:
+        - "ThreadsModel with encode_wsi/encode_rna/encode_dna/contrastive_loss"
+        - "WSI feature batches + modality-aligned molecular batches"
+      required_outputs:
+        - "best checkpoint path"
+        - "epoch-level training logs"
+        - "RankMe trace for model selection"
+    finetune_module:
+      class_path: "src/train/finetune_module.py"
+      required_inputs:
+        - "initialized slide encoder backbone"
+        - "task-specific labels/splits"
+      required_outputs:
+        - "final checkpoint after fixed epoch budget"
+        - "task-level training logs"
+    rankme_callback:
+      class_path: "src/train/callbacks_rankme.py"
+      required_behavior:
+        - "Compute smooth-rank proxy (RankMe) on slide embeddings"
+        - "Start monitoring only after warmup"
+        - "Save checkpoint when monitored rank increases"
+
+  pretraining:
+    objective: "cross-modal contrastive learning (WSI <-> molecular)"
+    modality_policy:
+      supported_pairs:
+        - "WSI-RNA"
+        - "WSI-DNA"
+      batch_behavior:
+        - "Each sample path uses exactly one available molecular branch (RNA or DNA)."
+        - "Loss computation must skip unavailable modality branch without failing batch shape contracts."
+
+    optimizer:
+      name: "AdamW"
+      adamw_betas: null
+
+    schedule:
+      max_epochs: 101
+      batch_size_per_gpu: 300
+      gpus: 4
+      gpu_type: "NVIDIA A100 80GB"
+      lr_schedule: "5-epoch linear warmup, then cosine decay"
+      warmup_epochs: 5
+      warmup_start_lr: 0.0
+      peak_lr: 1.0e-5
+      final_lr: null
+
+    contrastive:
+      temperature: null
+
+    checkpointing_and_early_stopping:
+      criterion: "RankMe (smooth rank of slide embedding matrix)"
+      start_after_warmup: true
+      save_checkpoint_on_rank_increase: true
+      policy_logic:
+        - "Do not use downstream validation metrics for checkpoint selection during pretraining."
+        - "Begin rank monitoring only after epoch index reaches warmup_epochs."
+        - "Persist checkpoint when current RankMe exceeds best-so-far RankMe."
+
+    implementation_constraints:
+      - "No paper-inconsistent hyperparameter search during pretraining."
+      - "Unknown hyperparameters remain null and must be provided explicitly by override if needed."
+      - "Training loop must preserve deterministic seed handling across workers."
+
+  finetuning:
+    optimizer:
+      name: "AdamW"
+      learning_rate: 2.5e-5
+      weight_decay: 0.0
+    schedule:
+      epochs: 5
+      batch_size: 1
+      gradient_accumulation: false
+      layerwise_lr_decay: false
+      early_stopping: false
+    data_sampling:
+      sampled_patches_per_batch: 2048
+      train_sampling_rule: "sample patch subset for training"
+      eval_sampling_rule: "use all patches at inference/evaluation"
+    losses:
+      classification: "weighted cross-entropy"
+      survival: "configured in task/eval stack; not overridden here"
+    precision: "bf16"
+
+    recipe_contract:
+      - "Use fixed 5-epoch recipe for all downstream finetuning tasks to limit overfitting and hyperparameter tuning."
+      - "Do not introduce layer-wise LR decay, weight decay, or gradient accumulation for THREADS finetuning path."
+      - "Final model is checkpoint from epoch=5 (no early-stop selection)."
+
+  rankme_callback:
+    enabled: true
+    eps: 1.0e-7
+    start_epoch: 5
+    monitor_split: "train"
+    mathematical_intent:
+      - "RankMe approximates embedding-space expressivity via entropy of normalized singular values."
+      - "Higher rank indicates lower collapse risk in learned embedding space."
+    callback_io_contract:
+      callback_inputs:
+        - "slide embedding matrix H from current model state"
+      callback_outputs:
+        - "rankme_value (float)"
+        - "checkpoint save decision"
+
+  dataloader_contract:
+    pretraining:
+      expects:
+        - "patch_feats"
+        - "patch_mask"
+        - "rna tensors (gene_ids, expr_values) OR dna tensor (variant_vector)"
+      shape_invariants:
+        - "WSI encoder output embedding is always 1024"
+        - "RNA encoder output embedding is always 1024"
+        - "DNA encoder output embedding is always 1024"
+    finetuning:
+      expects:
+        - "patch_feats"
+        - "patch_mask"
+        - "task labels"
+      patient_level_rule: "when task is patient-level, patches are unioned across all patient WSIs"
+
+  reproducibility:
+    required:
+      - "Record seed, resolved config, and run_id for every stage."
+      - "Record hardware/GPU type used in each stage."
+      - "Persist optimizer/scheduler state in checkpoints when available."
+      - "Keep split files immutable once generated for a run_id."
+
+  unresolved_from_paper_or_config:
+    - "pretraining.adamw_betas is unspecified (null)."
+    - "pretraining.contrastive.temperature is unspecified (null)."
+    - "pretraining.schedule.final_lr is unspecified (null)."
+    - "pretraining mixed-precision mode is not explicitly set in config.yaml."
+
+  guardrails:
+    - "Do not add public member functions outside the provided design interfaces."
+    - "Do not change embedding dimensionality contracts (1024 post-encoder)."
+    - "Do not change fixed linear-probe/survival-probe hyperparameters in eval config from this file."
