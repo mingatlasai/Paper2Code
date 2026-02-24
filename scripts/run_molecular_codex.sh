@@ -112,6 +112,11 @@ python "${ROOT_DIR}/codes/3_coding.py" \
   --output_repo_dir "${OUTPUT_REPO_DIR}" \
   "${RESUME_ARGS[@]}"
 
+echo "------- Environment Files Generation -------"
+python "${ROOT_DIR}/codes/3.3_env_files.py" \
+  --output_repo_dir "${OUTPUT_REPO_DIR}" \
+  --python_version "3.10"
+
 echo "------- README Generation -------"
 python "${ROOT_DIR}/codes/3.2_readme.py" \
   --paper_name "${PAPER_NAME}" \
