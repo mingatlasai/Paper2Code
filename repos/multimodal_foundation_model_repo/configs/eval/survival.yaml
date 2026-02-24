@@ -1,0 +1,158 @@
+# Logic analysis for survival evaluation used by src/eval/survival_eval.py.
+# Scope: CoxNet linear-probe survival evaluation on exported slide/patient embeddings.
+# Source of truth: provided config.yaml + paper methods + fixed design interfaces.
+
+survival_eval:
+  version: "1.0"
+  purpose: "Paper-aligned CoxNet survival evaluation with fixed alpha defaults and explicit task/model overrides"
+
+  provenance:
+    paper: "Molecular-driven Foundation Model for Oncologic Pathology"
+    config_source: "config.yaml"
+    required_interface_consistency:
+      - "SplitManager.load_official / make_cv / make_monte_carlo"
+      - "SurvivalEvaluator.fit / predict_risk / score_c_index"
+      - "ManifestRecord schema keys and patient-level grouping policy"
+
+  fixed_model_settings:
+    estimator: "sksurv.linear_model.CoxnetSurvivalAnalysis"
+    max_iter: 10000
+    hyperparameter_search: false
+    random_state_from_global_seed: true
+
+  alpha_policy:
+    defaults:
+      overall_survival: 0.07
+      progression_free_survival: 0.01
+    endpoint_detection:
+      progression_free_keywords:
+        - "progression-free survival"
+        - "progression free survival"
+        - "pfs"
+      overall_survival_keywords:
+        - "overall survival"
+        - "os"
+      fallback_endpoint: "overall_survival"
+    task_model_overrides:
+      - task: "CPTAC-CCRCC overall survival"
+        model: "CHIEF"
+        alpha: 0.01
+      - task: "BOEHMK progression-free survival"
+        model: "PRISM"
+        alpha: 0.02
+    resolution_order:
+      - "If task+model pair matches override, use override alpha."
+      - "Else if task endpoint matches progression-free keywords, use progression_free_survival alpha."
+      - "Else if task endpoint matches overall-survival keywords, use overall_survival alpha."
+      - "Else use fallback endpoint alpha (overall_survival)."
+
+  data_contract:
+    embedding_dim: 1024
+    accepted_embedding_levels:
+      - "slide"
+      - "patient"
+    patient_level_rule: "union of patches across all WSIs for a patient (applied upstream during embedding export)"
+    required_embedding_columns:
+      - "sample_id"
+      - "patient_id"
+      - "task_name"
+      - "embedding"
+      - "time"
+      - "event"
+      - "cohort"
+      - "fold_id"
+    required_split_schema:
+      - "task_name"
+      - "fold_id"
+      - "train_ids"
+      - "test_ids"
+    leakage_guardrails:
+      enforce_patient_disjoint_between_train_test: true
+      enforce_split_reuse_across_models: true
+      use_identical_test_fold_across_models_per_task: true
+      fail_on_missing_embedding_ids: true
+      fail_on_missing_survival_targets: true
+
+  split_logic:
+    official_single_fold_datasets:
+      - "EBRAINS"
+      - "PANDA"
+      - "IMP"
+    non_official_policy:
+      allowed:
+        - "5-fold 80:20 cross-validation"
+        - "50-fold bootstrapping/Monte Carlo"
+      stratification: "label- and patient-stratified (except documented dataset-specific constraints)"
+    transferability_protocol:
+      train_on_all_source_samples: true
+      test_on_all_target_samples_single_fold: true
+      bootstrap_test_outputs: 100
+
+  fit_predict_logic:
+    training:
+      x_train: "embeddings selected by split.train_ids"
+      y_train_time: "survival duration aligned to x_train"
+      y_train_event: "event indicator aligned to x_train"
+      alpha_from_policy: true
+      max_iter_fixed: true
+      no_validation_tuning: true
+    inference:
+      x_test: "embeddings selected by split.test_ids"
+      y_test_time: "survival duration aligned to x_test"
+      y_test_event: "event indicator aligned to x_test"
+      risk_output: "continuous risk score from CoxNet"
+    scoring:
+      primary_metric: "concordance_index"
+      scorer_method: "SurvivalEvaluator.score_c_index"
+
+  aggregation_and_uncertainty:
+    multi_fold_reporting: "mean ± standard error across folds"
+    single_fold_reporting: "95% CI via non-parametric bootstrap (100 replicates)"
+    bootstrap_replicates_single_fold: 100
+
+  output_contract:
+    per_fold_metrics_schema:
+      - "task"
+      - "cohort"
+      - "fold"
+      - "metric_name"
+      - "value"
+      - "model_name"
+      - "embedding_level"
+      - "alpha_used"
+    aggregated_metrics_schema:
+      - "task"
+      - "metric_name"
+      - "mean"
+      - "se"
+      - "ci_low"
+      - "ci_high"
+      - "n_folds"
+      - "model_name"
+
+  handoff_to_stats_tests:
+    per_task:
+      omnibus_test: "two-way ANOVA"
+      post_hoc_if_significant: "two-sided Tukey HSD (p<0.05, multiple-comparison adjusted)"
+    across_tasks:
+      model: "mixed-effects"
+      fixed_effect: "model type"
+      random_effect: "dataset"
+    km_curves:
+      significance_test: "log-rank"
+
+  reproducibility:
+    global_seed_required: true
+    deterministic_split_generation_required: true
+    deterministic_bootstrap_seed_required: true
+    artifact_layout: "runs/{date}/eval/{run_id}"
+
+  hard_constraints:
+    - "Do not tune alpha, max_iter, or other CoxNet settings outside configured defaults and overrides."
+    - "Do not change split policy outside official/CV/MC protocols."
+    - "Do not alter patient aggregation rule for patient-level embeddings."
+    - "Do not alter survival metric from concordance index."
+
+  unresolved_items:
+    - "Selection rule for 5-fold vs 50-fold on non-official cohorts must come from downstream task metadata/config; not inferred here."
+    - "No additional paper-valid CoxNet hyperparameters were provided in config.yaml beyond alpha and max_iter."

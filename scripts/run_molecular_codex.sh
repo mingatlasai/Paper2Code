@@ -9,7 +9,7 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export P2C_PROVIDER="${P2C_PROVIDER:-codex}"
 export P2C_CODEX_CMD="${P2C_CODEX_CMD:-codex exec}"
 
-PAPER_NAME="molecular_foundation_model"
+PAPER_NAME="multimodal_foundation_model"
 PAPER_PDF="/Users/mingatlas/Projects/papers/Molecular-driven Foundation Model for Oncologic Pathology.pdf"
 
 # PDF -> JSON converter config (s2orc-doc2json)
@@ -21,9 +21,15 @@ S2ORC_OUTPUT_DIR="${S2ORC_OUTPUT_DIR:-${S2ORC_DIR}/output_dir/paper_coder}"
 # Optional override: if provided and exists, skip conversion and use this file directly.
 RAW_JSON="${RAW_JSON:-}"
 
-OUTPUT_DIR="${ROOT_DIR}/outputs/${PAPER_NAME}"
-OUTPUT_REPO_DIR="${ROOT_DIR}/outputs/${PAPER_NAME}_repo"
+OUTPUT_DIR="${ROOT_DIR}/repos/${PAPER_NAME}"
+OUTPUT_REPO_DIR="${ROOT_DIR}/repos/${PAPER_NAME}_repo"
 PDF_JSON_CLEANED_PATH="${OUTPUT_DIR}/${PAPER_NAME}_cleaned.json"
+RESUME="${RESUME:-1}"
+
+RESUME_ARGS=()
+if [[ "${RESUME}" == "1" ]]; then
+  RESUME_ARGS+=(--resume)
+fi
 
 if [[ -z "${RAW_JSON}" || ! -f "${RAW_JSON}" ]]; then
   echo "------- Convert PDF -> JSON (s2orc-doc2json) -------"
@@ -62,20 +68,32 @@ fi
 mkdir -p "${OUTPUT_DIR}" "${OUTPUT_REPO_DIR}"
 
 echo "------- Preprocess -------"
-python "${ROOT_DIR}/codes/0_pdf_process.py" \
-  --input_json_path "${RAW_JSON}" \
-  --output_json_path "${PDF_JSON_CLEANED_PATH}"
+if [[ "${RESUME}" == "1" && -f "${PDF_JSON_CLEANED_PATH}" ]]; then
+  echo "[RESUME] Skip preprocess: ${PDF_JSON_CLEANED_PATH} exists"
+else
+  python "${ROOT_DIR}/codes/0_pdf_process.py" \
+    --input_json_path "${RAW_JSON}" \
+    --output_json_path "${PDF_JSON_CLEANED_PATH}"
+fi
 
 echo "------- PaperCoder (Codex) -------"
-python "${ROOT_DIR}/codes/1_planning.py" \
-  --paper_name "${PAPER_NAME}" \
-  --gpt_version "codex" \
-  --pdf_json_path "${PDF_JSON_CLEANED_PATH}" \
-  --output_dir "${OUTPUT_DIR}"
+if [[ "${RESUME}" == "1" && -f "${OUTPUT_DIR}/planning_trajectories.json" ]]; then
+  echo "[RESUME] Skip planning: planning_trajectories.json exists"
+else
+  python "${ROOT_DIR}/codes/1_planning.py" \
+    --paper_name "${PAPER_NAME}" \
+    --gpt_version "codex" \
+    --pdf_json_path "${PDF_JSON_CLEANED_PATH}" \
+    --output_dir "${OUTPUT_DIR}"
+fi
 
-python "${ROOT_DIR}/codes/1.1_extract_config.py" \
-  --paper_name "${PAPER_NAME}" \
-  --output_dir "${OUTPUT_DIR}"
+if [[ "${RESUME}" == "1" && -f "${OUTPUT_DIR}/planning_config.yaml" ]]; then
+  echo "[RESUME] Skip config extraction: planning_config.yaml exists"
+else
+  python "${ROOT_DIR}/codes/1.1_extract_config.py" \
+    --paper_name "${PAPER_NAME}" \
+    --output_dir "${OUTPUT_DIR}"
+fi
 
 cp -rp "${OUTPUT_DIR}/planning_config.yaml" "${OUTPUT_REPO_DIR}/config.yaml"
 
@@ -83,13 +101,24 @@ python "${ROOT_DIR}/codes/2_analyzing.py" \
   --paper_name "${PAPER_NAME}" \
   --gpt_version "codex" \
   --pdf_json_path "${PDF_JSON_CLEANED_PATH}" \
-  --output_dir "${OUTPUT_DIR}"
+  --output_dir "${OUTPUT_DIR}" \
+  "${RESUME_ARGS[@]}"
 
 python "${ROOT_DIR}/codes/3_coding.py" \
   --paper_name "${PAPER_NAME}" \
   --gpt_version "codex" \
   --pdf_json_path "${PDF_JSON_CLEANED_PATH}" \
   --output_dir "${OUTPUT_DIR}" \
-  --output_repo_dir "${OUTPUT_REPO_DIR}"
+  --output_repo_dir "${OUTPUT_REPO_DIR}" \
+  "${RESUME_ARGS[@]}"
+
+echo "------- README Generation -------"
+python "${ROOT_DIR}/codes/3.2_readme.py" \
+  --paper_name "${PAPER_NAME}" \
+  --gpt_version "codex" \
+  --pdf_json_path "${PDF_JSON_CLEANED_PATH}" \
+  --output_dir "${OUTPUT_DIR}" \
+  --output_repo_dir "${OUTPUT_REPO_DIR}" \
+  "${RESUME_ARGS[@]}"
 
 echo "[DONE] Generated repo: ${OUTPUT_REPO_DIR}"

@@ -1,0 +1,144 @@
+# configs/train/finetune.yaml
+# Finetuning configuration for THREADS reproduction.
+# Values are constrained by the provided config.yaml and paper-grounded task spec.
+
+finetune:
+  name: "threads_finetune"
+  stage: "finetune"
+
+  reproducibility:
+    seed: 42
+    deterministic: true
+
+  selector:
+    default_recipe: "threads"
+    allowed_recipes:
+      - "threads"
+      - "chief"
+      - "abmil"
+
+  # Shared contracts used by src/train/finetune_module.py and data modules.
+  contracts:
+    slide_embedding_dim: 1024
+    train_patch_sampling:
+      strategy: "random"
+      patches_per_batch: 2048
+    eval_patch_sampling:
+      strategy: "all"
+      patches_per_batch: null
+    patient_level_aggregation: "union_of_patches_across_all_wsis"
+
+    required_batch_keys:
+      - "patch_features"
+      - "patch_mask"
+      - "label"
+    optional_batch_keys:
+      - "sample_weight"
+      - "time"
+      - "event"
+      - "patient_id"
+      - "sample_id"
+
+  # Paper-reported THREADS finetuning recipe.
+  threads:
+    applies_to:
+      - "THREADS"
+
+    optimizer:
+      name: "AdamW"
+      learning_rate: 2.5e-5
+      weight_decay: 0.0
+      layerwise_lr_decay: false
+      gradient_accumulation: false
+      betas: null
+      eps: null
+
+    scheduler:
+      policy: "same as GIGAPATH"
+      warmup_epochs: null
+      type: null
+      final_lr: null
+
+    training:
+      epochs: 5
+      batch_size: 1
+      patches_per_batch: 2048
+      early_stopping: false
+      checkpoint_selection: "final_epoch"
+
+    loss:
+      classification: "weighted cross-entropy"
+      survival: null
+
+    hardware:
+      gpus: 1
+      gpu_type: "NVIDIA 3090Ti 24GB"
+      precision: "bf16"
+
+  # CHIEF finetuning uses the same recipe as THREADS (paper/config reported).
+  chief:
+    applies_to:
+      - "CHIEF"
+    inherits: "threads"
+    hardware:
+      gpus: 1
+      gpu_type: "NVIDIA 3090Ti 24GB"
+      precision: "fp32"
+
+  # Supervised ABMIL baseline recipe.
+  abmil:
+    applies_to:
+      - "ABMIL"
+
+    optimizer:
+      name: "AdamW"
+      learning_rate: 3.0e-4
+      weight_decay: 1.0e-5
+      layerwise_lr_decay: false
+      gradient_accumulation: false
+      betas: null
+      eps: null
+
+    scheduler:
+      type: null
+
+    training:
+      epochs: 20
+      batch_size: 1
+      patches_per_batch: 2048
+      early_stopping: false
+      checkpoint_selection: "final_epoch"
+
+    loss:
+      classification: "balanced cross-entropy"
+      survival: null
+
+    inference:
+      use_all_patches: true
+
+  checkpointing:
+    dirpath: "outputs/checkpoints/finetune"
+    filename_template: "{model_name}_{task_name}_fold{fold_id}_epoch{epoch:02d}"
+    save_last: true
+    save_weights_only: false
+    monitor: null
+    mode: null
+
+  logging:
+    log_every_n_steps: 10
+    required_metrics:
+      - "train/loss"
+      - "val/loss"
+      - "val/metric_primary"
+      - "train/lr"
+
+  invariants:
+    target_magnification: "20x"
+    patch_size: 512
+    patch_stride: 512
+    overlap: 0
+    linear_probe_default_c: 0.5
+    linear_probe_default_solver: "lbfgs"
+    linear_probe_default_max_iter: 10000
+    survival_default_alpha_os: 0.07
+    survival_default_alpha_pfs: 0.01

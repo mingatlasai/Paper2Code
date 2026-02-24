@@ -1,0 +1,13 @@
+Implemented the requested logic analysis in `src/core/logging_utils.py` (file was missing, so I created it).
+
+The file now contains a structured, paper-aligned specification for:
+
+- unified logging responsibilities,
+- run ID and artifact layout contracts,
+- stage-specific logging requirements,
+- W&B/MLflow integration behavior,
+- DDP-safe logging rules,
+- failure/resume semantics,
+- cross-module contracts and validation checklist,
+
+all grounded in your provided `config.yaml`, design interfaces, and task constraints.

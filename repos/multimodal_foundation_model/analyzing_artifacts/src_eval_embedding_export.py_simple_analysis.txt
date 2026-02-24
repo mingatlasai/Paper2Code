@@ -1,0 +1,13 @@
+Implemented the requested logic analysis in `src/eval/embedding_export.py`.
+
+What I added:
+- A full, paper-aligned analysis for embedding export behavior.
+- Strict adherence to the design interface:
+  - `__init__(feature_store, model_ckpt, device)`
+  - `export_slide_embeddings(records, out_path)`
+  - `export_patient_embeddings(records, out_path)`
+- Explicit use of `config.yaml` constraints only (1024-d embeddings, all patches, no sampling, patient union-of-patches, bf16 extraction expectation).
+- Clear contracts for dependencies, I/O schema expectations, determinism, failure policies, and downstream compatibility.
+
+File updated:
+- `src/eval/embedding_export.py`

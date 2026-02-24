@@ -1,0 +1,520 @@
+"""RankMe callback for THREADS pretraining.
+
+This module implements the design-locked interface:
+- ``RankMeCallback.__init__(start_epoch: int, eps: float) -> None``
+- ``RankMeCallback.compute_rankme(embeddings: object) -> float``
+- ``RankMeCallback.on_train_epoch_end(trainer: object, pl_module: object) -> None``
+
+Paper/config alignment:
+- Monitor RankMe after warmup (default start epoch = 5).
+- Use smooth-rank stability epsilon (default eps = 1e-7).
+- Save/update best checkpoint only on strict RankMe improvement.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+import numpy as np
+import torch
+
+try:
+    import pytorch_lightning as pl
+except Exception as import_exc:  # pragma: no cover - runtime environment specific.
+    raise RuntimeError(
+        "pytorch-lightning is required for RankMeCallback."
+    ) from import_exc
+
+
+# -----------------------------------------------------------------------------
+# Config-aligned defaults
+# -----------------------------------------------------------------------------
+DEFAULT_START_EPOCH: int = 5
+DEFAULT_RANKME_EPS: float = 1.0e-7
+DEFAULT_STRICT_IMPROVEMENT_TOLERANCE: float = 1.0e-12
+DEFAULT_EMBEDDING_DIM: int = 1024
+DEFAULT_MIN_SAMPLES: int = 2
+DEFAULT_MIN_DIM: int = 2
+DEFAULT_MONITOR_KEY_CURRENT: str = "rankme/current"
+DEFAULT_MONITOR_KEY_BEST: str = "rankme/best"
+DEFAULT_MONITOR_KEY_IMPROVED: str = "rankme/improved"
+DEFAULT_MONITOR_KEY_COUNT: str = "rankme/num_embeddings"
+DEFAULT_CHECKPOINT_NAME: str = "best-rank.ckpt"
+
+
+class RankMeCallbackError(Exception):
+    """Base exception for RankMe callback failures."""
+
+
+class RankMeConfigError(RankMeCallbackError):
+    """Raised when callback configuration is invalid."""
+
+
+class RankMeInputError(RankMeCallbackError):
+    """Raised when embedding payload is invalid."""
+
+
+class RankMeCallback(pl.callbacks.Callback):
+    """RankMe-based checkpoint monitor.
+
+    The callback computes RankMe at train epoch end from slide embeddings produced
+    by the training loop/module and updates best state on strict improvement.
+    """
+
+    def __init__(self, start_epoch: int = DEFAULT_START_EPOCH, eps: float = DEFAULT_RANKME_EPS) -> None:
+        """Initialize callback.
+
+        Args:
+            start_epoch: First epoch index at which RankMe is monitored.
+            eps: Numerical stability epsilon for smooth-rank computation.
+        """
+        super().__init__()
+
+        self._start_epoch: int = self._validate_start_epoch(start_epoch)
+        self._eps: float = self._validate_eps(eps)
+
+        self._best_rankme: float = float("-inf")
+        self._best_epoch: int = -1
+        self._current_rankme: float = float("nan")
+        self._strict_tol: float = DEFAULT_STRICT_IMPROVEMENT_TOLERANCE
+
+    def compute_rankme(self, embeddings: object) -> float:
+        """Compute RankMe score from embedding matrix.
+
+        Args:
+            embeddings: Tensor-like object with shape [N, D].
+
+        Returns:
+            RankMe scalar as Python float. Returns NaN for invalid input.
+        """
+        embedding_tensor: torch.Tensor = self._coerce_embedding_matrix(embeddings)
+
+        if embedding_tensor.ndim != 2:
+            return float("nan")
+
+        num_rows: int = int(embedding_tensor.shape[0])
+        num_cols: int = int(embedding_tensor.shape[1])
+        if num_rows < DEFAULT_MIN_SAMPLES or num_cols < DEFAULT_MIN_DIM:
+            return float("nan")
+
+        if not torch.isfinite(embedding_tensor).all():
+            return float("nan")
+
+        # RankMe uses singular value entropy of slide embedding matrix.
+        matrix: torch.Tensor = embedding_tensor.to(dtype=torch.float64, device="cpu")
+
+        try:
+            singular_values: torch.Tensor = torch.linalg.svdvals(matrix)
+        except Exception:
+            return float("nan")
+
+        if singular_values.ndim != 1 or int(singular_values.shape[0]) == 0:
+            return float("nan")
+        if not torch.isfinite(singular_values).all():
+            return float("nan")
+
+        denom: torch.Tensor = singular_values.sum().clamp_min(self._eps)
+        probabilities: torch.Tensor = singular_values / denom
+
+        if not torch.isfinite(probabilities).all():
+            return float("nan")
+
+        entropy: torch.Tensor = -torch.sum(probabilities * torch.log(probabilities + self._eps))
+        rankme: torch.Tensor = torch.exp(entropy)
+
+        if not torch.isfinite(rankme):
+            return float("nan")
+
+        return float(rankme.item())
+
+    def on_train_epoch_end(self, trainer: object, pl_module: object) -> None:
+        """Run RankMe monitoring and optional best-checkpoint save.
+
+        Args:
+            trainer: PyTorch Lightning trainer-like object.
+            pl_module: LightningModule that may expose epoch embeddings.
+        """
+        epoch_index: int = self._resolve_epoch_index(trainer)
+        if epoch_index < self._start_epoch:
+            self._log_metrics(
+                pl_module=pl_module,
+                current=float("nan"),
+                best=self._best_rankme,
+                improved=False,
+                num_embeddings=0,
+                sync_dist=True,
+            )
+            return
+
+        epoch_embeddings: Optional[torch.Tensor] = self._extract_epoch_embeddings(pl_module)
+        if epoch_embeddings is None:
+            self._log_metrics(
+                pl_module=pl_module,
+                current=float("nan"),
+                best=self._best_rankme,
+                improved=False,
+                num_embeddings=0,
+                sync_dist=True,
+            )
+            self._set_module_rankme_state(
+                pl_module,
+                current=float("nan"),
+                best=self._best_rankme,
+                improved=False,
+                num_embeddings=0,
+                epoch=epoch_index,
+            )
+            return
+
+        gathered_embeddings: torch.Tensor = self._gather_embeddings_ddp(epoch_embeddings)
+        num_embeddings: int = int(gathered_embeddings.shape[0]) if gathered_embeddings.ndim == 2 else 0
+
+        current_rankme: float = self.compute_rankme(gathered_embeddings)
+        self._current_rankme = current_rankme
+
+        improved: bool = self._is_strict_improvement(current_rankme, self._best_rankme)
+        if improved:
+            self._best_rankme = current_rankme
+            self._best_epoch = epoch_index
+
+        self._log_metrics(
+            pl_module=pl_module,
+            current=current_rankme,
+            best=self._best_rankme,
+            improved=improved,
+            num_embeddings=num_embeddings,
+            sync_dist=True,
+        )
+        self._set_module_rankme_state(
+            pl_module,
+            current=current_rankme,
+            best=self._best_rankme,
+            improved=improved,
+            num_embeddings=num_embeddings,
+            epoch=epoch_index,
+        )
+
+        if improved and self._is_rank_zero(trainer):
+            self._save_best_checkpoint(trainer=trainer, pl_module=pl_module, epoch=epoch_index, score=current_rankme)
+
+    # ------------------------------------------------------------------
+    # Internal helpers (private)
+    # ------------------------------------------------------------------
+    def _validate_start_epoch(self, start_epoch: int) -> int:
+        if isinstance(start_epoch, bool) or not isinstance(start_epoch, int):
+            raise RankMeConfigError(
+                f"start_epoch must be int, got {type(start_epoch).__name__}."
+            )
+        if start_epoch < 0:
+            raise RankMeConfigError(f"start_epoch must be >= 0, got {start_epoch}.")
+        return int(start_epoch)
+
+    def _validate_eps(self, eps: float) -> float:
+        if isinstance(eps, bool):
+            raise RankMeConfigError("eps must be float, got bool.")
+        try:
+            eps_float: float = float(eps)
+        except Exception as exc:  # noqa: BLE001
+            raise RankMeConfigError(f"eps must be float, got {eps!r}.") from exc
+
+        if not np.isfinite(eps_float) or eps_float <= 0.0:
+            raise RankMeConfigError(f"eps must be finite and > 0, got {eps_float}.")
+        return eps_float
+
+    def _coerce_embedding_matrix(self, embeddings: object) -> torch.Tensor:
+        try:
+            embedding_tensor: torch.Tensor = torch.as_tensor(embeddings)
+        except Exception as exc:  # noqa: BLE001
+            raise RankMeInputError(f"embeddings cannot be converted to tensor: {exc}") from exc
+
+        if embedding_tensor.ndim == 1:
+            embedding_tensor = embedding_tensor.unsqueeze(0)
+
+        if embedding_tensor.ndim != 2:
+            raise RankMeInputError(
+                f"embeddings must be rank-2 [N,D], got shape={tuple(embedding_tensor.shape)}."
+            )
+
+        if int(embedding_tensor.shape[0]) <= 0:
+            raise RankMeInputError("embeddings has zero samples.")
+        if int(embedding_tensor.shape[1]) <= 0:
+            raise RankMeInputError("embeddings has zero feature dimension.")
+
+        if int(embedding_tensor.shape[1]) != DEFAULT_EMBEDDING_DIM:
+            # Enforce project-wide embedding contract.
+            raise RankMeInputError(
+                "embeddings last-dimension mismatch: "
+                f"expected {DEFAULT_EMBEDDING_DIM}, got {int(embedding_tensor.shape[1])}."
+            )
+
+        if not torch.is_floating_point(embedding_tensor):
+            embedding_tensor = embedding_tensor.to(torch.float32)
+        else:
+            embedding_tensor = embedding_tensor.to(torch.float32)
+
+        return embedding_tensor
+
+    def _resolve_epoch_index(self, trainer: object) -> int:
+        if hasattr(trainer, "current_epoch"):
+            try:
+                return int(getattr(trainer, "current_epoch"))
+            except Exception:
+                return 0
+        return 0
+
+    def _extract_epoch_embeddings(self, pl_module: object) -> Optional[torch.Tensor]:
+        candidate_names: Sequence[str] = (
+            "rankme_embeddings",
+            "_rankme_embeddings",
+            "epoch_slide_embeddings",
+            "_epoch_slide_embeddings",
+            "train_epoch_slide_embeddings",
+            "_train_epoch_slide_embeddings",
+            "train_slide_embeddings",
+            "_train_slide_embeddings",
+            "slide_embeddings_epoch",
+        )
+
+        attribute_name: str
+        for attribute_name in candidate_names:
+            if not hasattr(pl_module, attribute_name):
+                continue
+            payload: Any = getattr(pl_module, attribute_name)
+            if payload is None:
+                continue
+
+            try:
+                embedding_tensor: torch.Tensor = self._coerce_embedding_matrix(payload)
+            except RankMeInputError:
+                continue
+
+            # Best-effort cleanup to prevent stale accumulation if module stores list/tensor.
+            try:
+                setattr(pl_module, attribute_name, None)
+            except Exception:
+                pass
+
+            return embedding_tensor
+
+        return None
+
+    def _gather_embeddings_ddp(self, local_embeddings: torch.Tensor) -> torch.Tensor:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return local_embeddings.detach()
+
+        world_size: int = int(torch.distributed.get_world_size())
+        if world_size <= 1:
+            return local_embeddings.detach()
+
+        local_tensor: torch.Tensor = local_embeddings.detach()
+        if local_tensor.ndim != 2:
+            raise RankMeInputError(
+                f"local_embeddings must be rank-2 [N,D], got {tuple(local_tensor.shape)}."
+            )
+
+        backend_name: str = str(torch.distributed.get_backend()).lower()
+        if backend_name == "nccl" and not local_tensor.is_cuda:
+            if not torch.cuda.is_available():
+                raise RankMeInputError(
+                    "DDP backend is NCCL but CUDA is unavailable for all_gather."
+                )
+            local_tensor = local_tensor.to(torch.device("cuda", torch.cuda.current_device()))
+
+        local_rows: int = int(local_tensor.shape[0])
+        embed_dim: int = int(local_tensor.shape[1])
+
+        row_count_tensor: torch.Tensor = torch.tensor([local_rows], device=local_tensor.device, dtype=torch.long)
+        gathered_row_counts: list[torch.Tensor] = [
+            torch.zeros_like(row_count_tensor) for _ in range(world_size)
+        ]
+        torch.distributed.all_gather(gathered_row_counts, row_count_tensor)
+
+        row_counts: list[int] = [int(item.item()) for item in gathered_row_counts]
+        max_rows: int = max(row_counts)
+
+        if max_rows <= 0:
+            return torch.zeros((0, embed_dim), dtype=local_tensor.dtype, device=local_tensor.device)
+
+        if local_rows < max_rows:
+            padding: torch.Tensor = torch.zeros(
+                (max_rows - local_rows, embed_dim),
+                dtype=local_tensor.dtype,
+                device=local_tensor.device,
+            )
+            padded_local: torch.Tensor = torch.cat([local_tensor, padding], dim=0)
+        else:
+            padded_local = local_tensor
+
+        gathered_tensors: list[torch.Tensor] = [
+            torch.zeros_like(padded_local) for _ in range(world_size)
+        ]
+        torch.distributed.all_gather(gathered_tensors, padded_local)
+
+        valid_chunks: list[torch.Tensor] = []
+        rank_index: int
+        for rank_index in range(world_size):
+            count: int = row_counts[rank_index]
+            if count <= 0:
+                continue
+            valid_chunks.append(gathered_tensors[rank_index][:count, :])
+
+        if len(valid_chunks) == 0:
+            return torch.zeros((0, embed_dim), dtype=local_tensor.dtype, device=local_tensor.device)
+
+        merged: torch.Tensor = torch.cat(valid_chunks, dim=0)
+        return merged
+
+    def _is_strict_improvement(self, current: float, best: float) -> bool:
+        if not np.isfinite(current):
+            return False
+        if not np.isfinite(best):
+            return True
+        return bool(current > (best + self._strict_tol))
+
+    def _is_rank_zero(self, trainer: object) -> bool:
+        if hasattr(trainer, "is_global_zero"):
+            try:
+                return bool(getattr(trainer, "is_global_zero"))
+            except Exception:
+                pass
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                return int(torch.distributed.get_rank()) == 0
+            except Exception:
+                return True
+
+        return True
+
+    def _log_metrics(
+        self,
+        pl_module: object,
+        *,
+        current: float,
+        best: float,
+        improved: bool,
+        num_embeddings: int,
+        sync_dist: bool,
+    ) -> None:
+        if not hasattr(pl_module, "log"):
+            return
+
+        try:
+            pl_module.log(
+                DEFAULT_MONITOR_KEY_CURRENT,
+                float(current),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                sync_dist=bool(sync_dist),
+            )
+            pl_module.log(
+                DEFAULT_MONITOR_KEY_BEST,
+                float(best) if np.isfinite(best) else float("nan"),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                sync_dist=bool(sync_dist),
+            )
+            pl_module.log(
+                DEFAULT_MONITOR_KEY_IMPROVED,
+                float(1.0 if improved else 0.0),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                sync_dist=bool(sync_dist),
+            )
+            pl_module.log(
+                DEFAULT_MONITOR_KEY_COUNT,
+                float(int(num_embeddings)),
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                sync_dist=bool(sync_dist),
+            )
+        except Exception:
+            # Callback must remain non-fatal for logging issues.
+            return
+
+    def _set_module_rankme_state(
+        self,
+        pl_module: object,
+        *,
+        current: float,
+        best: float,
+        improved: bool,
+        num_embeddings: int,
+        epoch: int,
+    ) -> None:
+        # These attributes are intentionally lightweight and optional.
+        try:
+            setattr(pl_module, "rankme_current", float(current))
+            setattr(pl_module, "rankme_best", float(best))
+            setattr(pl_module, "rankme_improved", bool(improved))
+            setattr(pl_module, "rankme_num_embeddings", int(num_embeddings))
+            setattr(pl_module, "rankme_best_epoch", int(self._best_epoch))
+            setattr(pl_module, "rankme_last_epoch", int(epoch))
+        except Exception:
+            return
+
+    def _save_best_checkpoint(self, trainer: object, pl_module: object, epoch: int, score: float) -> None:
+        if not hasattr(trainer, "save_checkpoint"):
+            return
+
+        checkpoint_path: Path = self._resolve_best_checkpoint_path(trainer)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            trainer.save_checkpoint(str(checkpoint_path))
+        except TypeError:
+            try:
+                trainer.save_checkpoint(str(checkpoint_path), weights_only=False)
+            except Exception:
+                return
+        except Exception:
+            return
+
+        # Best-effort callback metrics surface for checkpointing/metadata modules.
+        try:
+            setattr(pl_module, "best_rankme_checkpoint_path", str(checkpoint_path))
+            setattr(pl_module, "best_rankme_score", float(score))
+            setattr(pl_module, "best_rankme_epoch", int(epoch))
+        except Exception:
+            return
+
+    def _resolve_best_checkpoint_path(self, trainer: object) -> Path:
+        # Priority: explicit checkpoint callback dirpath, then trainer log/default roots.
+        if hasattr(trainer, "checkpoint_callback"):
+            callback_obj: Any = getattr(trainer, "checkpoint_callback")
+            if callback_obj is not None and hasattr(callback_obj, "dirpath"):
+                dirpath_value: Any = getattr(callback_obj, "dirpath")
+                if dirpath_value:
+                    return Path(str(dirpath_value)).expanduser().resolve() / DEFAULT_CHECKPOINT_NAME
+
+        if hasattr(trainer, "log_dir"):
+            log_dir_value: Any = getattr(trainer, "log_dir")
+            if log_dir_value:
+                return Path(str(log_dir_value)).expanduser().resolve() / "checkpoints" / DEFAULT_CHECKPOINT_NAME
+
+        if hasattr(trainer, "default_root_dir"):
+            root_dir_value: Any = getattr(trainer, "default_root_dir")
+            if root_dir_value:
+                return Path(str(root_dir_value)).expanduser().resolve() / "checkpoints" / DEFAULT_CHECKPOINT_NAME
+
+        return Path("runs") / "checkpoints" / DEFAULT_CHECKPOINT_NAME
+
+
+__all__ = [
+    "DEFAULT_START_EPOCH",
+    "DEFAULT_RANKME_EPS",
+    "DEFAULT_STRICT_IMPROVEMENT_TOLERANCE",
+    "RankMeCallbackError",
+    "RankMeConfigError",
+    "RankMeInputError",
+    "RankMeCallback",
+]

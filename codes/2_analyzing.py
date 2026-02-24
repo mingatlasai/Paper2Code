@@ -16,6 +16,7 @@ parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", 
 parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
 parser.add_argument('--output_dir',type=str, default="")
+parser.add_argument('--resume', action='store_true')
 
 args    = parser.parse_args()
 
@@ -148,6 +149,14 @@ for todo_file_name in tqdm(todo_file_lst):
     print(current_stage)
     if todo_file_name == "config.yaml":
         continue
+
+    save_todo_file_name = todo_file_name.replace("/", "_")
+    artifact_path = f'{artifact_output_dir}/{save_todo_file_name}_simple_analysis.txt'
+    response_path = f'{output_dir}/{save_todo_file_name}_simple_analysis_response.json'
+    traj_path = f'{output_dir}/{save_todo_file_name}_simple_analysis_trajectories.json'
+    if args.resume and os.path.exists(artifact_path) and os.path.exists(response_path) and os.path.exists(traj_path):
+        print(f"[RESUME] Skip completed analysis: {todo_file_name}")
+        continue
     
     if todo_file_name not in logic_analysis_dict:
         # print(f"[DEBUG ANALYSIS] {paper_name} {todo_file_name} is not exist in the logic analysis")
@@ -166,18 +175,16 @@ for todo_file_name in tqdm(todo_file_lst):
 
     print_response(completion_json)
 
-    save_todo_file_name = todo_file_name.replace("/", "_")
-
     # save
-    with open(f'{artifact_output_dir}/{save_todo_file_name}_simple_analysis.txt', 'w') as f:
+    with open(artifact_path, 'w') as f:
         f.write(completion_json['choices'][0]['message']['content'])
 
 
     done_file_lst.append(todo_file_name)
 
     # save for next stage(coding)
-    with open(f'{output_dir}/{save_todo_file_name}_simple_analysis_response.json', 'w') as f:
+    with open(response_path, 'w') as f:
         json.dump(responses, f)
 
-    with open(f'{output_dir}/{save_todo_file_name}_simple_analysis_trajectories.json', 'w') as f:
+    with open(traj_path, 'w') as f:
         json.dump(trajectories, f)

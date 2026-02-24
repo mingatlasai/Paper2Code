@@ -1,0 +1,10 @@
+Implemented the logic analysis in `configs/eval/linear_probe.yaml`.
+
+It now encodes:
+- Fixed linear probe settings from the paper/config (`C=0.5`, `lbfgs`, `max_iter=10000`, `class_weight=balanced`)
+- Split/few-shot logic and leakage guardrails
+- Task-to-metric routing (`macro_auc`, `balanced_accuracy`, `quadratic_weighted_kappa`)
+- Fold aggregation/CI reporting and stats-test handoff
+- Reproducibility and hard constraints for no-tuning evaluation
+
+File: `configs/eval/linear_probe.yaml`

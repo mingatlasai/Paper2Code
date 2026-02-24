@@ -1,0 +1,10 @@
+Added the requested logic analysis to `src/eval/survival_eval.py`.
+
+It is now a structured, analysis-only specification covering:
+- exact `SurvivalEvaluator` interface constraints from the design,
+- CoxNet config fidelity (`max_iter=10000`, OS/PFS alpha defaults + overrides),
+- split and data contracts with `SplitManager`,
+- fold execution flow, c-index scoring, CI aggregation rules,
+- guardrails, reproducibility requirements, and unresolved ambiguities.
+
+No code execution/tests were run since this change is documentation-only.

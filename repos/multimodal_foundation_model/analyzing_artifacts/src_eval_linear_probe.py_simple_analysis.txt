@@ -1,0 +1,5 @@
+Completed. I added the requested logic analysis to:
+
+- `src/eval/linear_probe.py`
+
+It is analysis-only (no code), paper-aligned, config-referenced, and constrained to the specified `LinearProbeEvaluator` interface and split/metric contracts.

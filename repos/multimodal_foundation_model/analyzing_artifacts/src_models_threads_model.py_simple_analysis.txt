@@ -1,0 +1,14 @@
+Implemented the requested logic analysis in `src/models/threads_model.py`.
+
+What it now contains:
+- A full analysis-only specification for `ThreadsModel` (no executable code).
+- Exact interface contract matching your design (`__init__`, `forward_wsi`, `forward_rna`, `forward_dna`, `training_step`, `extract_slide_embedding`).
+- Paper/config-aligned behavior for:
+  - 1024-d shared embedding space,
+  - multimodal (WSI↔RNA/WSI↔DNA) contrastive pretraining,
+  - modality-availability handling,
+  - embedding export semantics.
+- Explicit loss aggregation policy with uncertainty handling where paper details are unreadable.
+- Validation, failure modes, integration boundaries, and reproducibility requirements.
+
+File: `src/models/threads_model.py`

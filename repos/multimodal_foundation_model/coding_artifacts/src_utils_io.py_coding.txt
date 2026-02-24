@@ -1,0 +1,1053 @@
+## Code: src/utils/io.py
+```python
+"""Reusable I/O helpers for THREADS reproduction.
+
+This module provides deterministic, typed read/write helpers for:
+- YAML
+- JSON
+- Parquet
+- HDF5
+
+It also includes contract validators used by data/eval modules.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import math
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+
+import h5py
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import yaml
+
+
+PathLike = Union[str, Path]
+
+# Paper/config-grounded defaults from configs/default.yaml.
+DEFAULT_SLIDE_EMBEDDING_DIM: int = 1024
+DEFAULT_PATCH_SIZE: int = 512
+DEFAULT_TARGET_MAGNIFICATION: str = "20x"
+DEFAULT_LINEAR_PROBE_C: float = 0.5
+DEFAULT_LINEAR_PROBE_SOLVER: str = "lbfgs"
+DEFAULT_LINEAR_PROBE_MAX_ITER: int = 10000
+DEFAULT_SURVIVAL_ALPHA_OS: float = 0.07
+DEFAULT_SURVIVAL_ALPHA_PFS: float = 0.01
+DEFAULT_PARQUET_COMPRESSION: str = "zstd"
+DEFAULT_JSON_INDENT: int = 2
+
+MANIFEST_REQUIRED_KEYS: Tuple[str, ...] = (
+    "sample_id",
+    "patient_id",
+    "cohort",
+    "slide_path",
+    "magnification",
+    "rna_path",
+    "dna_path",
+    "task_labels",
+    "meta",
+)
+
+SPLIT_REQUIRED_KEYS: Tuple[str, ...] = (
+    "task_name",
+    "fold_id",
+    "train_ids",
+    "test_ids",
+)
+
+FEATURE_STORE_REQUIRED_KEYS: Tuple[str, ...] = (
+    "sample_id",
+    "coords",
+    "features",
+    "encoder_name",
+    "precision",
+)
+
+METRICS_REQUIRED_KEYS: Tuple[str, ...] = (
+    "task",
+    "fold",
+    "metric_name",
+    "value",
+    "ci_low",
+    "ci_high",
+    "model_name",
+)
+
+SUPPORTED_PARQUET_SUFFIXES: Tuple[str, ...] = (".parquet",)
+SUPPORTED_JSON_SUFFIXES: Tuple[str, ...] = (".json",)
+SUPPORTED_YAML_SUFFIXES: Tuple[str, ...] = (".yaml", ".yml")
+SUPPORTED_H5_SUFFIXES: Tuple[str, ...] = (".h5", ".hdf5")
+
+
+class IOErrorBase(Exception):
+    """Base exception for this module."""
+
+
+class ValidationError(IOErrorBase):
+    """Raised when an object does not satisfy a contract."""
+
+
+class FileFormatError(IOErrorBase):
+    """Raised when an unsupported format/suffix is used."""
+
+
+class IntegrityError(IOErrorBase):
+    """Raised when persisted data is corrupted or contract-inconsistent."""
+
+
+@dataclass(frozen=True)
+class H5ArraySpec:
+    """Specification for writing one HDF5 dataset."""
+
+    key: str
+    compression: Optional[str] = "gzip"
+    compression_opts: Optional[int] = 4
+    chunks: Optional[Tuple[int, ...]] = None
+
+
+# -----------------------------------------------------------------------------
+# Path and serialization helpers
+# -----------------------------------------------------------------------------
+
+def ensure_parent_dir(path: PathLike) -> Path:
+    """Ensure a file path parent directory exists.
+
+    Args:
+        path: Target file path.
+
+    Returns:
+        Resolved Path object.
+    """
+    resolved_path: Path = Path(path).expanduser().resolve()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    return resolved_path
+
+
+def ensure_dir(path: PathLike) -> Path:
+    """Ensure a directory exists and return resolved path."""
+    resolved_path: Path = Path(path).expanduser().resolve()
+    resolved_path.mkdir(parents=True, exist_ok=True)
+    return resolved_path
+
+
+def validate_suffix(path: PathLike, allowed_suffixes: Sequence[str]) -> Path:
+    """Validate file suffix against an allowlist.
+
+    Args:
+        path: File path to validate.
+        allowed_suffixes: Allowed suffixes including leading dot.
+
+    Returns:
+        Resolved path.
+
+    Raises:
+        FileFormatError: If suffix is not in allowlist.
+    """
+    resolved_path: Path = Path(path).expanduser().resolve()
+    suffix: str = resolved_path.suffix.lower()
+    normalized_allowlist: Tuple[str, ...] = tuple(item.lower() for item in allowed_suffixes)
+    if suffix not in normalized_allowlist:
+        raise FileFormatError(
+            f"Invalid suffix for {resolved_path}. Expected one of {normalized_allowlist}, got {suffix!r}."
+        )
+    return resolved_path
+
+
+def utc_timestamp() -> str:
+    """Return RFC3339 UTC timestamp string."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def to_serializable(obj: Any) -> Any:
+    """Convert common scientific/python objects to JSON-serializable values."""
+    if obj is None:
+        return None
+
+    if isinstance(obj, (str, int, float, bool)):
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+        return obj
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    if isinstance(obj, datetime):
+        if obj.tzinfo is None:
+            return obj.replace(tzinfo=timezone.utc).isoformat()
+        return obj.astimezone(timezone.utc).isoformat()
+
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+
+    if isinstance(obj, (np.floating,)):
+        value: float = float(obj)
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+
+    if isinstance(obj, Mapping):
+        return {str(key): to_serializable(value) for key, value in obj.items()}
+
+    if isinstance(obj, (list, tuple, set)):
+        return [to_serializable(item) for item in obj]
+
+    if hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return to_serializable(obj.to_dict())
+
+    return str(obj)
+
+
+def compute_file_sha256(path: PathLike, chunk_size: int = 1_048_576) -> str:
+    """Compute SHA256 checksum for a file.
+
+    Args:
+        path: File path.
+        chunk_size: Bytes per read chunk.
+
+    Returns:
+        Hex digest.
+    """
+    resolved_path: Path = Path(path).expanduser().resolve()
+    if not resolved_path.exists() or not resolved_path.is_file():
+        raise FileNotFoundError(f"Cannot hash missing file: {resolved_path}")
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+
+    hasher = hashlib.sha256()
+    with resolved_path.open("rb") as file_handle:
+        while True:
+            chunk: bytes = file_handle.read(chunk_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def _atomic_write_text(path: PathLike, content: str, encoding: str = "utf-8") -> Path:
+    """Atomically write text content to path."""
+    resolved_path: Path = ensure_parent_dir(path)
+    with NamedTemporaryFile(
+        mode="w",
+        suffix=resolved_path.suffix,
+        dir=str(resolved_path.parent),
+        delete=False,
+        encoding=encoding,
+    ) as temp_file:
+        temp_file.write(content)
+        temp_path: Path = Path(temp_file.name)
+    temp_path.replace(resolved_path)
+    return resolved_path
+
+
+# -----------------------------------------------------------------------------
+# YAML
+# -----------------------------------------------------------------------------
+
+def read_yaml(path: PathLike, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Read a YAML file into a dictionary.
+
+    Args:
+        path: YAML file path.
+        default: Default dict if file does not exist.
+
+    Returns:
+        Parsed dictionary.
+    """
+    resolved_path: Path = validate_suffix(path, SUPPORTED_YAML_SUFFIXES)
+    if not resolved_path.exists():
+        if default is not None:
+            return dict(default)
+        raise FileNotFoundError(f"YAML file not found: {resolved_path}")
+
+    with resolved_path.open("r", encoding="utf-8") as file_handle:
+        loaded: Any = yaml.safe_load(file_handle)
+
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, Mapping):
+        raise ValidationError(
+            f"YAML root must be a mapping for {resolved_path}, got {type(loaded).__name__}."
+        )
+    return dict(loaded)
+
+
+def write_yaml(
+    obj: Mapping[str, Any],
+    path: PathLike,
+    *,
+    sort_keys: bool = True,
+    default_flow_style: bool = False,
+) -> Path:
+    """Write mapping to YAML atomically."""
+    resolved_path: Path = validate_suffix(path, SUPPORTED_YAML_SUFFIXES)
+    serializable: Any = to_serializable(dict(obj))
+    rendered: str = yaml.safe_dump(
+        serializable,
+        sort_keys=sort_keys,
+        default_flow_style=default_flow_style,
+        allow_unicode=False,
+    )
+    return _atomic_write_text(resolved_path, rendered, encoding="utf-8")
+
+
+# -----------------------------------------------------------------------------
+# JSON
+# -----------------------------------------------------------------------------
+
+def read_json(path: PathLike, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Read JSON file into a dictionary."""
+    resolved_path: Path = validate_suffix(path, SUPPORTED_JSON_SUFFIXES)
+    if not resolved_path.exists():
+        if default is not None:
+            return dict(default)
+        raise FileNotFoundError(f"JSON file not found: {resolved_path}")
+
+    with resolved_path.open("r", encoding="utf-8") as file_handle:
+        loaded: Any = json.load(file_handle)
+
+    if not isinstance(loaded, Mapping):
+        raise ValidationError(
+            f"JSON root must be a mapping for {resolved_path}, got {type(loaded).__name__}."
+        )
+    return dict(loaded)
+
+
+def write_json(
+    obj: Mapping[str, Any],
+    path: PathLike,
+    *,
+    indent: int = DEFAULT_JSON_INDENT,
+    sort_keys: bool = True,
+) -> Path:
+    """Write mapping to JSON atomically with deterministic key order."""
+    resolved_path: Path = validate_suffix(path, SUPPORTED_JSON_SUFFIXES)
+    serializable: Any = to_serializable(dict(obj))
+    rendered: str = json.dumps(
+        serializable,
+        indent=indent,
+        sort_keys=sort_keys,
+        ensure_ascii=True,
+    )
+    if indent > 0:
+        rendered += "\n"
+    return _atomic_write_text(resolved_path, rendered, encoding="utf-8")
+
+
+# -----------------------------------------------------------------------------
+# Parquet
+# -----------------------------------------------------------------------------
+
+def read_parquet(path: PathLike, columns: Optional[Sequence[str]] = None) -> pd.DataFrame:
+    """Read parquet as pandas DataFrame."""
+    resolved_path: Path = validate_suffix(path, SUPPORTED_PARQUET_SUFFIXES)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Parquet file not found: {resolved_path}")
+
+    table: pa.Table = pq.read_table(resolved_path, columns=list(columns) if columns else None)
+    dataframe: pd.DataFrame = table.to_pandas(types_mapper=None)
+    return dataframe
+
+
+def write_parquet(
+    data: Union[pd.DataFrame, Sequence[Mapping[str, Any]]],
+    path: PathLike,
+    *,
+    compression: str = DEFAULT_PARQUET_COMPRESSION,
+    sort_columns: bool = False,
+) -> Path:
+    """Write pandas data to parquet atomically.
+
+    Args:
+        data: Dataframe or list of row mappings.
+        path: Destination parquet path.
+        compression: Arrow parquet compression codec.
+        sort_columns: Deterministically sort dataframe columns before write.
+    """
+    resolved_path: Path = validate_suffix(path, SUPPORTED_PARQUET_SUFFIXES)
+
+    dataframe: pd.DataFrame
+    if isinstance(data, pd.DataFrame):
+        dataframe = data.copy(deep=True)
+    else:
+        dataframe = pd.DataFrame([to_serializable(item) for item in data])
+
+    if sort_columns:
+        dataframe = dataframe.reindex(sorted(dataframe.columns), axis=1)
+
+    ensure_parent_dir(resolved_path)
+    with NamedTemporaryFile(
+        mode="wb",
+        suffix=resolved_path.suffix,
+        dir=str(resolved_path.parent),
+        delete=False,
+    ) as temp_file:
+        temp_path: Path = Path(temp_file.name)
+
+    try:
+        table: pa.Table = pa.Table.from_pandas(dataframe, preserve_index=False)
+        pq.write_table(
+            table,
+            temp_path,
+            compression=compression,
+            flavor="spark",
+            version="2.6",
+        )
+        temp_path.replace(resolved_path)
+    finally:
+        if temp_path.exists() and temp_path != resolved_path:
+            temp_path.unlink(missing_ok=True)
+
+    return resolved_path
+
+
+# -----------------------------------------------------------------------------
+# HDF5
+# -----------------------------------------------------------------------------
+
+def read_h5_array(path: PathLike, key: str) -> np.ndarray:
+    """Read one array from HDF5 by key.
+
+    Args:
+        path: HDF5 file path.
+        key: Dataset key.
+
+    Returns:
+        Numpy array.
+    """
+    resolved_path: Path = validate_suffix(path, SUPPORTED_H5_SUFFIXES)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {resolved_path}")
+    if not key:
+        raise ValidationError("HDF5 key must be non-empty.")
+
+    with h5py.File(resolved_path, "r") as file_handle:
+        if key not in file_handle:
+            raise KeyError(f"Dataset key {key!r} not found in {resolved_path}")
+        array: np.ndarray = np.asarray(file_handle[key])
+    return array
+
+
+def read_h5_attrs(path: PathLike, key: Optional[str] = None) -> Dict[str, Any]:
+    """Read HDF5 attributes either from file root or one dataset key."""
+    resolved_path: Path = validate_suffix(path, SUPPORTED_H5_SUFFIXES)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {resolved_path}")
+
+    with h5py.File(resolved_path, "r") as file_handle:
+        target: Any = file_handle if key is None else file_handle.get(key)
+        if target is None:
+            raise KeyError(f"HDF5 key {key!r} not found in {resolved_path}")
+        attrs: Dict[str, Any] = {
+            str(attr_key): _deserialize_h5_attr(attr_value) for attr_key, attr_value in target.attrs.items()
+        }
+    return attrs
+
+
+def write_h5_array(
+    path: PathLike,
+    key: str,
+    array: np.ndarray,
+    *,
+    attrs: Optional[Mapping[str, Any]] = None,
+    mode: str = "a",
+    compression: Optional[str] = "gzip",
+    compression_opts: Optional[int] = 4,
+    chunks: Optional[Tuple[int, ...]] = None,
+) -> Path:
+    """Write one array into HDF5.
+
+    Args:
+        path: HDF5 path.
+        key: Dataset key.
+        array: Numpy array.
+        attrs: Optional dataset-level attributes.
+        mode: HDF5 open mode.
+        compression: Dataset compression codec.
+        compression_opts: Compression level.
+        chunks: Optional explicit chunking.
+    """
+    resolved_path: Path = validate_suffix(path, SUPPORTED_H5_SUFFIXES)
+    ensure_parent_dir(resolved_path)
+
+    if not key:
+        raise ValidationError("HDF5 key must be non-empty.")
+
+    np_array: np.ndarray = np.asarray(array)
+
+    with h5py.File(resolved_path, mode) as file_handle:
+        if key in file_handle:
+            del file_handle[key]
+        dataset = file_handle.create_dataset(
+            key,
+            data=np_array,
+            compression=compression,
+            compression_opts=compression_opts,
+            chunks=chunks,
+        )
+        if attrs:
+            for attr_key, attr_value in attrs.items():
+                dataset.attrs[str(attr_key)] = _serialize_h5_attr(attr_value)
+
+    return resolved_path
+
+
+def write_h5_group(
+    path: PathLike,
+    arrays: Mapping[str, np.ndarray],
+    *,
+    attrs: Optional[Mapping[str, Any]] = None,
+    dataset_specs: Optional[Mapping[str, H5ArraySpec]] = None,
+    mode: str = "w",
+) -> Path:
+    """Write multiple arrays under one HDF5 file atomically.
+
+    Args:
+        path: Destination file.
+        arrays: Mapping key -> ndarray.
+        attrs: File-level attributes.
+        dataset_specs: Optional per-key writing spec.
+        mode: Write mode.
+    """
+    resolved_path: Path = validate_suffix(path, SUPPORTED_H5_SUFFIXES)
+    ensure_parent_dir(resolved_path)
+
+    if not arrays:
+        raise ValidationError("arrays must be non-empty for write_h5_group.")
+
+    with h5py.File(resolved_path, mode) as file_handle:
+        for key, array in arrays.items():
+            if not key:
+                raise ValidationError("All HDF5 dataset keys must be non-empty.")
+            spec: H5ArraySpec = (
+                dataset_specs[key] if dataset_specs is not None and key in dataset_specs else H5ArraySpec(key=key)
+            )
+            if key in file_handle:
+                del file_handle[key]
+            file_handle.create_dataset(
+                key,
+                data=np.asarray(array),
+                compression=spec.compression,
+                compression_opts=spec.compression_opts,
+                chunks=spec.chunks,
+            )
+
+        if attrs:
+            for attr_key, attr_value in attrs.items():
+                file_handle.attrs[str(attr_key)] = _serialize_h5_attr(attr_value)
+
+    return resolved_path
+
+
+# -----------------------------------------------------------------------------
+# Contract validators
+# -----------------------------------------------------------------------------
+
+def validate_manifest_dataframe(
+    dataframe: pd.DataFrame,
+    *,
+    required_keys: Sequence[str] = MANIFEST_REQUIRED_KEYS,
+    enforce_unique_sample_id: bool = True,
+) -> None:
+    """Validate manifest dataframe schema and minimal invariants."""
+    _require_columns(dataframe=dataframe, required_columns=required_keys, context="manifest")
+
+    if dataframe.empty:
+        raise ValidationError("Manifest dataframe is empty.")
+
+    _require_non_empty_series(dataframe["sample_id"], "manifest.sample_id")
+    _require_non_empty_series(dataframe["patient_id"], "manifest.patient_id")
+    _require_non_empty_series(dataframe["cohort"], "manifest.cohort")
+    _require_non_empty_series(dataframe["slide_path"], "manifest.slide_path")
+
+    if enforce_unique_sample_id:
+        duplicated_mask: pd.Series = dataframe["sample_id"].duplicated(keep=False)
+        if bool(duplicated_mask.any()):
+            duplicated_ids: List[str] = [str(item) for item in dataframe.loc[duplicated_mask, "sample_id"].tolist()]
+            raise ValidationError(
+                f"Manifest sample_id must be unique. Duplicates: {sorted(set(duplicated_ids))[:20]}"
+            )
+
+
+def validate_split_object(
+    split_obj: Mapping[str, Any],
+    *,
+    required_keys: Sequence[str] = SPLIT_REQUIRED_KEYS,
+    strict_disjoint: bool = True,
+) -> None:
+    """Validate split object schema and ID-level invariants."""
+    _require_mapping_keys(mapping=split_obj, required_keys=required_keys, context="split")
+
+    train_ids_raw: Any = split_obj["train_ids"]
+    test_ids_raw: Any = split_obj["test_ids"]
+
+    if not isinstance(train_ids_raw, Sequence) or isinstance(train_ids_raw, (str, bytes)):
+        raise ValidationError("split.train_ids must be a sequence of IDs.")
+    if not isinstance(test_ids_raw, Sequence) or isinstance(test_ids_raw, (str, bytes)):
+        raise ValidationError("split.test_ids must be a sequence of IDs.")
+
+    train_ids: List[str] = [str(item) for item in train_ids_raw]
+    test_ids: List[str] = [str(item) for item in test_ids_raw]
+
+    if len(set(train_ids)) != len(train_ids):
+        raise ValidationError("split.train_ids contains duplicate IDs.")
+    if len(set(test_ids)) != len(test_ids):
+        raise ValidationError("split.test_ids contains duplicate IDs.")
+
+    if strict_disjoint:
+        overlap: set[str] = set(train_ids).intersection(set(test_ids))
+        if overlap:
+            raise ValidationError(f"split.train_ids and split.test_ids overlap: {sorted(overlap)[:20]}")
+
+
+def validate_feature_pair(
+    *,
+    sample_id: str,
+    features: np.ndarray,
+    coords: np.ndarray,
+    expected_patch_size: int = DEFAULT_PATCH_SIZE,
+) -> None:
+    """Validate patch feature/coordinate pair.
+
+    Contract:
+    - features shape [N, D]
+    - coords shape [N, 2]
+    - same N for both
+    - finite values in features
+    """
+    if not sample_id or not sample_id.strip():
+        raise ValidationError("sample_id must be non-empty.")
+
+    feature_array: np.ndarray = np.asarray(features)
+    coord_array: np.ndarray = np.asarray(coords)
+
+    if feature_array.ndim != 2:
+        raise ValidationError(f"features must be rank-2 [N, D], got shape {feature_array.shape}.")
+    if coord_array.ndim != 2 or coord_array.shape[1] != 2:
+        raise ValidationError(f"coords must be rank-2 [N, 2], got shape {coord_array.shape}.")
+    if feature_array.shape[0] != coord_array.shape[0]:
+        raise ValidationError(
+            f"features/coords row mismatch for sample_id={sample_id}: "
+            f"{feature_array.shape[0]} vs {coord_array.shape[0]}"
+        )
+    if feature_array.shape[0] == 0:
+        raise ValidationError(f"No patches found for sample_id={sample_id}.")
+
+    if not np.isfinite(feature_array).all():
+        raise ValidationError(f"features contain NaN/Inf for sample_id={sample_id}.")
+
+    if not np.issubdtype(coord_array.dtype, np.integer):
+        if np.all(np.equal(np.mod(coord_array, 1), 0)):
+            pass
+        else:
+            raise ValidationError(f"coords must be integer-like for sample_id={sample_id}.")
+
+    if expected_patch_size <= 0:
+        raise ValidationError(f"expected_patch_size must be > 0, got {expected_patch_size}.")
+
+
+def validate_embedding_dataframe(
+    dataframe: pd.DataFrame,
+    *,
+    embedding_dim: int = DEFAULT_SLIDE_EMBEDDING_DIM,
+    require_level_column: bool = True,
+) -> None:
+    """Validate exported embedding dataframe."""
+    if dataframe.empty:
+        raise ValidationError("Embedding dataframe is empty.")
+
+    has_sample_id: bool = "sample_id" in dataframe.columns
+    has_patient_id: bool = "patient_id" in dataframe.columns
+
+    if has_sample_id == has_patient_id:
+        raise ValidationError(
+            "Embedding dataframe must include exactly one identifier namespace: "
+            "sample_id XOR patient_id."
+        )
+
+    required_columns: List[str] = ["cohort", "embedding", "embedding_dim", "model_name"]
+    if require_level_column:
+        required_columns.append("level")
+    _require_columns(dataframe=dataframe, required_columns=required_columns, context="embedding")
+
+    dims: np.ndarray = dataframe["embedding_dim"].to_numpy()
+    if not np.all(dims == embedding_dim):
+        unique_dims: List[int] = sorted({int(item) for item in dims.tolist()})
+        raise ValidationError(
+            f"Embedding dim mismatch. Expected {embedding_dim}, observed {unique_dims}."
+        )
+
+    embeddings: Sequence[Any] = dataframe["embedding"].tolist()
+    for index, value in enumerate(embeddings):
+        vector: np.ndarray = np.asarray(value, dtype=np.float32)
+        if vector.ndim != 1:
+            raise ValidationError(f"embedding row {index} is not 1D, got shape {vector.shape}.")
+        if vector.shape[0] != embedding_dim:
+            raise ValidationError(
+                f"embedding row {index} dim mismatch: expected {embedding_dim}, got {vector.shape[0]}."
+            )
+        if not np.isfinite(vector).all():
+            raise ValidationError(f"embedding row {index} contains NaN/Inf.")
+
+
+def validate_metrics_dataframe(
+    dataframe: pd.DataFrame,
+    *,
+    required_keys: Sequence[str] = METRICS_REQUIRED_KEYS,
+) -> None:
+    """Validate metrics dataframe contract."""
+    _require_columns(dataframe=dataframe, required_columns=required_keys, context="metrics")
+
+    for column_name in ("value", "ci_low", "ci_high"):
+        values: np.ndarray = pd.to_numeric(dataframe[column_name], errors="coerce").to_numpy(dtype=np.float64)
+        if np.isnan(values).any() or np.isinf(values).any():
+            raise ValidationError(f"metrics.{column_name} contains non-finite values.")
+
+
+# -----------------------------------------------------------------------------
+# Domain-specific read/write wrappers
+# -----------------------------------------------------------------------------
+
+def read_manifest(path: PathLike) -> pd.DataFrame:
+    """Read and validate manifest parquet."""
+    dataframe: pd.DataFrame = read_parquet(path)
+    normalize_manifest_columns(dataframe)
+    validate_manifest_dataframe(dataframe)
+    return dataframe
+
+
+def write_manifest(dataframe: pd.DataFrame, path: PathLike) -> Path:
+    """Validate and write manifest parquet."""
+    dataframe_copy: pd.DataFrame = dataframe.copy(deep=True)
+    normalize_manifest_columns(dataframe_copy)
+    validate_manifest_dataframe(dataframe_copy)
+    return write_parquet(dataframe_copy, path, sort_columns=False)
+
+
+def read_split(path: PathLike) -> Dict[str, Any]:
+    """Read and validate split JSON."""
+    split_obj: Dict[str, Any] = read_json(path)
+    validate_split_object(split_obj)
+    return split_obj
+
+
+def write_split(split_obj: Mapping[str, Any], path: PathLike) -> Path:
+    """Validate and write split JSON."""
+    validate_split_object(split_obj)
+    return write_json(dict(split_obj), path)
+
+
+def write_feature_store_sample(
+    path: PathLike,
+    *,
+    sample_id: str,
+    features: np.ndarray,
+    coords: np.ndarray,
+    encoder_name: str,
+    precision: str,
+    patch_size: int = DEFAULT_PATCH_SIZE,
+    target_magnification: str = DEFAULT_TARGET_MAGNIFICATION,
+) -> Path:
+    """Write one sample feature artifact in HDF5 with required metadata."""
+    validate_feature_pair(sample_id=sample_id, features=features, coords=coords, expected_patch_size=patch_size)
+
+    attrs: Dict[str, Any] = {
+        "sample_id": sample_id,
+        "encoder_name": encoder_name,
+        "precision": precision,
+        "patch_size": int(patch_size),
+        "target_magnification": str(target_magnification),
+        "feature_dim": int(np.asarray(features).shape[1]),
+        "created_at_utc": utc_timestamp(),
+        "schema_required_keys": list(FEATURE_STORE_REQUIRED_KEYS),
+    }
+
+    arrays: Dict[str, np.ndarray] = {
+        "features": np.asarray(features),
+        "coords": np.asarray(coords),
+    }
+
+    dataset_specs: Dict[str, H5ArraySpec] = {
+        "features": H5ArraySpec(key="features", compression="gzip", compression_opts=4),
+        "coords": H5ArraySpec(key="coords", compression="gzip", compression_opts=4),
+    }
+
+    return write_h5_group(
+        path=path,
+        arrays=arrays,
+        attrs=attrs,
+        dataset_specs=dataset_specs,
+        mode="w",
+    )
+
+
+def read_feature_store_sample(path: PathLike) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Read one sample feature artifact and validate integrity."""
+    features: np.ndarray = read_h5_array(path, "features")
+    coords: np.ndarray = read_h5_array(path, "coords")
+    attrs: Dict[str, Any] = read_h5_attrs(path)
+
+    sample_id: str = str(attrs.get("sample_id", "")).strip()
+    if not sample_id:
+        raise IntegrityError(f"Missing required attribute 'sample_id' in feature file: {Path(path)}")
+
+    validate_feature_pair(sample_id=sample_id, features=features, coords=coords)
+
+    feature_dim_attr: Optional[Any] = attrs.get("feature_dim")
+    if feature_dim_attr is not None:
+        expected_dim: int = int(feature_dim_attr)
+        observed_dim: int = int(features.shape[1])
+        if observed_dim != expected_dim:
+            raise IntegrityError(
+                f"feature_dim mismatch for sample_id={sample_id}: attr={expected_dim}, observed={observed_dim}."
+            )
+
+    return features, coords, attrs
+
+
+def read_embeddings(path: PathLike, validate: bool = True) -> pd.DataFrame:
+    """Read embeddings parquet and optionally validate."""
+    dataframe: pd.DataFrame = read_parquet(path)
+    if validate:
+        validate_embedding_dataframe(dataframe)
+    return dataframe
+
+
+def write_embeddings(
+    dataframe: pd.DataFrame,
+    path: PathLike,
+    *,
+    embedding_dim: int = DEFAULT_SLIDE_EMBEDDING_DIM,
+    validate: bool = True,
+) -> Path:
+    """Write embeddings parquet with optional validation."""
+    data_copy: pd.DataFrame = dataframe.copy(deep=True)
+    if validate:
+        validate_embedding_dataframe(data_copy, embedding_dim=embedding_dim)
+    return write_parquet(data_copy, path, sort_columns=False)
+
+
+def read_metrics(path: PathLike, validate: bool = True) -> pd.DataFrame:
+    """Read metrics parquet and optionally validate."""
+    dataframe: pd.DataFrame = read_parquet(path)
+    if validate:
+        validate_metrics_dataframe(dataframe)
+    return dataframe
+
+
+def write_metrics(dataframe: pd.DataFrame, path: PathLike, validate: bool = True) -> Path:
+    """Write metrics parquet with optional schema validation."""
+    data_copy: pd.DataFrame = dataframe.copy(deep=True)
+    if validate:
+        validate_metrics_dataframe(data_copy)
+    return write_parquet(data_copy, path, sort_columns=False)
+
+
+def write_checksum_sidecar(path: PathLike, *, algorithm: str = "sha256") -> Path:
+    """Write checksum sidecar JSON for an existing artifact.
+
+    Sidecar filename: <artifact_name>.checksum.json
+    """
+    resolved_path: Path = Path(path).expanduser().resolve()
+    if not resolved_path.exists() or not resolved_path.is_file():
+        raise FileNotFoundError(f"Cannot write checksum sidecar for missing file: {resolved_path}")
+
+    normalized_algorithm: str = algorithm.strip().lower()
+    if normalized_algorithm != "sha256":
+        raise ValidationError(f"Unsupported checksum algorithm: {algorithm!r}. Only 'sha256' is supported.")
+
+    digest: str = compute_file_sha256(resolved_path)
+    sidecar_path: Path = resolved_path.with_name(f"{resolved_path.name}.checksum.json")
+
+    payload: Dict[str, Any] = {
+        "artifact_path": str(resolved_path),
+        "algorithm": normalized_algorithm,
+        "digest": digest,
+        "created_at_utc": utc_timestamp(),
+    }
+    return write_json(payload, sidecar_path)
+
+
+# -----------------------------------------------------------------------------
+# Internal validation helpers
+# -----------------------------------------------------------------------------
+
+def _require_columns(dataframe: pd.DataFrame, required_columns: Sequence[str], context: str) -> None:
+    missing_columns: List[str] = [column for column in required_columns if column not in dataframe.columns]
+    if missing_columns:
+        raise ValidationError(f"Missing required {context} columns: {missing_columns}")
+
+
+def _require_mapping_keys(mapping: Mapping[str, Any], required_keys: Sequence[str], context: str) -> None:
+    missing_keys: List[str] = [key for key in required_keys if key not in mapping]
+    if missing_keys:
+        raise ValidationError(f"Missing required {context} keys: {missing_keys}")
+
+
+def _require_non_empty_series(series: pd.Series, name: str) -> None:
+    values: List[str] = [str(item).strip() for item in series.tolist()]
+    if any(value == "" for value in values):
+        raise ValidationError(f"{name} contains empty values.")
+
+
+def _serialize_h5_attr(value: Any) -> Any:
+    """Serialize attribute value for robust h5py storage."""
+    serialized: Any = to_serializable(value)
+    if isinstance(serialized, (dict, list)):
+        return json.dumps(serialized, sort_keys=True, ensure_ascii=True)
+    return serialized
+
+
+def _deserialize_h5_attr(value: Any) -> Any:
+    """Best-effort HDF5 attribute deserialization."""
+    if isinstance(value, bytes):
+        decoded: str = value.decode("utf-8")
+        return _try_json_decode(decoded)
+    if isinstance(value, str):
+        return _try_json_decode(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _try_json_decode(value: str) -> Any:
+    """Attempt JSON decode; fallback to plain string."""
+    value_stripped: str = value.strip()
+    if not value_stripped:
+        return value
+    if value_stripped.startswith("{") or value_stripped.startswith("["):
+        try:
+            return json.loads(value_stripped)
+        except json.JSONDecodeError:
+            return value
+    return value
+
+
+def normalize_manifest_columns(dataframe: pd.DataFrame) -> None:
+    """Normalize manifest object columns in-place.
+
+    - `task_labels` and `meta` are normalized to dictionaries.
+    - `rna_path` and `dna_path` nulls become empty string.
+    - `magnification` is normalized to string if numeric-like input is mixed.
+    """
+    if "task_labels" in dataframe.columns:
+        dataframe["task_labels"] = dataframe["task_labels"].apply(_normalize_mapping_cell)
+
+    if "meta" in dataframe.columns:
+        dataframe["meta"] = dataframe["meta"].apply(_normalize_mapping_cell)
+
+    for column_name in ("rna_path", "dna_path"):
+        if column_name in dataframe.columns:
+            dataframe[column_name] = dataframe[column_name].fillna("").astype(str)
+
+    if "magnification" in dataframe.columns:
+        dataframe["magnification"] = dataframe["magnification"].apply(_normalize_magnification_cell)
+
+
+def _normalize_mapping_cell(value: Any) -> Dict[str, Any]:
+    """Normalize one dataframe cell into mapping."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return {}
+
+    if isinstance(value, Mapping):
+        return {str(key): to_serializable(item) for key, item in value.items()}
+
+    if isinstance(value, str):
+        stripped: str = value.strip()
+        if stripped == "":
+            return {}
+        try:
+            loaded: Any = json.loads(stripped)
+            if isinstance(loaded, Mapping):
+                return {str(key): to_serializable(item) for key, item in loaded.items()}
+        except json.JSONDecodeError:
+            pass
+        raise ValidationError(f"Expected mapping-compatible JSON string, got: {value!r}")
+
+    raise ValidationError(f"Expected mapping cell, got {type(value).__name__}")
+
+
+def _normalize_magnification_cell(value: Any) -> Any:
+    """Normalize magnification representation while preserving explicit inputs."""
+    if value is None:
+        return DEFAULT_TARGET_MAGNIFICATION
+
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+
+    if isinstance(value, float):
+        if value.is_integer():
+            return int(value)
+        return str(value)
+
+    value_str: str = str(value).strip()
+    return value_str if value_str else DEFAULT_TARGET_MAGNIFICATION
+
+
+__all__ = [
+    "DEFAULT_SLIDE_EMBEDDING_DIM",
+    "DEFAULT_PATCH_SIZE",
+    "DEFAULT_TARGET_MAGNIFICATION",
+    "DEFAULT_LINEAR_PROBE_C",
+    "DEFAULT_LINEAR_PROBE_SOLVER",
+    "DEFAULT_LINEAR_PROBE_MAX_ITER",
+    "DEFAULT_SURVIVAL_ALPHA_OS",
+    "DEFAULT_SURVIVAL_ALPHA_PFS",
+    "MANIFEST_REQUIRED_KEYS",
+    "SPLIT_REQUIRED_KEYS",
+    "FEATURE_STORE_REQUIRED_KEYS",
+    "METRICS_REQUIRED_KEYS",
+    "H5ArraySpec",
+    "IOErrorBase",
+    "ValidationError",
+    "FileFormatError",
+    "IntegrityError",
+    "ensure_parent_dir",
+    "ensure_dir",
+    "validate_suffix",
+    "utc_timestamp",
+    "to_serializable",
+    "compute_file_sha256",
+    "read_yaml",
+    "write_yaml",
+    "read_json",
+    "write_json",
+    "read_parquet",
+    "write_parquet",
+    "read_h5_array",
+    "read_h5_attrs",
+    "write_h5_array",
+    "write_h5_group",
+    "validate_manifest_dataframe",
+    "validate_split_object",
+    "validate_feature_pair",
+    "validate_embedding_dataframe",
+    "validate_metrics_dataframe",
+    "read_manifest",
+    "write_manifest",
+    "read_split",
+    "write_split",
+    "write_feature_store_sample",
+    "read_feature_store_sample",
+    "read_embeddings",
+    "write_embeddings",
+    "read_metrics",
+    "write_metrics",
+    "write_checksum_sidecar",
+    "normalize_manifest_columns",
+]
+```

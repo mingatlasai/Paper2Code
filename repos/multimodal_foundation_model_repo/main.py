@@ -1,0 +1,365 @@
+"""CLI entrypoint for THREADS reproduction pipelines.
+
+This module provides a thin, config-driven dispatcher over four stages:
+- preprocess
+- pretrain
+- embed
+- eval
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import tempfile
+from time import perf_counter
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Sequence
+
+import yaml
+
+if TYPE_CHECKING:
+    from src.core.config import ExperimentConfig
+
+
+DEFAULT_CONFIG_PATH_PRIMARY: str = "config.yaml"
+DEFAULT_CONFIG_PATH_FALLBACK: str = "configs/default.yaml"
+DEFAULT_STAGE: str = ""
+ALLOWED_STAGES: tuple[str, ...] = ("preprocess", "pretrain", "embed", "eval")
+DEFAULT_INDENT: int = 2
+EXIT_SUCCESS: int = 0
+EXIT_FAILURE: int = 1
+
+
+class MainAppError(Exception):
+    """Base exception for main application failures."""
+
+
+class MainAppConfigError(MainAppError):
+    """Raised when configuration path or content is invalid."""
+
+
+class MainAppStageError(MainAppError):
+    """Raised when stage resolution or dispatch fails."""
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """Serializable top-level run summary."""
+
+    status: str
+    stage: str
+    config_path: str
+    elapsed_sec: float
+    pipeline_result: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to JSON-serializable dictionary."""
+        return {
+            "status": str(self.status),
+            "stage": str(self.stage),
+            "config_path": str(self.config_path),
+            "elapsed_sec": float(self.elapsed_sec),
+            "pipeline_result": dict(self.pipeline_result),
+        }
+
+
+class MainApp:
+    """Top-level application dispatcher."""
+
+    def __init__(self, cfg_path: str) -> None:
+        """Initialize with a base configuration path.
+
+        Args:
+            cfg_path: Path to YAML config. Empty means auto-resolve default.
+        """
+        normalized_input_path: str = str(cfg_path).strip()
+        resolved_cfg_path: str = self._resolve_config_path(normalized_input_path)
+        self._base_cfg_path: str = resolved_cfg_path
+        experiment_config_class = self._load_experiment_config_class()
+        self._base_cfg: ExperimentConfig = experiment_config_class.from_yaml(resolved_cfg_path)
+        self._base_cfg.validate()
+
+        self._effective_cfg_path: str = resolved_cfg_path
+        self._effective_cfg: ExperimentConfig = self._base_cfg
+        self._effective_stage: str = self._base_cfg.stage
+        self._temporary_cfg_path: str = ""
+        self._last_pipeline_result: Dict[str, Any] = {}
+        self._last_run_summary: Optional[RunSummary] = None
+
+    def run(self, stage: str) -> None:
+        """Run one pipeline stage.
+
+        Args:
+            stage: Stage name. Empty string falls back to config runtime stage.
+        """
+        requested_stage: str = self._resolve_requested_stage(stage)
+        run_start_time: float = perf_counter()
+
+        try:
+            self._prepare_effective_config(requested_stage)
+            deterministic: bool = self._resolve_deterministic(self._effective_cfg.to_dict())
+            seed_state: Dict[str, Any] = self._seed_everything(
+                global_seed=int(self._effective_cfg.seed),
+                deterministic=deterministic,
+                stage=requested_stage,
+            )
+            _ = seed_state
+
+            self.run_dispatch(requested_stage)
+
+            elapsed_sec: float = perf_counter() - run_start_time
+            self._last_run_summary = RunSummary(
+                status="success",
+                stage=requested_stage,
+                config_path=self._effective_cfg_path,
+                elapsed_sec=elapsed_sec,
+                pipeline_result=self._last_pipeline_result,
+            )
+        finally:
+            self._cleanup_temporary_config()
+
+    def run_dispatch(self, stage: str) -> None:
+        """Dispatch to stage-specific handler.
+
+        Args:
+            stage: Valid normalized stage.
+        """
+        normalized_stage: str = self._normalize_stage(stage)
+        if normalized_stage == "preprocess":
+            self.run_preprocess()
+            return
+        if normalized_stage == "pretrain":
+            self.run_pretrain()
+            return
+        if normalized_stage == "embed":
+            self.run_embed()
+            return
+        if normalized_stage == "eval":
+            self.run_eval()
+            return
+        raise MainAppStageError(
+            f"Unsupported stage {normalized_stage!r}. Allowed: {list(ALLOWED_STAGES)}."
+        )
+
+    def run_preprocess(self) -> None:
+        """Run preprocess stage."""
+        from src.pipelines.run_preprocess import run_preprocess
+
+        result: Dict[str, Any] = run_preprocess(cfg_or_path=self._effective_cfg)
+        self._last_pipeline_result = dict(result)
+
+    def run_pretrain(self) -> None:
+        """Run pretrain stage."""
+        from src.pipelines.run_pretrain import run_pretrain
+
+        result: Dict[str, Any] = run_pretrain(cfg_or_path=self._effective_cfg)
+        self._last_pipeline_result = dict(result)
+
+    def run_embed(self) -> None:
+        """Run embed stage."""
+        from src.pipelines.run_embed import run_embed
+
+        result: Dict[str, Any] = run_embed(cfg_or_path=self._effective_cfg)
+        self._last_pipeline_result = dict(result)
+
+    def run_eval(self) -> None:
+        """Run eval stage."""
+        from src.pipelines.run_eval import run_eval
+
+        result: Dict[str, Any] = run_eval(cfg_or_path=self._effective_cfg)
+        self._last_pipeline_result = dict(result)
+
+    @property
+    def last_summary(self) -> Optional[RunSummary]:
+        """Return the last run summary if available."""
+        return self._last_run_summary
+
+    def _resolve_requested_stage(self, stage: str) -> str:
+        normalized_stage: str = str(stage).strip().lower()
+        if normalized_stage == "":
+            normalized_stage = self._base_cfg.stage
+        return self._normalize_stage(normalized_stage)
+
+    def _prepare_effective_config(self, stage: str) -> None:
+        """Materialize effective config honoring CLI stage precedence."""
+        normalized_stage: str = self._normalize_stage(stage)
+        self._temporary_cfg_path = ""
+
+        if normalized_stage == self._base_cfg.stage:
+            self._effective_cfg_path = self._base_cfg_path
+            self._effective_cfg = self._base_cfg
+            self._effective_stage = normalized_stage
+            return
+
+        with open(self._base_cfg_path, "r", encoding="utf-8") as handle:
+            loaded_yaml: Any = yaml.safe_load(handle)
+        if not isinstance(loaded_yaml, dict):
+            raise MainAppConfigError(
+                f"Expected mapping at config root, got {type(loaded_yaml).__name__}."
+            )
+
+        runtime_section: Any = loaded_yaml.get("runtime")
+        if runtime_section is None:
+            runtime_section = {}
+            loaded_yaml["runtime"] = runtime_section
+        if not isinstance(runtime_section, dict):
+            raise MainAppConfigError("Config key 'runtime' must be a mapping.")
+
+        runtime_section["stage"] = normalized_stage
+        runtime_section["mode"] = normalized_stage
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".yaml",
+            prefix=f"threads_{normalized_stage}_",
+            delete=False,
+            encoding="utf-8",
+        ) as temp_file:
+            yaml.safe_dump(loaded_yaml, temp_file, sort_keys=False)
+            temp_config_path: str = str(Path(temp_file.name).resolve())
+
+        self._temporary_cfg_path = temp_config_path
+        self._effective_cfg_path = temp_config_path
+        experiment_config_class = self._load_experiment_config_class()
+        self._effective_cfg = experiment_config_class.from_yaml(temp_config_path)
+        self._effective_cfg.validate()
+        self._effective_stage = normalized_stage
+
+    def _cleanup_temporary_config(self) -> None:
+        temporary_cfg_path: str = str(self._temporary_cfg_path).strip()
+        if temporary_cfg_path == "":
+            return
+
+        temp_path_obj: Path = Path(temporary_cfg_path)
+        if temp_path_obj.exists() and temp_path_obj.is_file():
+            temp_path_obj.unlink()
+        self._temporary_cfg_path = ""
+
+    @staticmethod
+    def _normalize_stage(stage: str) -> str:
+        normalized_stage: str = str(stage).strip().lower()
+        if normalized_stage not in ALLOWED_STAGES:
+            raise MainAppStageError(
+                f"Unsupported stage {normalized_stage!r}. Allowed: {list(ALLOWED_STAGES)}."
+            )
+        return normalized_stage
+
+    @staticmethod
+    def _resolve_config_path(input_path: str) -> str:
+        candidate_input: str = str(input_path).strip()
+        if candidate_input != "":
+            path_obj: Path = Path(candidate_input).expanduser().resolve()
+            if not path_obj.exists() or not path_obj.is_file():
+                raise MainAppConfigError(
+                    f"Config file does not exist or is not a file: {path_obj}"
+                )
+            return str(path_obj)
+
+        primary_path: Path = Path(DEFAULT_CONFIG_PATH_PRIMARY).expanduser().resolve()
+        if primary_path.exists() and primary_path.is_file():
+            return str(primary_path)
+
+        fallback_path: Path = Path(DEFAULT_CONFIG_PATH_FALLBACK).expanduser().resolve()
+        if fallback_path.exists() and fallback_path.is_file():
+            return str(fallback_path)
+
+        raise MainAppConfigError(
+            "No default config file found. Expected either "
+            f"{DEFAULT_CONFIG_PATH_PRIMARY!r} or {DEFAULT_CONFIG_PATH_FALLBACK!r}."
+        )
+
+    @staticmethod
+    def _resolve_deterministic(config: Mapping[str, Any]) -> bool:
+        runtime_section: Any = config.get("runtime", {})
+        if not isinstance(runtime_section, Mapping):
+            return True
+        deterministic_raw: Any = runtime_section.get("deterministic", True)
+        if isinstance(deterministic_raw, bool):
+            return deterministic_raw
+        if isinstance(deterministic_raw, str):
+            token: str = deterministic_raw.strip().lower()
+            if token in {"1", "true", "t", "yes", "y", "on"}:
+                return True
+            if token in {"0", "false", "f", "no", "n", "off"}:
+                return False
+        if isinstance(deterministic_raw, (int, float)):
+            return bool(deterministic_raw)
+        return True
+
+    @staticmethod
+    def _load_experiment_config_class() -> type["ExperimentConfig"]:
+        from src.core.config import ExperimentConfig
+
+        return ExperimentConfig
+
+    @staticmethod
+    def _seed_everything(global_seed: int, deterministic: bool, stage: str) -> Dict[str, Any]:
+        from src.utils.seeding import seed_everything
+
+        return dict(
+            seed_everything(
+                global_seed=int(global_seed),
+                deterministic=bool(deterministic),
+                stage=str(stage),
+            )
+        )
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        prog="main.py",
+        description="THREADS reproduction stage dispatcher.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=DEFAULT_CONFIG_PATH_PRIMARY,
+        help=(
+            "Path to config YAML. If omitted and 'config.yaml' is unavailable, "
+            f"falls back to '{DEFAULT_CONFIG_PATH_FALLBACK}'."
+        ),
+    )
+    parser.add_argument(
+        "--stage",
+        type=str,
+        default=DEFAULT_STAGE,
+        choices=ALLOWED_STAGES,
+        help="Pipeline stage to run. Empty uses runtime.stage from config.",
+    )
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Program entrypoint.
+
+    Args:
+        argv: Optional command line argument sequence.
+
+    Returns:
+        Process exit code.
+    """
+    parser: argparse.ArgumentParser = _build_arg_parser()
+    args: argparse.Namespace = parser.parse_args(argv)
+
+    try:
+        app: MainApp = MainApp(cfg_path=str(args.config))
+        app.run(stage=str(args.stage))
+
+        summary: Optional[RunSummary] = app.last_summary
+        if summary is not None:
+            print(json.dumps(summary.to_dict(), indent=DEFAULT_INDENT, sort_keys=True))
+        return EXIT_SUCCESS
+    except Exception as exc:  # noqa: BLE001
+        error_payload: Dict[str, str] = {
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+        print(json.dumps(error_payload, indent=DEFAULT_INDENT, sort_keys=True))
+        return EXIT_FAILURE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

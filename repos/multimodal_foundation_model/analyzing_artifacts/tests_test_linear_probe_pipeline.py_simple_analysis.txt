@@ -1,0 +1,9 @@
+Implemented the requested logic analysis in `tests/test_linear_probe_pipeline.py`.
+
+It now documents, in paper/config-aligned detail, the smoke-test logic for:
+- exported embeddings + split compatibility,
+- metric validity and routing,
+- deterministic behavior with fixed seeds,
+- leakage and schema invariants,
+- few-shot/test-set consistency,
+- strict fixed linear-probe hyperparameters (`C=0.5`, `lbfgs`, `max_iter=10000`, `class_weight=balanced`).

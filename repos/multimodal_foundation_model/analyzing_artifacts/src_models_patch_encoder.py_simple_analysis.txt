@@ -1,0 +1,15 @@
+Implemented the requested logic analysis in `src/models/patch_encoder.py`.
+
+What I added:
+- A full analysis docstring for the `PatchEncoder` and `ConchPatchEncoder` contracts.
+- Strict alignment to your design interfaces (no extra public methods).
+- Explicit references to `config.yaml` constraints:
+  - 20x, 512 patch size/stride, no overlap
+  - resize 512→448
+  - ImageNet normalization
+  - CONCHV1.5 adapter
+  - patch feature dim 768 (downstream THREADS compatibility)
+- Integration contracts with `src/data/patch_tiler.py`, `src/data/feature_store.py`, and `src/models/slide_encoder_threads.py`.
+- Determinism/error handling/validation checklist for coding phase.
+
+File updated: `src/models/patch_encoder.py`

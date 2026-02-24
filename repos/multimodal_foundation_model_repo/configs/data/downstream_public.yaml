@@ -1,0 +1,607 @@
+# Logic analysis for public downstream evaluation configuration.
+# Purpose:
+# - Define downstream tasks, split strategy (official/CV/MC), patient grouping keys,
+#   metric mapping, transferability, retrieval, and prompting behavior.
+# - Serve as configuration input for split_manager.py and run_eval.py.
+# Constraint:
+# - Values are grounded in provided paper context and config.yaml only.
+
+downstream_public:
+  config_version: "1.0"
+  paper_id: "Molecular-driven Foundation Model for Oncologic Pathology"
+  intent: "THREADS public-only downstream benchmark configuration"
+
+  reproduction_scope:
+    mode: "public_only"
+    tier: "Tier B"
+    includes_public_tasks_only: true
+    full_54_task_parity_expected: false
+    excludes_private_cohorts:
+      - "MGH/BWH internal diagnostic cohorts"
+      - "Internal GBM treatment cohort"
+    notes:
+      - "Public tasks are enabled by default."
+      - "Any private-only transfer target remains listed but disabled by default."
+
+  shared_constants:
+    embedding_dim: 1024
+    patch_size: 512
+    patch_stride: 512
+    target_magnification: "20x"
+    patient_aggregation_rule: "union_of_patches_across_all_wsis"
+
+  io:
+    manifests_root: "data/processed/manifests"
+    labels_root: "data/processed/labels"
+    splits_root: "data/processed/splits"
+    embeddings_root: "data/processed/embeddings"
+    reports_root: "outputs/reports"
+    artifacts_layout: "runs/{date}/{stage}/{run_id}"
+
+  schema_contract:
+    manifest_record_required_keys:
+      - "sample_id"
+      - "patient_id"
+      - "cohort"
+      - "slide_path"
+      - "magnification"
+      - "rna_path"
+      - "dna_path"
+      - "task_labels"
+      - "meta"
+    split_schema_required_keys:
+      - "task_name"
+      - "fold_id"
+      - "train_ids"
+      - "test_ids"
+    feature_store_required_keys:
+      - "sample_id"
+      - "coords"
+      - "features"
+      - "encoder_name"
+      - "precision"
+    metrics_schema_required_keys:
+      - "task"
+      - "fold"
+      - "metric_name"
+      - "value"
+      - "ci_low"
+      - "ci_high"
+      - "model_name"
+
+  patient_embedding_policy:
+    slide_level_aggregation: "single_slide_embedding"
+    patient_level_aggregation: "union_of_patches_across_all_wsis"
+    patient_group_key: "patient_id"
+    sample_key: "sample_id"
+
+  split_policy:
+    seed: 42
+    official_single_fold_datasets:
+      - "EBRAINS"
+      - "PANDA"
+      - "IMP"
+    strategy_catalog:
+      official_single_fold:
+        strategy_name: "official_single_fold"
+        enabled: true
+        n_folds: 1
+        train_ratio: 0.8
+        test_ratio: 0.2
+        group_by: "patient_id"
+        stratify_by: "label"
+      cv5_80_20:
+        strategy_name: "cv5_80_20"
+        enabled: true
+        n_folds: 5
+        train_ratio: 0.8
+        test_ratio: 0.2
+        group_by: "patient_id"
+        stratify_by: "label"
+      mc50:
+        strategy_name: "mc50"
+        enabled: true
+        n_splits: 50
+        train_ratio: 0.8
+        test_ratio: 0.2
+        group_by: "patient_id"
+        stratify_by: "label"
+
+    few_shot:
+      enabled: true
+      k_values: [1, 2, 4, 8, 16, 32]
+      derived_from_k_all_train_split: true
+      fixed_test_set_per_task: true
+      omit_infeasible_k: true
+      bootstrap_repeats_if_single_base_fold: 5
+
+    dataset_specific_exceptions:
+      BRACS:
+        stratify_by_label: false
+        group_by: "patient_id"
+        reason: "Multiple slides per patient with potential multi-label constraints."
+
+  metric_mapping:
+    binary_classification: "macro_auc"
+    multiclass_subtyping: "balanced_accuracy"
+    multiclass_grading: "quadratic_weighted_kappa"
+    survival: "c_index"
+    retrieval: "map_at_k"
+
+  linear_probe:
+    classification:
+      enabled: true
+      model: "LogisticRegression"
+      C: 0.5
+      solver: "lbfgs"
+      max_iter: 10000
+      class_weight: "balanced"
+      hyperparameter_search: false
+    survival:
+      enabled: true
+      model: "CoxNet"
+      max_iter: 10000
+      alpha_defaults:
+        overall_survival: 0.07
+        progression_free_survival: 0.01
+      alpha_overrides:
+        - task: "CPTAC-CCRCC overall survival"
+          model: "CHIEF"
+          alpha: 0.01
+        - task: "BOEHMK progression-free survival"
+          model: "PRISM"
+          alpha: 0.02
+
+  uncertainty_and_statistics:
+    confidence_intervals:
+      multi_fold: "mean_plus_minus_standard_error"
+      single_fold: "bootstrap_95_ci"
+      bootstrap_replicates: 100
+    per_task_significance:
+      enabled: true
+      omnibus: "two_way_anova"
+      post_hoc: "tukey_hsd_if_anova_p_lt_0_05"
+    across_tasks_significance:
+      enabled: true
+      model: "mixed_effects"
+      random_effect: "dataset"
+      pairwise_adjustment: "tukey"
+    km_curve_test:
+      enabled: true
+      method: "log_rank"
+
+  task_families:
+    clinical_subtyping_and_grading:
+      enabled: true
+      expected_task_count_in_full_benchmark: 8
+      public_tasks:
+        - task_name: "PANDA_ISUP_grading"
+          enabled: true
+          cohort: "PANDA"
+          unit: "slide"
+          task_type: "grading_multiclass"
+          metric: "quadratic_weighted_kappa"
+          split_strategy: "official_single_fold"
+        - task_name: "IMP_crc_grading"
+          enabled: true
+          cohort: "IMP"
+          unit: "slide"
+          task_type: "grading_multiclass"
+          metric: "quadratic_weighted_kappa"
+          split_strategy: "official_single_fold"
+        - task_name: "BRACS_fine_subtyping"
+          enabled: true
+          cohort: "BRACS"
+          unit: "slide"
+          task_type: "subtyping_multiclass"
+          metric: "balanced_accuracy"
+          split_strategy: "cv5_80_20"
+        - task_name: "BRACS_coarse_subtyping"
+          enabled: true
+          cohort: "BRACS"
+          unit: "slide"
+          task_type: "subtyping_multiclass"
+          metric: "balanced_accuracy"
+          split_strategy: "cv5_80_20"
+        - task_name: "EBRAINS_fine_subtyping"
+          enabled: true
+          cohort: "EBRAINS"
+          unit: "slide"
+          task_type: "subtyping_multiclass"
+          metric: "balanced_accuracy"
+          split_strategy: "official_single_fold"
+        - task_name: "EBRAINS_coarse_subtyping"
+          enabled: true
+          cohort: "EBRAINS"
+          unit: "slide"
+          task_type: "subtyping_multiclass"
+          metric: "balanced_accuracy"
+          split_strategy: "official_single_fold"
+
+    mutation_prediction:
+      enabled: true
+      expected_task_count_in_full_benchmark: 21
+      public_tasks:
+        - task_name: "MUT_HET_RCC_BAP1"
+          enabled: true
+          cohort: "MUT_HET_RCC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+        - task_name: "MUT_HET_RCC_PBRM1"
+          enabled: true
+          cohort: "MUT_HET_RCC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+        - task_name: "MUT_HET_RCC_SETD2"
+          enabled: true
+          cohort: "MUT_HET_RCC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+        - task_name: "CPTAC_BRCA_PIK3CA"
+          enabled: true
+          cohort: "CPTAC_BRCA"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_BRCA_TP53"
+          enabled: true
+          cohort: "CPTAC_BRCA"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_CCRCC_BAP1"
+          enabled: true
+          cohort: "CPTAC_CCRCC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_CCRCC_PBRM1"
+          enabled: true
+          cohort: "CPTAC_CCRCC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_COAD_KRAS"
+          enabled: true
+          cohort: "CPTAC_COAD"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_COAD_TP53"
+          enabled: true
+          cohort: "CPTAC_COAD"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_GBM_EGFR"
+          enabled: true
+          cohort: "CPTAC_GBM"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_GBM_TP53"
+          enabled: true
+          cohort: "CPTAC_GBM"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_HNSC_CASP8"
+          enabled: true
+          cohort: "CPTAC_HNSC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_LSCC_KEAP1"
+          enabled: true
+          cohort: "CPTAC_LSCC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_LSCC_ARID1A"
+          enabled: true
+          cohort: "CPTAC_LSCC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_LUAD_EGFR"
+          enabled: true
+          cohort: "CPTAC_LUAD"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_LUAD_STK11"
+          enabled: true
+          cohort: "CPTAC_LUAD"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_LUAD_TP53"
+          enabled: true
+          cohort: "CPTAC_LUAD"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "CPTAC_PDAC_SMAD4"
+          enabled: true
+          cohort: "CPTAC_PDAC"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "SURGEN_BRAF"
+          enabled: true
+          cohort: "SURGEN"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+        - task_name: "SURGEN_KRAS"
+          enabled: true
+          cohort: "SURGEN"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+        - task_name: "SURGEN_MMR_loss"
+          enabled: true
+          cohort: "SURGEN"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+
+    ihc_status_prediction:
+      enabled: true
+      expected_task_count_in_full_benchmark: 12
+      public_tasks:
+        - task_name: "BCNB_ER"
+          enabled: true
+          cohort: "BCNB"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+        - task_name: "BCNB_PR"
+          enabled: true
+          cohort: "BCNB"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+        - task_name: "BCNB_HER2"
+          enabled: true
+          cohort: "BCNB"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+
+    treatment_response_and_survival_prediction:
+      enabled: true
+      expected_task_count_in_full_benchmark: 13
+      public_tasks:
+        - task_name: "OV_Bevacizumab_response"
+          enabled: true
+          cohort: "OV_BEVACIZUMAB"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "NADT_Prostate_response"
+          enabled: true
+          cohort: "NADT_PROSTATE"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "Post_NAT_BRCA_lymphovascular_invasion"
+          enabled: true
+          cohort: "POST_NAT_BRCA"
+          unit: "slide"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "mc50"
+        - task_name: "MBC_RECIST"
+          enabled: true
+          cohort: "MBC"
+          unit: "patient"
+          task_type: "grading_multiclass"
+          metric: "quadratic_weighted_kappa"
+          split_strategy: "mc50"
+        - task_name: "SURGEN_5y_death"
+          enabled: true
+          cohort: "SURGEN"
+          unit: "patient"
+          task_type: "binary_classification"
+          metric: "macro_auc"
+          split_strategy: "cv5_80_20"
+        - task_name: "CPTAC_CCRCC_overall_survival"
+          enabled: true
+          cohort: "CPTAC_CCRCC"
+          unit: "patient"
+          task_type: "survival"
+          survival_endpoint: "overall_survival"
+          metric: "c_index"
+          split_strategy: "cv5_80_20"
+        - task_name: "CPTAC_PDAC_overall_survival"
+          enabled: true
+          cohort: "CPTAC_PDAC"
+          unit: "patient"
+          task_type: "survival"
+          survival_endpoint: "overall_survival"
+          metric: "c_index"
+          split_strategy: "cv5_80_20"
+        - task_name: "CPTAC_LUAD_overall_survival"
+          enabled: true
+          cohort: "CPTAC_LUAD"
+          unit: "patient"
+          task_type: "survival"
+          survival_endpoint: "overall_survival"
+          metric: "c_index"
+          split_strategy: "cv5_80_20"
+        - task_name: "CPTAC_HNSC_overall_survival"
+          enabled: true
+          cohort: "CPTAC_HNSC"
+          unit: "patient"
+          task_type: "survival"
+          survival_endpoint: "overall_survival"
+          metric: "c_index"
+          split_strategy: "cv5_80_20"
+        - task_name: "SURGEN_overall_survival"
+          enabled: true
+          cohort: "SURGEN"
+          unit: "patient"
+          task_type: "survival"
+          survival_endpoint: "overall_survival"
+          metric: "c_index"
+          split_strategy: "cv5_80_20"
+        - task_name: "MBC_overall_survival"
+          enabled: true
+          cohort: "MBC"
+          unit: "patient"
+          task_type: "survival"
+          survival_endpoint: "overall_survival"
+          metric: "c_index"
+          split_strategy: "cv5_80_20"
+        - task_name: "BOEHMK_overall_survival"
+          enabled: true
+          cohort: "BOEHMK"
+          unit: "patient"
+          task_type: "survival"
+          survival_endpoint: "overall_survival"
+          metric: "c_index"
+          split_strategy: "cv5_80_20"
+        - task_name: "BOEHMK_progression_free_survival"
+          enabled: true
+          cohort: "BOEHMK"
+          unit: "patient"
+          task_type: "survival"
+          survival_endpoint: "progression_free_survival"
+          metric: "c_index"
+          split_strategy: "cv5_80_20"
+
+  transferability:
+    enabled: true
+    policy:
+      train_on_all_source_samples: true
+      test_on_all_target_samples: true
+      test_bootstrap_replicates: 100
+    public_task_pairs:
+      - task_name: "IDH_status_transfer"
+        enabled: true
+        source_dataset: "TCGA_GBMLGG"
+        target_dataset: "EBRAINS"
+        task_type: "binary_classification"
+        metric: "macro_auc"
+      - task_name: "ER_status_transfer"
+        enabled: true
+        source_dataset: "TCGA_BRCA"
+        target_dataset: "BCNB"
+        task_type: "binary_classification"
+        metric: "macro_auc"
+      - task_name: "PR_status_transfer"
+        enabled: true
+        source_dataset: "TCGA_BRCA"
+        target_dataset: "BCNB"
+        task_type: "binary_classification"
+        metric: "macro_auc"
+      - task_name: "BRCA_subtype_transfer"
+        enabled: false
+        source_dataset: "TCGA_BRCA"
+        target_dataset: "MGB_BREAST"
+        task_type: "binary_classification"
+        metric: "macro_auc"
+      - task_name: "lung_subtype_transfer"
+        enabled: false
+        source_dataset: "TCGA_LUNG"
+        target_dataset: "MGB_LUNG"
+        task_type: "binary_classification"
+        metric: "macro_auc"
+      - task_name: "LUAD_OS_transfer"
+        enabled: true
+        source_dataset: "TCGA_LUAD"
+        target_dataset: "CPTAC_LUAD"
+        task_type: "survival"
+        metric: "c_index"
+      - task_name: "PDAC_OS_transfer"
+        enabled: true
+        source_dataset: "TCGA_PDAC"
+        target_dataset: "CPTAC_PDAC"
+        task_type: "survival"
+        metric: "c_index"
+      - task_name: "CCRCC_BAP1_transfer"
+        enabled: true
+        source_dataset: "CPTAC_CCRCC"
+        target_dataset: "MUT_HET_RCC"
+        task_type: "binary_classification"
+        metric: "macro_auc"
+      - task_name: "CCRCC_PBRM1_transfer"
+        enabled: true
+        source_dataset: "CPTAC_CCRCC"
+        target_dataset: "MUT_HET_RCC"
+        task_type: "binary_classification"
+        metric: "macro_auc"
+
+  retrieval:
+    enabled: true
+    distance_metric: "l2"
+    top_k: [1, 5, 10]
+    evaluations:
+      - task_name: "EBRAINS_retrieval_fine"
+        enabled: true
+        dataset: "EBRAINS"
+        label_type: "fine_subtype"
+        metric: "map_at_k"
+      - task_name: "EBRAINS_retrieval_coarse"
+        enabled: true
+        dataset: "EBRAINS"
+        label_type: "coarse_subtype"
+        metric: "map_at_k"
+      - task_name: "CPTAC_pan_cancer_retrieval"
+        enabled: true
+        dataset: "CPTAC_10_cohorts"
+        label_type: "cancer_type"
+        metric: "map_at_k"
+
+  molecular_prompting:
+    enabled: true
+    distance_metric: "l2"
+    classification:
+      enabled: true
+      prototype_building: "mean_molecular_embedding_per_class"
+      prediction_rule: "nearest_prompt"
+    survival:
+      enabled: true
+      prompt_construction: "top_bottom_25_percent_uncensored"
+      risk_score: "distance_to_high_risk_minus_distance_to_low_risk"
+
+  invariants:
+    - "No hyperparameter search in linear probing or survival probing."
+    - "Use identical split definitions across model comparisons for each task."
+    - "Patient-level tasks must split by patient_id."
+    - "Patient-level embedding aggregation must be union_of_patches_across_all_wsis."
+    - "Use configured metric mapping only unless a task explicitly declares a different metric."
+
+  known_limitations:
+    - "Public-only scope cannot reproduce all 54 tasks due private cohorts."
+    - "Rule choosing cv5_80_20 vs mc50 by cohort size is not fully explicit in paper; per-task split_strategy is source of truth."

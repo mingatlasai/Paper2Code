@@ -1,0 +1,16 @@
+Implemented the requested logic analysis in `src/utils/metrics.py`.
+
+What it now contains:
+- Paper- and `config.yaml`-aligned metric contracts for:
+  - binary `macro-AUC`
+  - multiclass `balanced accuracy`
+  - grading `QWK`
+  - survival `c-index`
+- Explicit helper interface blueprint for evaluators (`linear_probe`, `survival_eval`, `prompting_eval`)
+- Input/output schema expectations and strict validation rules
+- Prompting-specific risk-direction caveat and required handling
+- Determinism and numeric guardrails
+- Edge-case policies and implementation-phase test expectations
+
+File updated:
+- `src/utils/metrics.py`

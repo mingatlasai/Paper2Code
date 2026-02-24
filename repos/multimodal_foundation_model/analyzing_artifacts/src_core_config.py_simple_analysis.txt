@@ -1,0 +1,15 @@
+Implemented the requested logic analysis in `src/core/config.py`.
+
+What I added in `src/core/config.py`:
+- A full analysis blueprint for the Hydra/OmegaConf loader + validation layer.
+- Exact `ExperimentConfig` interface contract aligned to design (`from_yaml`, `validate`, `to_dict`).
+- Stage normalization/dispatch logic (`preprocess|pretrain|embed|eval`).
+- Paper-locked invariant checks tied to provided `config.yaml` values only.
+- Cross-config consistency checks (shared constants, schema contracts, patient aggregation rule).
+- Typed getter plan for downstream pipelines.
+- Error model and failure behavior.
+- Handling policy for unresolved paper values (`null`, no silent guessing).
+- Public-only reproduction guardrails and expected test behaviors.
+
+File reference:
+- `src/core/config.py`

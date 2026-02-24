@@ -1,0 +1,504 @@
+"""Molecular prompting evaluator for THREADS downstream tasks.
+
+This module implements the design-locked public interface:
+- ``PromptingEvaluator.build_molecular_prompts(z_mol, y)``
+- ``PromptingEvaluator.classify_by_nearest_prompt(z_wsi, prompts)``
+- ``PromptingEvaluator.risk_score(z_wsi, high_prompt, low_prompt)``
+
+Paper/config alignment:
+- Molecular prompting uses class-wise prototype means in molecular embedding space.
+- Query assignment uses nearest prompt by L2 distance.
+- Survival risk prompting score is ``d(high_prompt) - d(low_prompt)``.
+- Shared embedding dimension is fixed to 1024.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Mapping, Tuple
+
+import numpy as np
+
+
+# -----------------------------------------------------------------------------
+# Config-anchored defaults
+# -----------------------------------------------------------------------------
+DEFAULT_EMBEDDING_DIM: int = 1024
+DEFAULT_DISTANCE_METRIC: str = "l2"
+DEFAULT_SURVIVAL_EXTREME_FRACTION: float = 0.25
+DEFAULT_VALIDATE_NUMERICS: bool = True
+DEFAULT_EPS: float = 1.0e-12
+
+ALLOWED_DISTANCE_METRICS: Tuple[str, ...] = ("l2",)
+
+
+class PromptingEvaluatorError(Exception):
+    """Base exception for prompting evaluator failures."""
+
+
+class PromptingEvaluatorConfigError(PromptingEvaluatorError):
+    """Raised when evaluator configuration is invalid."""
+
+
+class PromptingEvaluatorInputError(PromptingEvaluatorError):
+    """Raised when prompting inputs are malformed."""
+
+
+@dataclass(frozen=True)
+class _PromptMatrix:
+    """Normalized prompt matrix representation."""
+
+    labels: Tuple[str, ...]
+    matrix: np.ndarray  # [C, D]
+
+
+class PromptingEvaluator:
+    """Evaluator implementing molecular prompting operations.
+
+    Public methods are intentionally limited to the design-specified API.
+    """
+
+    def __init__(self) -> None:
+        self._embedding_dim: int = DEFAULT_EMBEDDING_DIM
+        self._distance_metric: str = DEFAULT_DISTANCE_METRIC
+        self._validate_numerics: bool = DEFAULT_VALIDATE_NUMERICS
+        self._survival_extreme_fraction: float = DEFAULT_SURVIVAL_EXTREME_FRACTION
+
+        self._validate_constructor_invariants()
+
+    def build_molecular_prompts(self, z_mol: object, y: object) -> dict[str, object]:
+        """Build class-wise molecular prototypes by class mean.
+
+        Args:
+            z_mol: Molecular support embeddings with shape [N, D].
+            y: Support labels with shape [N].
+
+        Returns:
+            Mapping ``class_label -> prototype_vector`` where prototype vectors are
+            ``np.ndarray`` with shape [D] and dtype float32.
+        """
+        z_mol_array: np.ndarray = self._coerce_embeddings(z_mol, name="z_mol")
+        label_array: np.ndarray = self._coerce_labels(y, name="y")
+
+        if int(z_mol_array.shape[0]) != int(label_array.shape[0]):
+            raise PromptingEvaluatorInputError(
+                "z_mol and y sample counts mismatch: "
+                f"{int(z_mol_array.shape[0])} vs {int(label_array.shape[0])}."
+            )
+
+        unique_labels: List[str] = sorted({str(item) for item in label_array.tolist()})
+        if len(unique_labels) == 0:
+            raise PromptingEvaluatorInputError("No classes found in y.")
+
+        prompts: Dict[str, object] = {}
+        for label_str in unique_labels:
+            class_mask: np.ndarray = np.asarray(
+                [str(item) == label_str for item in label_array.tolist()],
+                dtype=bool,
+            )
+            class_count: int = int(np.sum(class_mask))
+            if class_count <= 0:
+                raise PromptingEvaluatorInputError(
+                    f"Empty support set for class label {label_str!r}."
+                )
+
+            class_embeddings: np.ndarray = z_mol_array[class_mask, :]
+            class_prototype: np.ndarray = np.mean(class_embeddings, axis=0, dtype=np.float64)
+
+            if self._validate_numerics and not np.isfinite(class_prototype).all():
+                raise PromptingEvaluatorInputError(
+                    f"Class prototype contains NaN/Inf for label={label_str!r}."
+                )
+
+            prompts[label_str] = class_prototype.astype(np.float32, copy=False)
+
+        return prompts
+
+    def classify_by_nearest_prompt(self, z_wsi: object, prompts: dict[str, object]) -> object:
+        """Classify query WSI embeddings by nearest molecular prompt using L2.
+
+        Args:
+            z_wsi: Query WSI embeddings with shape [N, D] or [D].
+            prompts: Mapping from class label to prototype vector [D].
+
+        Returns:
+            Dictionary containing:
+            - ``pred_labels``: predicted labels [N] (dtype object)
+            - ``pred_indices``: predicted class indices [N]
+            - ``distances``: pairwise L2 distances [N, C]
+            - ``class_order``: deterministic class label order [C]
+        """
+        z_wsi_array: np.ndarray = self._coerce_embeddings(z_wsi, name="z_wsi")
+        prompt_matrix: _PromptMatrix = self._normalize_prompts(prompts)
+
+        distances: np.ndarray = self._pairwise_l2(
+            query_matrix=z_wsi_array,
+            reference_matrix=prompt_matrix.matrix,
+        )
+        if self._validate_numerics and not np.isfinite(distances).all():
+            raise PromptingEvaluatorInputError("Pairwise distances contain NaN/Inf.")
+
+        predicted_indices: np.ndarray = np.argmin(distances, axis=1).astype(np.int64, copy=False)
+        predicted_labels: np.ndarray = np.asarray(
+            [prompt_matrix.labels[index] for index in predicted_indices.tolist()],
+            dtype=object,
+        )
+
+        output: Dict[str, object] = {
+            "pred_labels": predicted_labels,
+            "pred_indices": predicted_indices,
+            "distances": distances,
+            "class_order": list(prompt_matrix.labels),
+        }
+        return output
+
+    def risk_score(self, z_wsi: object, high_prompt: object, low_prompt: object) -> object:
+        """Compute survival prompting risk score using L2 distance difference.
+
+        Risk definition (paper-aligned):
+        ``risk = ||z_wsi - high_prompt||_2 - ||z_wsi - low_prompt||_2``.
+
+        Args:
+            z_wsi: Query WSI embeddings with shape [N, D] or [D].
+            high_prompt: High-risk prompt vector with shape [D].
+            low_prompt: Low-risk prompt vector with shape [D].
+
+        Returns:
+            - float for single-query input [D]
+            - np.ndarray [N] for batched input [N, D]
+        """
+        z_wsi_is_vector: bool = self._is_1d_array_like(z_wsi)
+        z_wsi_array: np.ndarray = self._coerce_embeddings(z_wsi, name="z_wsi")
+
+        high_vector: np.ndarray = self._coerce_prompt_vector(high_prompt, name="high_prompt")
+        low_vector: np.ndarray = self._coerce_prompt_vector(low_prompt, name="low_prompt")
+
+        distance_high: np.ndarray = np.linalg.norm(z_wsi_array - high_vector.reshape(1, -1), axis=1)
+        distance_low: np.ndarray = np.linalg.norm(z_wsi_array - low_vector.reshape(1, -1), axis=1)
+
+        risk_values: np.ndarray = (distance_high - distance_low).astype(np.float64, copy=False)
+        if self._validate_numerics and not np.isfinite(risk_values).all():
+            raise PromptingEvaluatorInputError("risk_score produced NaN/Inf values.")
+
+        if z_wsi_is_vector:
+            return float(risk_values[0])
+        return risk_values
+
+    def build_survival_prompts(
+        self,
+        z_mol: object,
+        y_time: object,
+        y_event: object,
+    ) -> dict[str, object]:
+        """Build low/high-risk prompts from uncensored support patients.
+
+        This helper follows the paper/config prompting rule:
+        - Use uncensored support samples only.
+        - Rank by survival time.
+        - Build prompts from bottom/top 25% extremes.
+
+        Args:
+            z_mol: Support molecular embeddings with shape [N, D].
+            y_time: Survival duration values with shape [N].
+            y_event: Event indicators with shape [N] (1=event, 0=censored).
+
+        Returns:
+            Dictionary with:
+            - ``low_prompt``: np.ndarray [D] from longest-survival uncensored group.
+            - ``high_prompt``: np.ndarray [D] from shortest-survival uncensored group.
+            - ``low_indices``: np.ndarray of selected support indices.
+            - ``high_indices``: np.ndarray of selected support indices.
+            - ``fraction``: float selection fraction.
+        """
+        z_mol_array: np.ndarray = self._coerce_embeddings(z_mol, name="z_mol")
+        time_array: np.ndarray = self._coerce_time(y_time, name="y_time")
+        event_array: np.ndarray = self._coerce_event(y_event, name="y_event")
+
+        sample_count: int = int(z_mol_array.shape[0])
+        if sample_count != int(time_array.shape[0]) or sample_count != int(event_array.shape[0]):
+            raise PromptingEvaluatorInputError(
+                "z_mol, y_time, and y_event sample counts must match: "
+                f"{sample_count}, {int(time_array.shape[0])}, {int(event_array.shape[0])}."
+            )
+
+        uncensored_indices: np.ndarray = np.where(event_array)[0]
+        uncensored_count: int = int(uncensored_indices.shape[0])
+        if uncensored_count <= 0:
+            raise PromptingEvaluatorInputError(
+                "Cannot build survival prompts without uncensored samples."
+            )
+
+        group_size: int = max(
+            1,
+            int(np.floor(float(self._survival_extreme_fraction) * float(uncensored_count) + DEFAULT_EPS)),
+        )
+
+        uncensored_time: np.ndarray = time_array[uncensored_indices]
+        rank_order: np.ndarray = np.argsort(uncensored_time, kind="mergesort")
+
+        high_group_indices: np.ndarray = uncensored_indices[rank_order[:group_size]]
+        low_group_indices: np.ndarray = uncensored_indices[rank_order[-group_size:]]
+
+        high_prompt: np.ndarray = np.mean(z_mol_array[high_group_indices, :], axis=0, dtype=np.float64)
+        low_prompt: np.ndarray = np.mean(z_mol_array[low_group_indices, :], axis=0, dtype=np.float64)
+
+        if self._validate_numerics and (
+            not np.isfinite(high_prompt).all() or not np.isfinite(low_prompt).all()
+        ):
+            raise PromptingEvaluatorInputError("Survival prompts contain NaN/Inf values.")
+
+        output: Dict[str, object] = {
+            "low_prompt": low_prompt.astype(np.float32, copy=False),
+            "high_prompt": high_prompt.astype(np.float32, copy=False),
+            "low_indices": low_group_indices.astype(np.int64, copy=False),
+            "high_indices": high_group_indices.astype(np.int64, copy=False),
+            "fraction": float(self._survival_extreme_fraction),
+        }
+        return output
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+    def _validate_constructor_invariants(self) -> None:
+        if int(self._embedding_dim) != int(DEFAULT_EMBEDDING_DIM):
+            raise PromptingEvaluatorConfigError(
+                "Embedding dimension invariant violated: "
+                f"expected {DEFAULT_EMBEDDING_DIM}, got {self._embedding_dim}."
+            )
+
+        metric_name: str = str(self._distance_metric).strip().lower()
+        if metric_name not in ALLOWED_DISTANCE_METRICS:
+            raise PromptingEvaluatorConfigError(
+                f"Unsupported distance metric {self._distance_metric!r}. "
+                f"Allowed: {ALLOWED_DISTANCE_METRICS}."
+            )
+
+        fraction_value: float = float(self._survival_extreme_fraction)
+        if not (0.0 < fraction_value <= 0.5):
+            raise PromptingEvaluatorConfigError(
+                "survival extreme fraction must be in (0, 0.5], "
+                f"got {fraction_value}."
+            )
+
+    def _coerce_embeddings(self, value: object, name: str) -> np.ndarray:
+        try:
+            array_value: np.ndarray = np.asarray(value, dtype=np.float64)
+        except Exception as exc:  # noqa: BLE001
+            raise PromptingEvaluatorInputError(
+                f"{name} cannot be converted to float array: {exc}"
+            ) from exc
+
+        if array_value.ndim == 1:
+            array_value = array_value.reshape(1, -1)
+
+        if array_value.ndim != 2:
+            raise PromptingEvaluatorInputError(
+                f"{name} must be rank-2 [N,D] or rank-1 [D], got shape={tuple(array_value.shape)}."
+            )
+
+        if int(array_value.shape[0]) <= 0:
+            raise PromptingEvaluatorInputError(f"{name} must contain at least one sample.")
+        if int(array_value.shape[1]) <= 0:
+            raise PromptingEvaluatorInputError(f"{name} must contain at least one feature.")
+
+        if int(array_value.shape[1]) != int(self._embedding_dim):
+            raise PromptingEvaluatorInputError(
+                f"{name} embedding dim mismatch: expected {self._embedding_dim}, got {int(array_value.shape[1])}."
+            )
+
+        if self._validate_numerics and not np.isfinite(array_value).all():
+            raise PromptingEvaluatorInputError(f"{name} contains NaN/Inf values.")
+
+        return array_value.astype(np.float64, copy=False)
+
+    def _coerce_labels(self, value: object, name: str) -> np.ndarray:
+        try:
+            label_array: np.ndarray = np.asarray(value)
+        except Exception as exc:  # noqa: BLE001
+            raise PromptingEvaluatorInputError(
+                f"{name} cannot be converted to array: {exc}"
+            ) from exc
+
+        if label_array.ndim == 0:
+            label_array = label_array.reshape(1)
+        if label_array.ndim > 1:
+            label_array = label_array.reshape(-1)
+
+        if int(label_array.shape[0]) <= 0:
+            raise PromptingEvaluatorInputError(f"{name} cannot be empty.")
+
+        normalized_labels: np.ndarray = np.asarray(
+            [str(item) for item in label_array.tolist()],
+            dtype=object,
+        )
+        if any(str(item).strip() == "" for item in normalized_labels.tolist()):
+            raise PromptingEvaluatorInputError(f"{name} contains empty label values.")
+
+        return normalized_labels
+
+    def _coerce_time(self, value: object, name: str) -> np.ndarray:
+        try:
+            time_array: np.ndarray = np.asarray(value, dtype=np.float64)
+        except Exception as exc:  # noqa: BLE001
+            raise PromptingEvaluatorInputError(
+                f"{name} cannot be converted to float array: {exc}"
+            ) from exc
+
+        if time_array.ndim == 0:
+            time_array = time_array.reshape(1)
+        if time_array.ndim > 1:
+            time_array = time_array.reshape(-1)
+        if int(time_array.shape[0]) <= 0:
+            raise PromptingEvaluatorInputError(f"{name} cannot be empty.")
+        if self._validate_numerics and not np.isfinite(time_array).all():
+            raise PromptingEvaluatorInputError(f"{name} contains NaN/Inf values.")
+        if np.any(time_array <= 0.0):
+            raise PromptingEvaluatorInputError(f"{name} must contain strictly positive values.")
+
+        return time_array.astype(np.float64, copy=False)
+
+    def _coerce_event(self, value: object, name: str) -> np.ndarray:
+        try:
+            event_array: np.ndarray = np.asarray(value)
+        except Exception as exc:  # noqa: BLE001
+            raise PromptingEvaluatorInputError(
+                f"{name} cannot be converted to array: {exc}"
+            ) from exc
+
+        if event_array.ndim == 0:
+            event_array = event_array.reshape(1)
+        if event_array.ndim > 1:
+            event_array = event_array.reshape(-1)
+        if int(event_array.shape[0]) <= 0:
+            raise PromptingEvaluatorInputError(f"{name} cannot be empty.")
+
+        if event_array.dtype == np.bool_:
+            return event_array.astype(bool, copy=False)
+
+        if np.issubdtype(event_array.dtype, np.number):
+            numeric: np.ndarray = np.asarray(event_array, dtype=np.float64)
+            if self._validate_numerics and not np.isfinite(numeric).all():
+                raise PromptingEvaluatorInputError(f"{name} contains NaN/Inf values.")
+            unique_values: set[float] = set(np.unique(numeric).tolist())
+            if not unique_values.issubset({0.0, 1.0}):
+                raise PromptingEvaluatorInputError(
+                    f"{name} must contain only 0/1 values, got {sorted(unique_values)}."
+                )
+            return numeric.astype(bool, copy=False)
+
+        normalized: List[bool] = []
+        for item in event_array.tolist():
+            token: str = str(item).strip().lower()
+            if token in {"1", "true", "t", "yes", "y", "event"}:
+                normalized.append(True)
+            elif token in {"0", "false", "f", "no", "n", "censored"}:
+                normalized.append(False)
+            else:
+                raise PromptingEvaluatorInputError(
+                    f"{name} has unsupported token: {item!r}."
+                )
+        return np.asarray(normalized, dtype=bool)
+
+    def _normalize_prompts(self, prompts: Mapping[str, object]) -> _PromptMatrix:
+        if not isinstance(prompts, Mapping):
+            raise PromptingEvaluatorInputError(
+                f"prompts must be mapping[label -> vector], got {type(prompts).__name__}."
+            )
+        if len(prompts) == 0:
+            raise PromptingEvaluatorInputError("prompts cannot be empty.")
+
+        labels_sorted: List[str] = sorted(str(label) for label in prompts.keys())
+        vectors: List[np.ndarray] = []
+
+        label: str
+        for label in labels_sorted:
+            if label not in prompts:
+                matched: bool = False
+                for raw_key in prompts.keys():
+                    if str(raw_key) == label:
+                        vectors.append(self._coerce_prompt_vector(prompts[raw_key], name=f"prompts[{label}]"))
+                        matched = True
+                        break
+                if not matched:
+                    raise PromptingEvaluatorInputError(
+                        f"Failed to resolve prompt vector for label={label!r}."
+                    )
+            else:
+                vectors.append(self._coerce_prompt_vector(prompts[label], name=f"prompts[{label}]"))
+
+        matrix: np.ndarray = np.vstack(vectors).astype(np.float64, copy=False)
+        if matrix.ndim != 2:
+            raise PromptingEvaluatorInputError("Prompt matrix construction failed.")
+
+        if int(matrix.shape[1]) != int(self._embedding_dim):
+            raise PromptingEvaluatorInputError(
+                "Prompt embedding dim mismatch: "
+                f"expected {self._embedding_dim}, got {int(matrix.shape[1])}."
+            )
+
+        return _PromptMatrix(labels=tuple(labels_sorted), matrix=matrix)
+
+    def _coerce_prompt_vector(self, value: object, name: str) -> np.ndarray:
+        try:
+            vector: np.ndarray = np.asarray(value, dtype=np.float64)
+        except Exception as exc:  # noqa: BLE001
+            raise PromptingEvaluatorInputError(
+                f"{name} cannot be converted to float vector: {exc}"
+            ) from exc
+
+        if vector.ndim == 2:
+            if vector.shape[0] == 1:
+                vector = vector.reshape(-1)
+            elif vector.shape[1] == 1:
+                vector = vector.reshape(-1)
+            else:
+                raise PromptingEvaluatorInputError(
+                    f"{name} must be rank-1 [D] (or degenerate [1,D]/[D,1]), got shape={tuple(vector.shape)}."
+                )
+
+        if vector.ndim != 1:
+            raise PromptingEvaluatorInputError(
+                f"{name} must be rank-1 [D], got shape={tuple(vector.shape)}."
+            )
+
+        if int(vector.shape[0]) != int(self._embedding_dim):
+            raise PromptingEvaluatorInputError(
+                f"{name} embedding dim mismatch: expected {self._embedding_dim}, got {int(vector.shape[0])}."
+            )
+
+        if self._validate_numerics and not np.isfinite(vector).all():
+            raise PromptingEvaluatorInputError(f"{name} contains NaN/Inf values.")
+
+        return vector.astype(np.float64, copy=False)
+
+    def _pairwise_l2(self, query_matrix: np.ndarray, reference_matrix: np.ndarray) -> np.ndarray:
+        if query_matrix.ndim != 2 or reference_matrix.ndim != 2:
+            raise PromptingEvaluatorInputError("pairwise L2 expects rank-2 matrices.")
+        if int(query_matrix.shape[1]) != int(reference_matrix.shape[1]):
+            raise PromptingEvaluatorInputError(
+                "pairwise L2 feature dimension mismatch: "
+                f"{int(query_matrix.shape[1])} vs {int(reference_matrix.shape[1])}."
+            )
+
+        query_norm: np.ndarray = np.sum(np.square(query_matrix), axis=1, dtype=np.float64).reshape(-1, 1)
+        ref_norm: np.ndarray = np.sum(np.square(reference_matrix), axis=1, dtype=np.float64).reshape(1, -1)
+        dot_values: np.ndarray = np.matmul(query_matrix, reference_matrix.T)
+
+        squared_distance: np.ndarray = np.maximum(query_norm + ref_norm - 2.0 * dot_values, 0.0)
+        distance: np.ndarray = np.sqrt(squared_distance, dtype=np.float64)
+        return distance
+
+    def _is_1d_array_like(self, value: object) -> bool:
+        try:
+            array_value: np.ndarray = np.asarray(value)
+        except Exception:
+            return False
+        return array_value.ndim == 1
+
+
+__all__ = [
+    "PromptingEvaluatorError",
+    "PromptingEvaluatorConfigError",
+    "PromptingEvaluatorInputError",
+    "PromptingEvaluator",
+]

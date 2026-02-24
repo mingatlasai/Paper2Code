@@ -1,0 +1,9 @@
+Implemented the logic analysis in `src/data/split_manager.py`.
+
+It now contains a paper- and config-aligned specification for:
+- the exact `SplitManager` public interface from your design
+- official split loading (`EBRAINS`, `PANDA`, `IMP`)
+- patient-safe 5-fold CV and 50-split Monte Carlo generation
+- few-shot derivation rules (`k={1,2,4,8,16,32}`) with fixed test sets
+- deterministic seeding and split schema contracts
+- leakage checks, exception handling (including BRACS caveat), and integration notes for eval pipelines.

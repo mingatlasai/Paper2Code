@@ -1,0 +1,11 @@
+Added the requested logic analysis to `tests/test_split_manager.py`.
+
+It now documents, in paper/config-aligned detail, the unit-test logic for:
+- patient-stratified split correctness,
+- leakage prevention checks,
+- few-shot derivation consistency,
+- deterministic reproducibility,
+- official split schema/roundtrip validation,
+- edge/failure cases.
+
+File: `tests/test_split_manager.py`

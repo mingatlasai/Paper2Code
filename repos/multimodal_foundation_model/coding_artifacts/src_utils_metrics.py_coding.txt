@@ -1,0 +1,644 @@
+## Code: src/utils/metrics.py
+```python
+"""Shared metric utilities for THREADS reproduction.
+
+This module centralizes deterministic, validated metric computation for:
+- Linear probing (`src/eval/linear_probe.py`)
+- Survival evaluation (`src/eval/survival_eval.py`)
+- Prompting evaluation (`src/eval/prompting_eval.py`)
+
+The metric policy is fixed by `config.yaml`:
+- Binary classification: macro-AUC
+- Multiclass subtyping: balanced accuracy
+- Grading: quadratic weighted Cohen's kappa
+- Survival: concordance index (c-index)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+
+import numpy as np
+from sklearn.metrics import balanced_accuracy_score, cohen_kappa_score, roc_auc_score
+from sksurv.metrics import concordance_index_censored
+
+
+ArrayLike = Union[Sequence[Any], np.ndarray]
+
+# ---------------------------------------------------------------------------
+# Paper/config-aligned constants
+# ---------------------------------------------------------------------------
+DEFAULT_METRIC_BINARY_CLASSIFICATION: str = "macro-AUC"
+DEFAULT_METRIC_MULTICLASS_SUBTYPING: str = "balanced accuracy"
+DEFAULT_METRIC_GRADING: str = "quadratic weighted Cohen's kappa"
+DEFAULT_METRIC_SURVIVAL: str = "concordance index (c-index)"
+
+TASK_FAMILY_BINARY: str = "binary_classification"
+TASK_FAMILY_MULTICLASS_SUBTYPING: str = "multiclass_subtyping"
+TASK_FAMILY_GRADING: str = "grading"
+TASK_FAMILY_SURVIVAL: str = "survival"
+
+METRIC_NAME_AUC: str = "macro_auc"
+METRIC_NAME_BALANCED_ACCURACY: str = "balanced_accuracy"
+METRIC_NAME_QWK: str = "quadratic_weighted_kappa"
+METRIC_NAME_C_INDEX: str = "c_index"
+
+ALLOWED_TASK_FAMILIES: Tuple[str, ...] = (
+    TASK_FAMILY_BINARY,
+    TASK_FAMILY_MULTICLASS_SUBTYPING,
+    TASK_FAMILY_GRADING,
+    TASK_FAMILY_SURVIVAL,
+)
+
+
+class MetricError(Exception):
+    """Base exception for metric failures."""
+
+
+class MetricValidationError(MetricError):
+    """Raised when inputs are malformed or invalid for a metric."""
+
+
+class MetricComputationError(MetricError):
+    """Raised when computation fails despite valid-looking inputs."""
+
+
+@dataclass(frozen=True)
+class MetricContext:
+    """Optional context metadata for clear error reporting.
+
+    Attributes:
+        task_name: Task identifier.
+        fold_id: Fold identifier.
+        model_name: Model identifier.
+    """
+
+    task_name: str = ""
+    fold_id: str = ""
+    model_name: str = ""
+
+    def to_suffix(self) -> str:
+        """Return compact context suffix for error messages."""
+        parts: list[str] = []
+        if self.task_name:
+            parts.append(f"task={self.task_name}")
+        if self.fold_id:
+            parts.append(f"fold={self.fold_id}")
+        if self.model_name:
+            parts.append(f"model={self.model_name}")
+        if not parts:
+            return ""
+        return " (" + ", ".join(parts) + ")"
+
+
+@dataclass(frozen=True)
+class MetricResult:
+    """Structured metric output for downstream tabulation."""
+
+    metric_name: str
+    value: float
+
+    def to_row(self) -> Dict[str, Union[str, float]]:
+        """Convert to a serializable dictionary row."""
+        return {"metric_name": self.metric_name, "value": float(self.value)}
+
+
+def get_expected_metric_by_family() -> Dict[str, str]:
+    """Return paper/config-anchored metric naming by task family."""
+    return {
+        TASK_FAMILY_BINARY: DEFAULT_METRIC_BINARY_CLASSIFICATION,
+        TASK_FAMILY_MULTICLASS_SUBTYPING: DEFAULT_METRIC_MULTICLASS_SUBTYPING,
+        TASK_FAMILY_GRADING: DEFAULT_METRIC_GRADING,
+        TASK_FAMILY_SURVIVAL: DEFAULT_METRIC_SURVIVAL,
+    }
+
+
+def parse_binary_score_input(
+    y_score: ArrayLike,
+    *,
+    positive_class_index: int = 1,
+    context: Optional[MetricContext] = None,
+) -> np.ndarray:
+    """Normalize binary score input to shape [N].
+
+    Accepts:
+    - Rank-1 positive-class scores.
+    - Rank-2 probabilities/scores [N, 2], selecting `positive_class_index`.
+    """
+    context_obj: MetricContext = context or MetricContext()
+    score_array: np.ndarray = np.asarray(y_score)
+
+    if score_array.ndim == 1:
+        normalized: np.ndarray = score_array.astype(np.float64, copy=False)
+    elif score_array.ndim == 2:
+        if score_array.shape[1] <= positive_class_index:
+            raise MetricValidationError(
+                "Binary score matrix does not contain requested positive class index "
+                f"{positive_class_index}. shape={score_array.shape}{context_obj.to_suffix()}"
+            )
+        normalized = score_array[:, positive_class_index].astype(np.float64, copy=False)
+    else:
+        raise MetricValidationError(
+            f"Binary score input must be rank-1 or rank-2, got rank={score_array.ndim}"
+            f"{context_obj.to_suffix()}"
+        )
+
+    _require_finite_array(normalized, metric_name=METRIC_NAME_AUC, context=context_obj)
+    return normalized
+
+
+def score_binary_auc(
+    y_true: ArrayLike,
+    y_score: ArrayLike,
+    *,
+    positive_class_index: int = 1,
+    context: Optional[MetricContext] = None,
+) -> float:
+    """Compute binary ROC-AUC (paper reports macro-AUC for binary tasks)."""
+    context_obj: MetricContext = context or MetricContext()
+    y_true_array: np.ndarray = _as_1d_array(y_true, name="y_true", context=context_obj)
+    score_array: np.ndarray = parse_binary_score_input(
+        y_score,
+        positive_class_index=positive_class_index,
+        context=context_obj,
+    )
+    _validate_equal_length(
+        y_true_array,
+        score_array,
+        metric_name=METRIC_NAME_AUC,
+        context=context_obj,
+    )
+
+    if y_true_array.size == 0:
+        raise MetricValidationError(
+            f"Binary AUC received empty arrays{context_obj.to_suffix()}"
+        )
+
+    unique_labels: np.ndarray = np.unique(y_true_array)
+    if unique_labels.size != 2:
+        raise MetricValidationError(
+            "Binary AUC requires exactly two classes in y_true, got "
+            f"{unique_labels.tolist()}{context_obj.to_suffix()}"
+        )
+
+    y_true_binary: np.ndarray = _encode_binary_labels(
+        y_true_array,
+        context=context_obj,
+        metric_name=METRIC_NAME_AUC,
+    )
+
+    try:
+        value: float = float(roc_auc_score(y_true_binary, score_array))
+    except Exception as exc:  # noqa: BLE001
+        raise MetricComputationError(
+            f"Failed to compute binary AUC{context_obj.to_suffix()}: {exc}"
+        ) from exc
+
+    _require_finite_scalar(value, metric_name=METRIC_NAME_AUC, context=context_obj)
+    return value
+
+
+def score_multiclass_balanced_accuracy(
+    y_true: ArrayLike,
+    y_pred: ArrayLike,
+    *,
+    allowed_labels: Optional[Iterable[Any]] = None,
+    context: Optional[MetricContext] = None,
+) -> float:
+    """Compute balanced accuracy for multiclass subtyping tasks."""
+    context_obj: MetricContext = context or MetricContext()
+    y_true_array: np.ndarray = _as_1d_array(y_true, name="y_true", context=context_obj)
+    y_pred_array: np.ndarray = _as_1d_array(y_pred, name="y_pred", context=context_obj)
+    _validate_equal_length(
+        y_true_array,
+        y_pred_array,
+        metric_name=METRIC_NAME_BALANCED_ACCURACY,
+        context=context_obj,
+    )
+
+    if y_true_array.size == 0:
+        raise MetricValidationError(
+            f"Balanced accuracy received empty arrays{context_obj.to_suffix()}"
+        )
+
+    if allowed_labels is not None:
+        allowed_set: set[Any] = set(allowed_labels)
+        unknown_true: set[Any] = set(y_true_array.tolist()).difference(allowed_set)
+        unknown_pred: set[Any] = set(y_pred_array.tolist()).difference(allowed_set)
+        if unknown_true or unknown_pred:
+            raise MetricValidationError(
+                "Found labels outside allowed label set in balanced accuracy. "
+                f"unknown_true={sorted(unknown_true)} unknown_pred={sorted(unknown_pred)}"
+                f"{context_obj.to_suffix()}"
+            )
+
+    try:
+        value: float = float(balanced_accuracy_score(y_true_array, y_pred_array))
+    except Exception as exc:  # noqa: BLE001
+        raise MetricComputationError(
+            f"Failed to compute balanced accuracy{context_obj.to_suffix()}: {exc}"
+        ) from exc
+
+    _require_finite_scalar(
+        value,
+        metric_name=METRIC_NAME_BALANCED_ACCURACY,
+        context=context_obj,
+    )
+    return value
+
+
+def score_qwk(
+    y_true: ArrayLike,
+    y_pred: ArrayLike,
+    *,
+    context: Optional[MetricContext] = None,
+) -> float:
+    """Compute quadratic weighted Cohen's kappa for grading tasks."""
+    context_obj: MetricContext = context or MetricContext()
+    y_true_array: np.ndarray = _as_1d_array(y_true, name="y_true", context=context_obj)
+    y_pred_array: np.ndarray = _as_1d_array(y_pred, name="y_pred", context=context_obj)
+    _validate_equal_length(y_true_array, y_pred_array, metric_name=METRIC_NAME_QWK, context=context_obj)
+
+    if y_true_array.size == 0:
+        raise MetricValidationError(
+            f"QWK received empty arrays{context_obj.to_suffix()}"
+        )
+
+    if not _is_discrete_array(y_true_array) or not _is_discrete_array(y_pred_array):
+        raise MetricValidationError(
+            f"QWK requires discrete labels/predictions{context_obj.to_suffix()}"
+        )
+
+    try:
+        value: float = float(
+            cohen_kappa_score(y_true_array, y_pred_array, weights="quadratic")
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise MetricComputationError(
+            f"Failed to compute QWK{context_obj.to_suffix()}: {exc}"
+        ) from exc
+
+    _require_finite_scalar(value, metric_name=METRIC_NAME_QWK, context=context_obj)
+    return value
+
+
+def score_c_index(
+    y_time: ArrayLike,
+    y_event: ArrayLike,
+    risk_score: ArrayLike,
+    *,
+    higher_score_higher_risk: bool = True,
+    context: Optional[MetricContext] = None,
+) -> float:
+    """Compute censoring-aware c-index.
+
+    Args:
+        y_time: Survival/censoring time. Must be positive.
+        y_event: Event indicator where 1=event and 0=censored.
+        risk_score: Continuous risk score.
+        higher_score_higher_risk: Set False to invert scores before c-index.
+        context: Optional metadata used in error messages.
+    """
+    context_obj: MetricContext = context or MetricContext()
+    time_array: np.ndarray = _as_1d_array(y_time, name="y_time", context=context_obj).astype(np.float64, copy=False)
+    event_array_raw: np.ndarray = _as_1d_array(y_event, name="y_event", context=context_obj)
+    risk_array: np.ndarray = _as_1d_array(risk_score, name="risk_score", context=context_obj).astype(np.float64, copy=False)
+    _validate_equal_length(time_array, event_array_raw, metric_name=METRIC_NAME_C_INDEX, context=context_obj)
+    _validate_equal_length(time_array, risk_array, metric_name=METRIC_NAME_C_INDEX, context=context_obj)
+
+    if time_array.size == 0:
+        raise MetricValidationError(
+            f"C-index received empty arrays{context_obj.to_suffix()}"
+        )
+
+    _require_finite_array(time_array, metric_name=METRIC_NAME_C_INDEX, context=context_obj)
+    _require_finite_array(risk_array, metric_name=METRIC_NAME_C_INDEX, context=context_obj)
+
+    if np.any(time_array <= 0.0):
+        raise MetricValidationError(
+            f"C-index requires strictly positive survival times{context_obj.to_suffix()}"
+        )
+
+    event_array: np.ndarray = _encode_event_indicator(
+        event_array_raw,
+        context=context_obj,
+    )
+
+    if not higher_score_higher_risk:
+        risk_array = -risk_array
+
+    if np.all(event_array == 0):
+        raise MetricValidationError(
+            f"C-index undefined when all samples are censored (no events){context_obj.to_suffix()}"
+        )
+
+    try:
+        c_index_tuple: Tuple[float, float, float, float, float] = concordance_index_censored(
+            event_indicator=event_array.astype(bool, copy=False),
+            event_time=time_array,
+            estimate=risk_array,
+        )
+        value: float = float(c_index_tuple[0])
+    except Exception as exc:  # noqa: BLE001
+        raise MetricComputationError(
+            f"Failed to compute c-index{context_obj.to_suffix()}: {exc}"
+        ) from exc
+
+    _require_finite_scalar(value, metric_name=METRIC_NAME_C_INDEX, context=context_obj)
+    return value
+
+
+def score_by_task_family(
+    task_family: str,
+    *,
+    y_true: Optional[ArrayLike] = None,
+    y_score: Optional[ArrayLike] = None,
+    y_pred: Optional[ArrayLike] = None,
+    y_time: Optional[ArrayLike] = None,
+    y_event: Optional[ArrayLike] = None,
+    risk_score: Optional[ArrayLike] = None,
+    positive_class_index: int = 1,
+    higher_score_higher_risk: bool = True,
+    allowed_labels: Optional[Iterable[Any]] = None,
+    context: Optional[MetricContext] = None,
+) -> MetricResult:
+    """Route metric scoring based on task family with strict mapping."""
+    context_obj: MetricContext = context or MetricContext()
+    normalized_family: str = task_family.strip().lower()
+    if normalized_family not in ALLOWED_TASK_FAMILIES:
+        raise MetricValidationError(
+            f"Unknown task_family={task_family!r}. Allowed={ALLOWED_TASK_FAMILIES}"
+            f"{context_obj.to_suffix()}"
+        )
+
+    if normalized_family == TASK_FAMILY_BINARY:
+        if y_true is None or y_score is None:
+            raise MetricValidationError(
+                f"Binary scoring requires y_true and y_score{context_obj.to_suffix()}"
+            )
+        value_auc: float = score_binary_auc(
+            y_true=y_true,
+            y_score=y_score,
+            positive_class_index=positive_class_index,
+            context=context_obj,
+        )
+        return MetricResult(metric_name=METRIC_NAME_AUC, value=value_auc)
+
+    if normalized_family == TASK_FAMILY_MULTICLASS_SUBTYPING:
+        if y_true is None or y_pred is None:
+            raise MetricValidationError(
+                f"Multiclass scoring requires y_true and y_pred{context_obj.to_suffix()}"
+            )
+        value_bacc: float = score_multiclass_balanced_accuracy(
+            y_true=y_true,
+            y_pred=y_pred,
+            allowed_labels=allowed_labels,
+            context=context_obj,
+        )
+        return MetricResult(metric_name=METRIC_NAME_BALANCED_ACCURACY, value=value_bacc)
+
+    if normalized_family == TASK_FAMILY_GRADING:
+        if y_true is None or y_pred is None:
+            raise MetricValidationError(
+                f"Grading scoring requires y_true and y_pred{context_obj.to_suffix()}"
+            )
+        value_qwk: float = score_qwk(
+            y_true=y_true,
+            y_pred=y_pred,
+            context=context_obj,
+        )
+        return MetricResult(metric_name=METRIC_NAME_QWK, value=value_qwk)
+
+    if y_time is None or y_event is None or risk_score is None:
+        raise MetricValidationError(
+            f"Survival scoring requires y_time, y_event, and risk_score{context_obj.to_suffix()}"
+        )
+    value_cindex: float = score_c_index(
+        y_time=y_time,
+        y_event=y_event,
+        risk_score=risk_score,
+        higher_score_higher_risk=higher_score_higher_risk,
+        context=context_obj,
+    )
+    return MetricResult(metric_name=METRIC_NAME_C_INDEX, value=value_cindex)
+
+
+def validate_metric_contracts_from_config(
+    config_mapping: Mapping[str, Any],
+    *,
+    strict: bool = True,
+) -> bool:
+    """Validate metric names in resolved config against fixed paper values.
+
+    Expected config path: `evaluation.metrics`.
+    """
+    evaluation_obj: Any = config_mapping.get("evaluation")
+    if not isinstance(evaluation_obj, Mapping):
+        if strict:
+            raise MetricValidationError("Missing mapping at config.evaluation")
+        return False
+
+    metrics_obj: Any = evaluation_obj.get("metrics")
+    if not isinstance(metrics_obj, Mapping):
+        if strict:
+            raise MetricValidationError("Missing mapping at config.evaluation.metrics")
+        return False
+
+    expected_mapping: Dict[str, str] = get_expected_metric_by_family()
+    config_key_mapping: Dict[str, str] = {
+        TASK_FAMILY_BINARY: "binary_classification",
+        TASK_FAMILY_MULTICLASS_SUBTYPING: "multiclass_subtyping",
+        TASK_FAMILY_GRADING: "grading",
+        TASK_FAMILY_SURVIVAL: "survival",
+    }
+
+    all_match: bool = True
+    for family_name, config_key in config_key_mapping.items():
+        expected_value: str = expected_mapping[family_name]
+        actual_raw: Any = metrics_obj.get(config_key)
+        if actual_raw is None:
+            all_match = False
+            if strict:
+                raise MetricValidationError(
+                    f"Missing metric declaration: evaluation.metrics.{config_key}"
+                )
+            continue
+
+        actual_value: str = str(actual_raw).strip()
+        if actual_value != expected_value:
+            all_match = False
+            if strict:
+                raise MetricValidationError(
+                    "Metric contract mismatch at "
+                    f"evaluation.metrics.{config_key}: expected {expected_value!r}, got {actual_value!r}"
+                )
+    return all_match
+
+
+def _as_1d_array(
+    values: ArrayLike,
+    *,
+    name: str,
+    context: MetricContext,
+) -> np.ndarray:
+    """Convert input to rank-1 array."""
+    array: np.ndarray = np.asarray(values)
+    if array.ndim != 1:
+        raise MetricValidationError(
+            f"{name} must be rank-1, got shape={array.shape}{context.to_suffix()}"
+        )
+    return array
+
+
+def _validate_equal_length(
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    metric_name: str,
+    context: MetricContext,
+) -> None:
+    """Validate length alignment."""
+    if left.shape[0] != right.shape[0]:
+        raise MetricValidationError(
+            f"{metric_name} length mismatch: left={left.shape[0]} right={right.shape[0]}"
+            f"{context.to_suffix()}"
+        )
+
+
+def _require_finite_array(
+    values: np.ndarray,
+    *,
+    metric_name: str,
+    context: MetricContext,
+) -> None:
+    """Validate all numeric values are finite."""
+    numeric_values: np.ndarray = values.astype(np.float64, copy=False)
+    if not np.isfinite(numeric_values).all():
+        raise MetricValidationError(
+            f"{metric_name} received NaN/Inf values{context.to_suffix()}"
+        )
+
+
+def _require_finite_scalar(
+    value: float,
+    *,
+    metric_name: str,
+    context: MetricContext,
+) -> None:
+    """Validate scalar metric value is finite."""
+    if not np.isfinite(np.float64(value)):
+        raise MetricComputationError(
+            f"{metric_name} produced non-finite value={value!r}{context.to_suffix()}"
+        )
+
+
+def _encode_binary_labels(
+    labels: np.ndarray,
+    *,
+    context: MetricContext,
+    metric_name: str,
+) -> np.ndarray:
+    """Encode two unique labels to {0, 1} deterministically."""
+    unique_labels: np.ndarray = np.unique(labels)
+    if unique_labels.size != 2:
+        raise MetricValidationError(
+            f"{metric_name} requires exactly two unique labels, got {unique_labels.tolist()}"
+            f"{context.to_suffix()}"
+        )
+    label_to_int: Dict[Any, int] = {
+        unique_labels[0].item() if hasattr(unique_labels[0], "item") else unique_labels[0]: 0,
+        unique_labels[1].item() if hasattr(unique_labels[1], "item") else unique_labels[1]: 1,
+    }
+    encoded: np.ndarray = np.array(
+        [label_to_int[item.item() if hasattr(item, "item") else item] for item in labels],
+        dtype=np.int64,
+    )
+    return encoded
+
+
+def _encode_event_indicator(
+    event_values: np.ndarray,
+    *,
+    context: MetricContext,
+) -> np.ndarray:
+    """Encode event indicator into {0,1} integer array."""
+    if event_values.dtype == np.bool_:
+        return event_values.astype(np.int64, copy=False)
+
+    if np.issubdtype(event_values.dtype, np.number):
+        finite_values: np.ndarray = event_values.astype(np.float64, copy=False)
+        _require_finite_array(finite_values, metric_name=METRIC_NAME_C_INDEX, context=context)
+        unique_values: np.ndarray = np.unique(finite_values)
+        if not set(unique_values.tolist()).issubset({0.0, 1.0}):
+            raise MetricValidationError(
+                "Survival event indicator must contain only {0,1}"
+                f", got {unique_values.tolist()}{context.to_suffix()}"
+            )
+        return finite_values.astype(np.int64, copy=False)
+
+    # Support common string/bool-like labels.
+    normalized_values: list[int] = []
+    allowed_map: Dict[str, int] = {
+        "0": 0,
+        "1": 1,
+        "false": 0,
+        "true": 1,
+        "censored": 0,
+        "event": 1,
+    }
+    for raw_item in event_values.tolist():
+        normalized_key: str = str(raw_item).strip().lower()
+        if normalized_key not in allowed_map:
+            raise MetricValidationError(
+                "Survival event indicator value is invalid: "
+                f"{raw_item!r}{context.to_suffix()}"
+            )
+        normalized_values.append(allowed_map[normalized_key])
+    return np.asarray(normalized_values, dtype=np.int64)
+
+
+def _is_discrete_array(values: np.ndarray) -> bool:
+    """Return True if array appears discrete (categorical/ordinal)."""
+    if values.dtype == np.bool_:
+        return True
+    if np.issubdtype(values.dtype, np.integer):
+        return True
+    if np.issubdtype(values.dtype, np.floating):
+        finite_values: np.ndarray = values.astype(np.float64, copy=False)
+        if not np.isfinite(finite_values).all():
+            return False
+        return bool(np.all(np.isclose(finite_values, np.round(finite_values))))
+    # String/object labels are discrete by definition for sklearn scorers.
+    return True
+
+
+__all__ = [
+    "DEFAULT_METRIC_BINARY_CLASSIFICATION",
+    "DEFAULT_METRIC_MULTICLASS_SUBTYPING",
+    "DEFAULT_METRIC_GRADING",
+    "DEFAULT_METRIC_SURVIVAL",
+    "TASK_FAMILY_BINARY",
+    "TASK_FAMILY_MULTICLASS_SUBTYPING",
+    "TASK_FAMILY_GRADING",
+    "TASK_FAMILY_SURVIVAL",
+    "METRIC_NAME_AUC",
+    "METRIC_NAME_BALANCED_ACCURACY",
+    "METRIC_NAME_QWK",
+    "METRIC_NAME_C_INDEX",
+    "ALLOWED_TASK_FAMILIES",
+    "MetricError",
+    "MetricValidationError",
+    "MetricComputationError",
+    "MetricContext",
+    "MetricResult",
+    "get_expected_metric_by_family",
+    "parse_binary_score_input",
+    "score_binary_auc",
+    "score_multiclass_balanced_accuracy",
+    "score_qwk",
+    "score_c_index",
+    "score_by_task_family",
+    "validate_metric_contracts_from_config",
+]
+```

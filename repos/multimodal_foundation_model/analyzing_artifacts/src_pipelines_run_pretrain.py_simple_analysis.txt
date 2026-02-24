@@ -1,0 +1,7 @@
+Implemented the requested logic analysis in `src/pipelines/run_pretrain.py`.
+
+What’s now in the file:
+- A full orchestration analysis for pretraining stage (datamodule -> THREADS model -> `PretrainModule` -> `RankMeCallback` -> checkpointing).
+- Strict alignment with your provided paper details, plan, design interfaces, task constraints, and `config.yaml`.
+- Explicit handling of unresolved hyperparameters (no invented values).
+- Clear preconditions, construction order, runtime checks, failure policy, reproducibility controls, and open decisions.

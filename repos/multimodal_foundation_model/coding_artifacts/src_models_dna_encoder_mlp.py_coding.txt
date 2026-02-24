@@ -1,0 +1,219 @@
+## Code: src/models/dna_encoder_mlp.py
+```python
+"""DNA multi-hot MLP encoder for THREADS.
+
+This module implements the design-locked interface:
+- ``DNAMLPEncoder.__init__(in_dim: int, hidden_dim: int, out_dim: int, dropout: float) -> None``
+- ``DNAMLPEncoder.forward(dna_multi_hot: object) -> object``
+
+Paper/config alignment:
+- Encoder type: 4-layer MLP
+- Default input dim: 1673
+- Default output dim: 1024
+- Hidden activation: ReLU
+- Dropout: 0.2
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+from torch import nn
+
+
+DEFAULT_INPUT_DIM: int = 1673
+DEFAULT_HIDDEN_DIM: int = 1673
+DEFAULT_OUTPUT_DIM: int = 1024
+DEFAULT_DROPOUT: float = 0.2
+
+
+class DNAMLPEncoderError(Exception):
+    """Base exception for DNA MLP encoder failures."""
+
+
+class DNAMLPEncoderConfigError(DNAMLPEncoderError):
+    """Raised when constructor configuration is invalid."""
+
+
+class DNAMLPEncoderInputError(DNAMLPEncoderError):
+    """Raised when forward input payload is invalid."""
+
+
+class DNAMLPEncoder(nn.Module):
+    """4-layer MLP encoder for DNA multi-hot vectors.
+
+    Args:
+        in_dim: Input vector width. Paper default is 1673.
+        hidden_dim: Hidden width for intermediate linear layers.
+        out_dim: Output embedding width. THREADS shared space is 1024.
+        dropout: Dropout probability applied after hidden activations.
+    """
+
+    def __init__(
+        self,
+        in_dim: int = DEFAULT_INPUT_DIM,
+        hidden_dim: int = DEFAULT_HIDDEN_DIM,
+        out_dim: int = DEFAULT_OUTPUT_DIM,
+        dropout: float = DEFAULT_DROPOUT,
+    ) -> None:
+        super().__init__()
+
+        self._in_dim: int = self._validate_positive_int(in_dim, "in_dim")
+        self._hidden_dim: int = self._validate_positive_int(hidden_dim, "hidden_dim")
+        self._out_dim: int = self._validate_positive_int(out_dim, "out_dim")
+        self._dropout_p: float = self._validate_dropout(dropout)
+
+        # Strict paper/config invariants.
+        if self._in_dim != DEFAULT_INPUT_DIM:
+            raise DNAMLPEncoderConfigError(
+                f"THREADS DNA input dim must be {DEFAULT_INPUT_DIM}, got {self._in_dim}."
+            )
+        if self._out_dim != DEFAULT_OUTPUT_DIM:
+            raise DNAMLPEncoderConfigError(
+                f"THREADS DNA output dim must be {DEFAULT_OUTPUT_DIM}, got {self._out_dim}."
+            )
+
+        self._layer1: nn.Linear = nn.Linear(self._in_dim, self._hidden_dim)
+        self._layer2: nn.Linear = nn.Linear(self._hidden_dim, self._hidden_dim)
+        self._layer3: nn.Linear = nn.Linear(self._hidden_dim, self._hidden_dim)
+        self._layer4: nn.Linear = nn.Linear(self._hidden_dim, self._out_dim)
+
+        self._activation: nn.ReLU = nn.ReLU(inplace=False)
+        self._dropout: nn.Dropout = nn.Dropout(p=self._dropout_p)
+
+        self._reset_parameters()
+
+    def forward(self, dna_multi_hot: object) -> object:
+        """Encode DNA multi-hot vectors into shared embedding space.
+
+        Args:
+            dna_multi_hot: Tensor-like input with shape ``[B, in_dim]`` or ``[in_dim]``.
+
+        Returns:
+            Tensor with shape ``[B, out_dim]``.
+        """
+        input_tensor: torch.Tensor = self._coerce_input_tensor(dna_multi_hot)
+
+        hidden: torch.Tensor = self._layer1(input_tensor)
+        hidden = self._activation(hidden)
+        hidden = self._dropout(hidden)
+
+        hidden = self._layer2(hidden)
+        hidden = self._activation(hidden)
+        hidden = self._dropout(hidden)
+
+        hidden = self._layer3(hidden)
+        hidden = self._activation(hidden)
+        hidden = self._dropout(hidden)
+
+        output: torch.Tensor = self._layer4(hidden)
+
+        if output.ndim != 2 or int(output.shape[1]) != self._out_dim:
+            raise DNAMLPEncoderInputError(
+                "DNAMLPEncoder.forward produced invalid output shape: "
+                f"expected [B, {self._out_dim}], got {tuple(output.shape)}."
+            )
+        if not torch.isfinite(output).all():
+            raise DNAMLPEncoderInputError(
+                "DNAMLPEncoder.forward produced non-finite values (NaN/Inf)."
+            )
+
+        return output
+
+    def input_dim(self) -> int:
+        """Return configured DNA input dimension."""
+        return self._in_dim
+
+    def output_dim(self) -> int:
+        """Return configured DNA output embedding dimension."""
+        return self._out_dim
+
+    @staticmethod
+    def _validate_positive_int(value: int, field_name: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise DNAMLPEncoderConfigError(
+                f"{field_name} must be int, got {type(value).__name__}."
+            )
+        if value <= 0:
+            raise DNAMLPEncoderConfigError(
+                f"{field_name} must be > 0, got {value}."
+            )
+        return int(value)
+
+    @staticmethod
+    def _validate_dropout(value: float) -> float:
+        if isinstance(value, bool):
+            raise DNAMLPEncoderConfigError("dropout must be float in [0, 1), got bool.")
+        try:
+            dropout_value: float = float(value)
+        except Exception as exc:  # noqa: BLE001
+            raise DNAMLPEncoderConfigError(
+                f"dropout must be float in [0, 1), got {value!r}."
+            ) from exc
+
+        if not (0.0 <= dropout_value < 1.0):
+            raise DNAMLPEncoderConfigError(
+                f"dropout must be in [0, 1), got {dropout_value}."
+            )
+        return dropout_value
+
+    def _coerce_input_tensor(self, dna_multi_hot: object) -> torch.Tensor:
+        try:
+            tensor_value: torch.Tensor = torch.as_tensor(dna_multi_hot)
+        except Exception as exc:  # noqa: BLE001
+            raise DNAMLPEncoderInputError(
+                f"dna_multi_hot cannot be converted to torch.Tensor: {exc}"
+            ) from exc
+
+        if tensor_value.ndim == 1:
+            tensor_value = tensor_value.unsqueeze(0)
+        elif tensor_value.ndim != 2:
+            raise DNAMLPEncoderInputError(
+                "dna_multi_hot must have shape [B, in_dim] or [in_dim], "
+                f"got {tuple(tensor_value.shape)}."
+            )
+
+        if int(tensor_value.shape[1]) != self._in_dim:
+            raise DNAMLPEncoderInputError(
+                "dna_multi_hot last-dimension mismatch: "
+                f"expected {self._in_dim}, got {int(tensor_value.shape[1])}."
+            )
+
+        if tensor_value.shape[0] <= 0:
+            raise DNAMLPEncoderInputError("dna_multi_hot batch dimension must be > 0.")
+
+        # Multi-hot vectors may arrive as bool/int; MLP expects floating input.
+        if tensor_value.dtype == torch.bool:
+            tensor_value = tensor_value.to(torch.float32)
+        elif not torch.is_floating_point(tensor_value):
+            tensor_value = tensor_value.to(torch.float32)
+        else:
+            tensor_value = tensor_value.to(torch.float32)
+
+        if not torch.isfinite(tensor_value).all():
+            raise DNAMLPEncoderInputError(
+                "dna_multi_hot contains non-finite values (NaN/Inf)."
+            )
+
+        return tensor_value
+
+    def _reset_parameters(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+
+__all__ = [
+    "DEFAULT_INPUT_DIM",
+    "DEFAULT_HIDDEN_DIM",
+    "DEFAULT_OUTPUT_DIM",
+    "DEFAULT_DROPOUT",
+    "DNAMLPEncoderError",
+    "DNAMLPEncoderConfigError",
+    "DNAMLPEncoderInputError",
+    "DNAMLPEncoder",
+]
+```

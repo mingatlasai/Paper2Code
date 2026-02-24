@@ -1,0 +1,1175 @@
+"""Checkpoint persistence and resume utilities for THREADS training.
+
+This module provides deterministic checkpoint naming/versioning, RankMe-best
+selection support, final-epoch checkpointing, and resume-path resolution.
+
+Design-aligned scope:
+- Pretraining: best checkpoint selected by RankMe strict improvement.
+- Fine-tuning: final epoch checkpoint selection (no early stopping).
+- Shared: atomic writes, metadata sidecar, DDP rank-0 writer policy.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import shutil
+import tempfile
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+import numpy as np
+import torch
+
+
+# -----------------------------------------------------------------------------
+# Paper/config-aligned defaults
+# -----------------------------------------------------------------------------
+DEFAULT_STAGE: str = "pretrain"
+DEFAULT_RUN_ID: str = "unknown-run"
+DEFAULT_CHECKPOINT_ROOT: str = "outputs/checkpoints"
+
+DEFAULT_PRETRAIN_CHECKPOINT_DIR: str = "outputs/checkpoints/pretrain"
+DEFAULT_FINETUNE_CHECKPOINT_DIR: str = "outputs/checkpoints/finetune"
+
+DEFAULT_PRETRAIN_MAX_EPOCHS: int = 101
+DEFAULT_PRETRAIN_WARMUP_EPOCHS: int = 5
+DEFAULT_RANKME_EPS: float = 1.0e-7
+DEFAULT_FINETUNE_EPOCHS: int = 5
+DEFAULT_FINETUNE_SELECTION: str = "final epoch"
+
+DEFAULT_METADATA_FILE: str = "checkpoint_state.json"
+DEFAULT_LAST_NAME: str = "last.ckpt"
+DEFAULT_BEST_RANK_NAME: str = "best-rank.ckpt"
+DEFAULT_FINAL_NAME: str = "final.ckpt"
+DEFAULT_EPOCH_TEMPLATE: str = "epoch-{epoch:03d}.ckpt"
+
+DEFAULT_SAVE_WEIGHTS_ONLY: bool = False
+DEFAULT_STRICT_MODE: bool = True
+DEFAULT_STRICT_IMPROVEMENT_TOLERANCE: float = 1.0e-12
+
+DEFAULT_EMBEDDING_DIM: int = 1024
+DEFAULT_DNA_INPUT_DIM: int = 1673
+
+_ALLOWED_STAGES: Tuple[str, ...] = ("pretrain", "finetune", "embed", "eval", "preprocess")
+_ALLOWED_RESUME_MODES: Tuple[str, ...] = (
+    "none",
+    "auto",
+    "last",
+    "best",
+    "final",
+    "path",
+)
+
+
+# -----------------------------------------------------------------------------
+# Errors
+# -----------------------------------------------------------------------------
+class CheckpointingError(Exception):
+    """Base exception for checkpointing failures."""
+
+
+class CheckpointConfigError(CheckpointingError):
+    """Raised when checkpoint configuration is invalid."""
+
+
+class CheckpointSaveError(CheckpointingError):
+    """Raised when checkpoint persistence fails."""
+
+
+class CheckpointLoadError(CheckpointingError):
+    """Raised when checkpoint loading/resume resolution fails."""
+
+
+class CheckpointIntegrityError(CheckpointingError):
+    """Raised when checkpoint metadata or artifacts are inconsistent."""
+
+
+# -----------------------------------------------------------------------------
+# Dataclasses
+# -----------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CheckpointPaths:
+    """Resolved checkpoint artifact paths for one run."""
+
+    root: Path
+    metadata: Path
+    last: Path
+    best_rank: Path
+    final: Path
+
+    def to_dict(self) -> Dict[str, str]:
+        """Return stringified path mapping."""
+        return {
+            "root": str(self.root),
+            "metadata": str(self.metadata),
+            "last": str(self.last),
+            "best_rank": str(self.best_rank),
+            "final": str(self.final),
+        }
+
+
+@dataclass
+class CheckpointState:
+    """Serializable checkpoint state metadata."""
+
+    schema_version: int = 1
+    run_id: str = DEFAULT_RUN_ID
+    stage: str = DEFAULT_STAGE
+    created_at_utc: str = ""
+    updated_at_utc: str = ""
+
+    version_counter: int = 0
+
+    # Current pointers.
+    last_checkpoint: Optional[str] = None
+    best_rank_checkpoint: Optional[str] = None
+    final_checkpoint: Optional[str] = None
+
+    # Best-rank tracking.
+    best_rank_value: Optional[float] = None
+    best_rank_epoch: Optional[int] = None
+
+    # Last training position.
+    last_epoch: Optional[int] = None
+    last_global_step: Optional[int] = None
+
+    # Resume provenance.
+    resumed_from: Optional[str] = None
+    resumed_at_utc: Optional[str] = None
+
+    # Paper/config reproducibility context.
+    embedding_dim: int = DEFAULT_EMBEDDING_DIM
+    dna_input_dim: int = DEFAULT_DNA_INPUT_DIM
+    pretrain_max_epochs: int = DEFAULT_PRETRAIN_MAX_EPOCHS
+    pretrain_warmup_epochs: int = DEFAULT_PRETRAIN_WARMUP_EPOCHS
+    rankme_eps: float = DEFAULT_RANKME_EPS
+    finetune_epochs: int = DEFAULT_FINETUNE_EPOCHS
+    finetune_checkpoint_selection: str = DEFAULT_FINETUNE_SELECTION
+
+    # Extra free-form metadata.
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize state as JSON-safe mapping."""
+        payload: Dict[str, Any] = asdict(self)
+        payload["extras"] = _to_jsonable(payload.get("extras", {}))
+        return payload
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "CheckpointState":
+        """Build state object from mapping with defaults."""
+        state: CheckpointState = cls()
+        for field_name in state.__dataclass_fields__.keys():
+            if field_name in payload:
+                setattr(state, field_name, payload[field_name])
+        if not isinstance(state.extras, dict):
+            state.extras = {}
+        return state
+
+
+# -----------------------------------------------------------------------------
+# Checkpoint manager
+# -----------------------------------------------------------------------------
+class CheckpointManager:
+    """Checkpoint naming, persistence, and resume policy manager."""
+
+    def __init__(
+        self,
+        cfg: Any,
+        stage: str = DEFAULT_STAGE,
+        run_id: str = DEFAULT_RUN_ID,
+        run_paths: Optional[Mapping[str, Any]] = None,
+        strict: bool = DEFAULT_STRICT_MODE,
+    ) -> None:
+        """Initialize checkpoint manager.
+
+        Args:
+            cfg: Resolved config object/dict.
+            stage: Runtime stage (typically ``pretrain`` or ``finetune``).
+            run_id: Stable run identifier.
+            run_paths: Optional run path mapping containing ``checkpoints``.
+            strict: If True, enforce paper-locked invariants for stage config.
+        """
+        cfg_dict: Dict[str, Any] = _to_dict(cfg)
+        normalized_stage: str = _normalize_stage(stage)
+        normalized_run_id: str = _normalize_run_id(run_id)
+        strict_mode: bool = bool(strict)
+
+        checkpoint_root: Path = self._resolve_checkpoint_root(
+            cfg_dict=cfg_dict,
+            stage=normalized_stage,
+            run_paths=run_paths,
+        )
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+
+        self._cfg: Dict[str, Any] = cfg_dict
+        self._stage: str = normalized_stage
+        self._run_id: str = normalized_run_id
+        self._strict: bool = strict_mode
+
+        self._paths: CheckpointPaths = CheckpointPaths(
+            root=checkpoint_root,
+            metadata=checkpoint_root / DEFAULT_METADATA_FILE,
+            last=checkpoint_root / DEFAULT_LAST_NAME,
+            best_rank=checkpoint_root / DEFAULT_BEST_RANK_NAME,
+            final=checkpoint_root / DEFAULT_FINAL_NAME,
+        )
+
+        self._state: CheckpointState = self._load_or_initialize_state()
+        self._validate_stage_invariants()
+
+    # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
+    @property
+    def stage(self) -> str:
+        """Return normalized stage."""
+        return self._stage
+
+    @property
+    def run_id(self) -> str:
+        """Return run identifier."""
+        return self._run_id
+
+    @property
+    def paths(self) -> CheckpointPaths:
+        """Return resolved checkpoint paths."""
+        return self._paths
+
+    @property
+    def state(self) -> CheckpointState:
+        """Return a copy-like view of current state object."""
+        return CheckpointState.from_mapping(self._state.to_dict())
+
+    # ------------------------------------------------------------------
+    # Save API
+    # ------------------------------------------------------------------
+    def save_last_checkpoint(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        *,
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+        metrics: Optional[Mapping[str, Any]] = None,
+        weights_only: bool = DEFAULT_SAVE_WEIGHTS_ONLY,
+    ) -> Optional[Path]:
+        """Persist/update ``last.ckpt`` atomically.
+
+        Returns:
+            Path to saved checkpoint on writer rank, else ``None``.
+        """
+        if not self._is_writer(trainer):
+            return None
+
+        target_path: Path = self._paths.last
+        self._atomic_trainer_save_checkpoint(
+            trainer=trainer,
+            target_path=target_path,
+            weights_only=weights_only,
+        )
+
+        resolved_epoch: int = self._resolve_epoch(epoch, trainer)
+        resolved_step: int = self._resolve_global_step(global_step, trainer)
+
+        self._state.version_counter += 1
+        self._state.last_checkpoint = str(target_path)
+        self._state.last_epoch = int(resolved_epoch)
+        self._state.last_global_step = int(resolved_step)
+        self._state.updated_at_utc = _utc_now_iso()
+
+        if metrics:
+            self._state.extras["last_metrics"] = _to_jsonable(dict(metrics))
+
+        self._persist_state_atomic()
+        self._sync_module_checkpoint_state(pl_module)
+        return target_path
+
+    def maybe_save_best_rank_checkpoint(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        *,
+        rankme_value: float,
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+        metrics: Optional[Mapping[str, Any]] = None,
+        start_epoch: Optional[int] = None,
+        weights_only: bool = DEFAULT_SAVE_WEIGHTS_ONLY,
+    ) -> Optional[Path]:
+        """Persist ``best-rank.ckpt`` on strict RankMe improvement.
+
+        Args:
+            rankme_value: Current RankMe score from callback/module.
+            start_epoch: Optional monitoring start epoch override.
+
+        Returns:
+            Saved checkpoint path if updated on writer rank; else ``None``.
+        """
+        if self._stage != "pretrain":
+            # For non-pretrain stages, best-rank policy is not active.
+            return None
+        if not self._is_writer(trainer):
+            return None
+
+        current_epoch: int = self._resolve_epoch(epoch, trainer)
+        monitor_start: int = self._resolve_rankme_start_epoch(start_epoch)
+
+        if current_epoch < monitor_start:
+            return None
+
+        rank_value_float: float = _as_finite_float(rankme_value, key="rankme_value")
+        if not np.isfinite(rank_value_float):
+            return None
+
+        best_so_far: float = float(self._state.best_rank_value) if self._state.best_rank_value is not None else float("-inf")
+        improved: bool = self._is_strict_improvement(rank_value_float, best_so_far)
+        if not improved:
+            return None
+
+        target_path: Path = self._paths.best_rank
+        self._atomic_trainer_save_checkpoint(
+            trainer=trainer,
+            target_path=target_path,
+            weights_only=weights_only,
+        )
+
+        resolved_step: int = self._resolve_global_step(global_step, trainer)
+
+        self._state.version_counter += 1
+        self._state.best_rank_checkpoint = str(target_path)
+        self._state.best_rank_value = float(rank_value_float)
+        self._state.best_rank_epoch = int(current_epoch)
+        self._state.last_epoch = int(current_epoch)
+        self._state.last_global_step = int(resolved_step)
+        self._state.updated_at_utc = _utc_now_iso()
+
+        if metrics:
+            self._state.extras["best_rank_metrics"] = _to_jsonable(dict(metrics))
+
+        self._persist_state_atomic()
+        self._sync_module_checkpoint_state(pl_module)
+        return target_path
+
+    def save_final_checkpoint(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        *,
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+        metrics: Optional[Mapping[str, Any]] = None,
+        weights_only: bool = DEFAULT_SAVE_WEIGHTS_ONLY,
+        enforce_final_epoch_policy: bool = True,
+    ) -> Optional[Path]:
+        """Persist ``final.ckpt`` for final-epoch selection policy.
+
+        For strict finetune policy, this method enforces save at configured final epoch.
+        """
+        if not self._is_writer(trainer):
+            return None
+
+        current_epoch: int = self._resolve_epoch(epoch, trainer)
+        if enforce_final_epoch_policy and self._stage == "finetune":
+            expected_epoch: int = self._resolve_expected_finetune_final_epoch()
+            if current_epoch < expected_epoch:
+                raise CheckpointSaveError(
+                    "save_final_checkpoint called before configured final epoch: "
+                    f"current_epoch={current_epoch}, expected_final_epoch={expected_epoch}."
+                )
+
+        target_path: Path = self._paths.final
+        self._atomic_trainer_save_checkpoint(
+            trainer=trainer,
+            target_path=target_path,
+            weights_only=weights_only,
+        )
+
+        resolved_step: int = self._resolve_global_step(global_step, trainer)
+
+        self._state.version_counter += 1
+        self._state.final_checkpoint = str(target_path)
+        self._state.last_epoch = int(current_epoch)
+        self._state.last_global_step = int(resolved_step)
+        self._state.updated_at_utc = _utc_now_iso()
+
+        if metrics:
+            self._state.extras["final_metrics"] = _to_jsonable(dict(metrics))
+
+        self._persist_state_atomic()
+        self._sync_module_checkpoint_state(pl_module)
+        return target_path
+
+    def save_epoch_snapshot(
+        self,
+        trainer: Any,
+        *,
+        epoch: Optional[int] = None,
+        weights_only: bool = DEFAULT_SAVE_WEIGHTS_ONLY,
+    ) -> Optional[Path]:
+        """Save immutable epoch snapshot ``epoch-{NNN}.ckpt``."""
+        if not self._is_writer(trainer):
+            return None
+
+        current_epoch: int = self._resolve_epoch(epoch, trainer)
+        file_name: str = DEFAULT_EPOCH_TEMPLATE.format(epoch=int(current_epoch))
+        target_path: Path = self._paths.root / file_name
+
+        if target_path.exists():
+            # Immutable by contract.
+            return target_path
+
+        self._atomic_trainer_save_checkpoint(
+            trainer=trainer,
+            target_path=target_path,
+            weights_only=weights_only,
+        )
+        return target_path
+
+    def record_resume_source(self, checkpoint_path: str) -> None:
+        """Record resume provenance in state metadata."""
+        resolved_path: Path = Path(str(checkpoint_path)).expanduser().resolve()
+        self._state.resumed_from = str(resolved_path)
+        self._state.resumed_at_utc = _utc_now_iso()
+        self._state.updated_at_utc = _utc_now_iso()
+        self._state.version_counter += 1
+        self._persist_state_atomic()
+
+    # ------------------------------------------------------------------
+    # Resume / load API
+    # ------------------------------------------------------------------
+    def resolve_resume_checkpoint(
+        self,
+        *,
+        mode: str = "auto",
+        explicit_path: Optional[str] = None,
+        strict: bool = True,
+    ) -> Optional[Path]:
+        """Resolve checkpoint path according to resume mode.
+
+        Modes:
+        - ``none``: return None
+        - ``auto``: prefer explicit_path, then metadata/last
+        - ``last``: use last checkpoint
+        - ``best``: use best-rank checkpoint
+        - ``final``: use final checkpoint
+        - ``path``: require explicit_path
+        """
+        normalized_mode: str = _normalize_resume_mode(mode)
+        strict_mode: bool = bool(strict)
+
+        candidate_path: Optional[Path] = None
+
+        if normalized_mode == "none":
+            return None
+
+        if normalized_mode == "path":
+            if explicit_path is None or str(explicit_path).strip() == "":
+                raise CheckpointLoadError("Resume mode 'path' requires explicit_path.")
+            candidate_path = Path(str(explicit_path)).expanduser().resolve()
+
+        elif normalized_mode == "auto":
+            if explicit_path is not None and str(explicit_path).strip() != "":
+                candidate_path = Path(str(explicit_path)).expanduser().resolve()
+            else:
+                candidate_path = self._resolve_last_from_state_or_default()
+
+        elif normalized_mode == "last":
+            candidate_path = self._resolve_last_from_state_or_default()
+
+        elif normalized_mode == "best":
+            candidate_path = self._resolve_best_from_state_or_default()
+
+        elif normalized_mode == "final":
+            candidate_path = self._resolve_final_from_state_or_default()
+
+        if candidate_path is None:
+            if strict_mode:
+                raise CheckpointLoadError(
+                    f"No checkpoint resolved for mode={normalized_mode!r}."
+                )
+            return None
+
+        if not candidate_path.exists() or not candidate_path.is_file():
+            if strict_mode:
+                raise CheckpointLoadError(
+                    f"Resolved checkpoint path does not exist: {candidate_path}"
+                )
+            return None
+
+        return candidate_path
+
+    def load_checkpoint(
+        self,
+        checkpoint_path: str,
+        *,
+        map_location: str | torch.device = "cpu",
+    ) -> Dict[str, Any]:
+        """Load checkpoint dictionary from disk."""
+        resolved_path: Path = Path(str(checkpoint_path)).expanduser().resolve()
+        if not resolved_path.exists() or not resolved_path.is_file():
+            raise CheckpointLoadError(f"Checkpoint path not found: {resolved_path}")
+
+        try:
+            payload: Any = torch.load(resolved_path, map_location=map_location)
+        except Exception as exc:  # noqa: BLE001
+            raise CheckpointLoadError(
+                f"Failed to load checkpoint at {resolved_path}: {exc}"
+            ) from exc
+
+        if not isinstance(payload, dict):
+            raise CheckpointIntegrityError(
+                f"Loaded checkpoint is not a dictionary: {type(payload).__name__}"
+            )
+        return payload
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _resolve_checkpoint_root(
+        self,
+        *,
+        cfg_dict: Mapping[str, Any],
+        stage: str,
+        run_paths: Optional[Mapping[str, Any]],
+    ) -> Path:
+        """Resolve checkpoint directory from run paths or config."""
+        if run_paths is not None:
+            checkpoints_value: Any = run_paths.get("checkpoints")
+            if checkpoints_value is not None and str(checkpoints_value).strip() != "":
+                return Path(str(checkpoints_value)).expanduser().resolve()
+
+        if stage == "pretrain":
+            config_path_value: Any = _deep_get(
+                cfg_dict,
+                ("train_pretrain", "pretrain", "checkpointing", "dirpath"),
+                _deep_get(cfg_dict, ("pretraining", "checkpointing", "dirpath"), DEFAULT_PRETRAIN_CHECKPOINT_DIR),
+            )
+            return Path(str(config_path_value)).expanduser().resolve()
+
+        if stage == "finetune":
+            config_path_value = _deep_get(
+                cfg_dict,
+                ("train_finetune", "finetune", "checkpointing", "dirpath"),
+                _deep_get(cfg_dict, ("finetuning_threads", "checkpointing", "dirpath"), DEFAULT_FINETUNE_CHECKPOINT_DIR),
+            )
+            return Path(str(config_path_value)).expanduser().resolve()
+
+        fallback: Path = Path(DEFAULT_CHECKPOINT_ROOT).expanduser().resolve() / stage
+        return fallback
+
+    def _load_or_initialize_state(self) -> CheckpointState:
+        """Load metadata state from disk or initialize new state."""
+        now_utc: str = _utc_now_iso()
+
+        if self._paths.metadata.exists() and self._paths.metadata.is_file():
+            try:
+                with self._paths.metadata.open("r", encoding="utf-8") as file_handle:
+                    payload: Any = json.load(file_handle)
+                if not isinstance(payload, Mapping):
+                    raise CheckpointIntegrityError("Checkpoint metadata root must be a mapping.")
+                state: CheckpointState = CheckpointState.from_mapping(payload)
+            except Exception as exc:  # noqa: BLE001
+                # Attempt backup and reinitialize clean state.
+                backup_path: Path = self._paths.metadata.with_suffix(".corrupt.json")
+                try:
+                    shutil.copy2(self._paths.metadata, backup_path)
+                except Exception:
+                    pass
+                state = CheckpointState()
+                state.extras["metadata_recovered_from_corruption"] = True
+                state.extras["metadata_corruption_error"] = str(exc)
+        else:
+            state = CheckpointState()
+
+        if not state.created_at_utc:
+            state.created_at_utc = now_utc
+        state.updated_at_utc = now_utc
+
+        state.run_id = self._run_id
+        state.stage = self._stage
+
+        # Populate reproducibility fields from config where present.
+        state.embedding_dim = _as_int(
+            _deep_get(self._cfg, ("model", "slide_embedding_dim"), state.embedding_dim),
+            key="model.slide_embedding_dim",
+            default=DEFAULT_EMBEDDING_DIM,
+        )
+        state.dna_input_dim = _as_int(
+            _deep_get(self._cfg, ("model", "dna_encoder", "input_dim"), state.dna_input_dim),
+            key="model.dna_encoder.input_dim",
+            default=DEFAULT_DNA_INPUT_DIM,
+        )
+        state.pretrain_max_epochs = _as_int(
+            _deep_get(self._cfg, ("pretraining", "training", "max_epochs"), state.pretrain_max_epochs),
+            key="pretraining.training.max_epochs",
+            default=DEFAULT_PRETRAIN_MAX_EPOCHS,
+        )
+        state.pretrain_warmup_epochs = _as_int(
+            _deep_get(self._cfg, ("pretraining", "scheduler", "warmup_epochs"), state.pretrain_warmup_epochs),
+            key="pretraining.scheduler.warmup_epochs",
+            default=DEFAULT_PRETRAIN_WARMUP_EPOCHS,
+        )
+        state.rankme_eps = _as_float(
+            _deep_get(self._cfg, ("pretraining", "training", "rankme_eps"), state.rankme_eps),
+            key="pretraining.training.rankme_eps",
+            default=DEFAULT_RANKME_EPS,
+        )
+        state.finetune_epochs = _as_int(
+            _deep_get(self._cfg, ("finetuning_threads", "training", "epochs"), state.finetune_epochs),
+            key="finetuning_threads.training.epochs",
+            default=DEFAULT_FINETUNE_EPOCHS,
+        )
+        state.finetune_checkpoint_selection = _as_str(
+            _deep_get(
+                self._cfg,
+                ("finetuning_threads", "training", "checkpoint_selection"),
+                state.finetune_checkpoint_selection,
+            ),
+            key="finetuning_threads.training.checkpoint_selection",
+            default=DEFAULT_FINETUNE_SELECTION,
+        )
+
+        self._state = state
+        self._persist_state_atomic()
+        return state
+
+    def _validate_stage_invariants(self) -> None:
+        """Validate stage-specific paper/config invariants."""
+        if not self._strict:
+            return
+
+        if self._state.embedding_dim != DEFAULT_EMBEDDING_DIM:
+            raise CheckpointConfigError(
+                f"embedding_dim invariant violated: expected {DEFAULT_EMBEDDING_DIM}, got {self._state.embedding_dim}."
+            )
+        if self._state.dna_input_dim != DEFAULT_DNA_INPUT_DIM:
+            raise CheckpointConfigError(
+                f"dna_input_dim invariant violated: expected {DEFAULT_DNA_INPUT_DIM}, got {self._state.dna_input_dim}."
+            )
+
+        if self._stage == "pretrain":
+            if self._state.pretrain_max_epochs != DEFAULT_PRETRAIN_MAX_EPOCHS:
+                raise CheckpointConfigError(
+                    "pretraining max_epochs invariant violated: "
+                    f"expected {DEFAULT_PRETRAIN_MAX_EPOCHS}, got {self._state.pretrain_max_epochs}."
+                )
+            if self._state.pretrain_warmup_epochs != DEFAULT_PRETRAIN_WARMUP_EPOCHS:
+                raise CheckpointConfigError(
+                    "pretraining warmup_epochs invariant violated: "
+                    f"expected {DEFAULT_PRETRAIN_WARMUP_EPOCHS}, got {self._state.pretrain_warmup_epochs}."
+                )
+            if not np.isclose(self._state.rankme_eps, DEFAULT_RANKME_EPS):
+                raise CheckpointConfigError(
+                    f"rankme_eps invariant violated: expected {DEFAULT_RANKME_EPS}, got {self._state.rankme_eps}."
+                )
+
+        if self._stage == "finetune":
+            if self._state.finetune_epochs != DEFAULT_FINETUNE_EPOCHS:
+                raise CheckpointConfigError(
+                    "finetune epochs invariant violated: "
+                    f"expected {DEFAULT_FINETUNE_EPOCHS}, got {self._state.finetune_epochs}."
+                )
+            if self._state.finetune_checkpoint_selection.strip().lower() != DEFAULT_FINETUNE_SELECTION:
+                raise CheckpointConfigError(
+                    "finetune checkpoint_selection invariant violated: "
+                    f"expected '{DEFAULT_FINETUNE_SELECTION}', got '{self._state.finetune_checkpoint_selection}'."
+                )
+
+    def _persist_state_atomic(self) -> None:
+        """Persist metadata JSON atomically."""
+        payload: Dict[str, Any] = self._state.to_dict()
+        serialized: str = json.dumps(
+            _to_jsonable(payload),
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=True,
+        ) + "\n"
+
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".json.tmp",
+                dir=str(self._paths.root),
+                encoding="utf-8",
+                delete=False,
+            ) as tmp_file:
+                tmp_file.write(serialized)
+                tmp_path = Path(tmp_file.name)
+
+            tmp_path.replace(self._paths.metadata)
+        except Exception as exc:  # noqa: BLE001
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise CheckpointSaveError(
+                f"Failed to persist checkpoint metadata atomically: {exc}"
+            ) from exc
+
+    def _atomic_trainer_save_checkpoint(
+        self,
+        *,
+        trainer: Any,
+        target_path: Path,
+        weights_only: bool,
+    ) -> None:
+        """Save checkpoint via trainer to temp path then atomic replace."""
+        if not hasattr(trainer, "save_checkpoint"):
+            raise CheckpointSaveError("trainer does not expose save_checkpoint().")
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_file: tempfile.NamedTemporaryFile
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=".ckpt.tmp",
+                dir=str(target_path.parent),
+                delete=False,
+            ) as temp_file:
+                tmp_path = Path(temp_file.name)
+
+            # Lightning API compatibility across versions.
+            try:
+                trainer.save_checkpoint(str(tmp_path), weights_only=bool(weights_only))
+            except TypeError:
+                trainer.save_checkpoint(str(tmp_path))
+
+            if not tmp_path.exists() or not tmp_path.is_file():
+                raise CheckpointSaveError(f"Trainer did not produce checkpoint file: {tmp_path}")
+
+            tmp_path.replace(target_path)
+        except Exception as exc:  # noqa: BLE001
+            if tmp_path is not None and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise CheckpointSaveError(
+                f"Failed to save checkpoint atomically to {target_path}: {exc}"
+            ) from exc
+
+    def _sync_module_checkpoint_state(self, pl_module: Any) -> None:
+        """Expose current checkpoint state on module for callback/pipeline access."""
+        try:
+            setattr(pl_module, "checkpoint_state", self._state.to_dict())
+            setattr(pl_module, "checkpoint_last_path", self._state.last_checkpoint)
+            setattr(pl_module, "checkpoint_best_rank_path", self._state.best_rank_checkpoint)
+            setattr(pl_module, "checkpoint_final_path", self._state.final_checkpoint)
+            setattr(pl_module, "checkpoint_version_counter", int(self._state.version_counter))
+        except Exception:
+            return
+
+    def _resolve_rankme_start_epoch(self, start_epoch: Optional[int]) -> int:
+        if start_epoch is not None:
+            return _as_int(start_epoch, key="start_epoch", default=DEFAULT_PRETRAIN_WARMUP_EPOCHS)
+
+        configured_start: Any = _deep_get(
+            self._cfg,
+            ("train_pretrain", "pretrain", "rankme", "first_monitor_epoch"),
+            None,
+        )
+        if configured_start is not None:
+            return _as_int(configured_start, key="train_pretrain.pretrain.rankme.first_monitor_epoch", default=6)
+
+        warmup_epochs: int = _as_int(
+            _deep_get(self._cfg, ("pretraining", "scheduler", "warmup_epochs"), DEFAULT_PRETRAIN_WARMUP_EPOCHS),
+            key="pretraining.scheduler.warmup_epochs",
+            default=DEFAULT_PRETRAIN_WARMUP_EPOCHS,
+        )
+        # Paper says monitoring starts after warmup.
+        return int(warmup_epochs + 1)
+
+    def _resolve_expected_finetune_final_epoch(self) -> int:
+        """Return expected final epoch index for strict final save policy."""
+        configured_epochs: int = _as_int(
+            _deep_get(self._cfg, ("finetuning_threads", "training", "epochs"), DEFAULT_FINETUNE_EPOCHS),
+            key="finetuning_threads.training.epochs",
+            default=DEFAULT_FINETUNE_EPOCHS,
+        )
+        # Epoch index is zero-based in Trainer.current_epoch.
+        return int(configured_epochs - 1)
+
+    def _resolve_epoch(self, epoch: Optional[int], trainer: Any) -> int:
+        if epoch is not None:
+            return _as_int(epoch, key="epoch", default=0)
+        if hasattr(trainer, "current_epoch"):
+            try:
+                return _as_int(getattr(trainer, "current_epoch"), key="trainer.current_epoch", default=0)
+            except Exception:
+                return 0
+        return 0
+
+    def _resolve_global_step(self, global_step: Optional[int], trainer: Any) -> int:
+        if global_step is not None:
+            return _as_int(global_step, key="global_step", default=0)
+        if hasattr(trainer, "global_step"):
+            try:
+                return _as_int(getattr(trainer, "global_step"), key="trainer.global_step", default=0)
+            except Exception:
+                return 0
+        return 0
+
+    def _resolve_last_from_state_or_default(self) -> Optional[Path]:
+        if self._state.last_checkpoint:
+            return Path(str(self._state.last_checkpoint)).expanduser().resolve()
+        if self._paths.last.exists():
+            return self._paths.last
+        return None
+
+    def _resolve_best_from_state_or_default(self) -> Optional[Path]:
+        if self._state.best_rank_checkpoint:
+            return Path(str(self._state.best_rank_checkpoint)).expanduser().resolve()
+        if self._paths.best_rank.exists():
+            return self._paths.best_rank
+        return None
+
+    def _resolve_final_from_state_or_default(self) -> Optional[Path]:
+        if self._state.final_checkpoint:
+            return Path(str(self._state.final_checkpoint)).expanduser().resolve()
+        if self._paths.final.exists():
+            return self._paths.final
+        return None
+
+    def _is_writer(self, trainer: Any) -> bool:
+        """Return True for the single process allowed to write artifacts."""
+        if hasattr(trainer, "is_global_zero"):
+            try:
+                return bool(getattr(trainer, "is_global_zero"))
+            except Exception:
+                pass
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                return int(torch.distributed.get_rank()) == 0
+            except Exception:
+                return True
+
+        return True
+
+    def _is_strict_improvement(self, current: float, best: float) -> bool:
+        if not np.isfinite(current):
+            return False
+        if not np.isfinite(best):
+            return True
+        return bool(current > (best + DEFAULT_STRICT_IMPROVEMENT_TOLERANCE))
+
+
+# -----------------------------------------------------------------------------
+# Convenience top-level helpers
+# -----------------------------------------------------------------------------
+def create_checkpoint_manager(
+    cfg: Any,
+    stage: str = DEFAULT_STAGE,
+    run_id: str = DEFAULT_RUN_ID,
+    run_paths: Optional[Mapping[str, Any]] = None,
+    strict: bool = DEFAULT_STRICT_MODE,
+) -> CheckpointManager:
+    """Factory helper for ``CheckpointManager``."""
+    return CheckpointManager(
+        cfg=cfg,
+        stage=stage,
+        run_id=run_id,
+        run_paths=run_paths,
+        strict=strict,
+    )
+
+
+def resolve_resume_checkpoint_path(
+    cfg: Any,
+    *,
+    stage: str,
+    run_id: str,
+    run_paths: Optional[Mapping[str, Any]] = None,
+    mode: str = "auto",
+    explicit_path: Optional[str] = None,
+    strict: bool = True,
+) -> Optional[str]:
+    """Resolve resume checkpoint path with one-shot manager instance."""
+    manager: CheckpointManager = create_checkpoint_manager(
+        cfg=cfg,
+        stage=stage,
+        run_id=run_id,
+        run_paths=run_paths,
+        strict=bool(strict),
+    )
+    resolved: Optional[Path] = manager.resolve_resume_checkpoint(
+        mode=mode,
+        explicit_path=explicit_path,
+        strict=bool(strict),
+    )
+    return str(resolved) if resolved is not None else None
+
+
+def save_last_checkpoint(
+    manager: CheckpointManager,
+    trainer: Any,
+    pl_module: Any,
+    *,
+    epoch: Optional[int] = None,
+    global_step: Optional[int] = None,
+    metrics: Optional[Mapping[str, Any]] = None,
+    weights_only: bool = DEFAULT_SAVE_WEIGHTS_ONLY,
+) -> Optional[str]:
+    """Thin wrapper to persist last checkpoint and return string path."""
+    path_value: Optional[Path] = manager.save_last_checkpoint(
+        trainer=trainer,
+        pl_module=pl_module,
+        epoch=epoch,
+        global_step=global_step,
+        metrics=metrics,
+        weights_only=weights_only,
+    )
+    return str(path_value) if path_value is not None else None
+
+
+def maybe_save_best_rank_checkpoint(
+    manager: CheckpointManager,
+    trainer: Any,
+    pl_module: Any,
+    *,
+    rankme_value: float,
+    epoch: Optional[int] = None,
+    global_step: Optional[int] = None,
+    metrics: Optional[Mapping[str, Any]] = None,
+    start_epoch: Optional[int] = None,
+    weights_only: bool = DEFAULT_SAVE_WEIGHTS_ONLY,
+) -> Optional[str]:
+    """Thin wrapper to maybe persist best-rank checkpoint."""
+    path_value: Optional[Path] = manager.maybe_save_best_rank_checkpoint(
+        trainer=trainer,
+        pl_module=pl_module,
+        rankme_value=rankme_value,
+        epoch=epoch,
+        global_step=global_step,
+        metrics=metrics,
+        start_epoch=start_epoch,
+        weights_only=weights_only,
+    )
+    return str(path_value) if path_value is not None else None
+
+
+def save_final_checkpoint(
+    manager: CheckpointManager,
+    trainer: Any,
+    pl_module: Any,
+    *,
+    epoch: Optional[int] = None,
+    global_step: Optional[int] = None,
+    metrics: Optional[Mapping[str, Any]] = None,
+    weights_only: bool = DEFAULT_SAVE_WEIGHTS_ONLY,
+    enforce_final_epoch_policy: bool = True,
+) -> Optional[str]:
+    """Thin wrapper to persist final checkpoint."""
+    path_value: Optional[Path] = manager.save_final_checkpoint(
+        trainer=trainer,
+        pl_module=pl_module,
+        epoch=epoch,
+        global_step=global_step,
+        metrics=metrics,
+        weights_only=weights_only,
+        enforce_final_epoch_policy=enforce_final_epoch_policy,
+    )
+    return str(path_value) if path_value is not None else None
+
+
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
+def _to_dict(cfg: Any) -> Dict[str, Any]:
+    """Convert config-like object to plain dictionary."""
+    if cfg is None:
+        return {}
+    if isinstance(cfg, dict):
+        return dict(cfg)
+    if isinstance(cfg, Mapping):
+        return dict(cfg)
+    if hasattr(cfg, "to_dict") and callable(cfg.to_dict):
+        converted: Any = cfg.to_dict()
+        if isinstance(converted, Mapping):
+            return dict(converted)
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(cfg):
+            container: Any = OmegaConf.to_container(cfg, resolve=True)
+            if isinstance(container, Mapping):
+                return dict(container)
+    except Exception:
+        pass
+    raise CheckpointConfigError(f"Unsupported config object type: {type(cfg).__name__}.")
+
+
+def _deep_get(mapping: Mapping[str, Any], path: Tuple[str, ...], default: Any) -> Any:
+    """Safely fetch nested mapping value."""
+    current: Any = mapping
+    for key in path:
+        if not isinstance(current, Mapping):
+            return default
+        if key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _normalize_stage(stage: str) -> str:
+    """Normalize and validate stage token."""
+    normalized: str = str(stage).strip().lower()
+    if normalized == "":
+        normalized = DEFAULT_STAGE
+    if normalized not in _ALLOWED_STAGES:
+        raise CheckpointConfigError(
+            f"Unsupported stage={stage!r}. Allowed stages: {_ALLOWED_STAGES}."
+        )
+    return normalized
+
+
+def _normalize_resume_mode(mode: str) -> str:
+    """Normalize and validate resume mode."""
+    normalized: str = str(mode).strip().lower()
+    if normalized == "":
+        normalized = "auto"
+    if normalized not in _ALLOWED_RESUME_MODES:
+        raise CheckpointConfigError(
+            f"Unsupported resume mode={mode!r}. Allowed modes: {_ALLOWED_RESUME_MODES}."
+        )
+    return normalized
+
+
+def _normalize_run_id(run_id: str) -> str:
+    """Normalize run identifier."""
+    normalized: str = str(run_id).strip()
+    return normalized if normalized != "" else DEFAULT_RUN_ID
+
+
+def _utc_now_iso() -> str:
+    """Return UTC timestamp in ISO8601 format."""
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _as_int(value: Any, *, key: str, default: int) -> int:
+    """Parse integer config value with explicit fallback."""
+    if value is None:
+        return int(default)
+    if isinstance(value, bool):
+        raise CheckpointConfigError(f"{key} must be int, got bool.")
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        if not float(value).is_integer():
+            raise CheckpointConfigError(f"{key} must be integer-like, got {value}.")
+        return int(value)
+    if isinstance(value, str):
+        stripped: str = value.strip()
+        if stripped == "":
+            return int(default)
+        try:
+            return int(stripped)
+        except ValueError as exc:
+            raise CheckpointConfigError(f"{key} must be int, got {value!r}.") from exc
+    raise CheckpointConfigError(f"{key} must be int, got {type(value).__name__}.")
+
+
+def _as_float(value: Any, *, key: str, default: float) -> float:
+    """Parse float config value with explicit fallback."""
+    if value is None:
+        return float(default)
+    if isinstance(value, bool):
+        raise CheckpointConfigError(f"{key} must be float, got bool.")
+    if isinstance(value, (int, float)):
+        parsed: float = float(value)
+        if not np.isfinite(parsed):
+            raise CheckpointConfigError(f"{key} must be finite, got {parsed}.")
+        return parsed
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped == "":
+            return float(default)
+        try:
+            parsed = float(stripped)
+        except ValueError as exc:
+            raise CheckpointConfigError(f"{key} must be float, got {value!r}.") from exc
+        if not np.isfinite(parsed):
+            raise CheckpointConfigError(f"{key} must be finite, got {parsed}.")
+        return parsed
+    raise CheckpointConfigError(f"{key} must be float, got {type(value).__name__}.")
+
+
+def _as_str(value: Any, *, key: str, default: str) -> str:
+    """Parse string config value with explicit fallback."""
+    if value is None:
+        return str(default)
+    parsed: str = str(value).strip()
+    return parsed if parsed != "" else str(default)
+
+
+def _as_finite_float(value: Any, *, key: str) -> float:
+    """Parse and require finite float."""
+    parsed: float = _as_float(value, key=key, default=float("nan"))
+    if not np.isfinite(parsed):
+        raise CheckpointInputError(f"{key} must be finite, got {parsed}.")
+    return parsed
+
+
+def _to_jsonable(value: Any) -> Any:
+    """Convert nested values to JSON-safe structures."""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        if not np.isfinite(value):
+            return None
+        return float(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    return str(value)
+
+
+class CheckpointInputError(CheckpointingError):
+    """Raised when runtime inputs to helper utilities are invalid."""
+
+
+__all__ = [
+    "DEFAULT_STAGE",
+    "DEFAULT_RUN_ID",
+    "DEFAULT_CHECKPOINT_ROOT",
+    "DEFAULT_PRETRAIN_CHECKPOINT_DIR",
+    "DEFAULT_FINETUNE_CHECKPOINT_DIR",
+    "DEFAULT_PRETRAIN_MAX_EPOCHS",
+    "DEFAULT_PRETRAIN_WARMUP_EPOCHS",
+    "DEFAULT_RANKME_EPS",
+    "DEFAULT_FINETUNE_EPOCHS",
+    "DEFAULT_FINETUNE_SELECTION",
+    "DEFAULT_METADATA_FILE",
+    "DEFAULT_LAST_NAME",
+    "DEFAULT_BEST_RANK_NAME",
+    "DEFAULT_FINAL_NAME",
+    "DEFAULT_EPOCH_TEMPLATE",
+    "DEFAULT_SAVE_WEIGHTS_ONLY",
+    "DEFAULT_STRICT_MODE",
+    "DEFAULT_STRICT_IMPROVEMENT_TOLERANCE",
+    "CheckpointingError",
+    "CheckpointConfigError",
+    "CheckpointSaveError",
+    "CheckpointLoadError",
+    "CheckpointIntegrityError",
+    "CheckpointInputError",
+    "CheckpointPaths",
+    "CheckpointState",
+    "CheckpointManager",
+    "create_checkpoint_manager",
+    "resolve_resume_checkpoint_path",
+    "save_last_checkpoint",
+    "maybe_save_best_rank_checkpoint",
+    "save_final_checkpoint",
+]

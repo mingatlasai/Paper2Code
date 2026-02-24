@@ -1,0 +1,14 @@
+Implemented the logic analysis in `src/train/checkpointing.py`.
+
+It now documents, in a paper-aligned way:
+
+- Checkpoint policy for pretraining vs finetuning
+- RankMe-based best-checkpoint persistence
+- Naming/versioning and artifact layout (`runs/{date}/{stage}/{run_id}`)
+- Resume modes and required restorable state
+- DDP single-writer rules
+- Atomic write/fault-tolerance behavior
+- Reproducibility metadata requirements
+- Edge cases and test expectations
+
+No executable code was added yet, only structured analysis as requested.

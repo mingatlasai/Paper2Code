@@ -1,0 +1,158 @@
+# configs/model/threads.yaml
+# THREADS model configuration.
+# Source-of-truth values are constrained by the provided config.yaml and paper text.
+
+# Flat model block (kept for compatibility with existing registry lookups).
+model:
+  name: "THREADS"
+  family: "threads"
+  version: "paper_aligned"
+
+  # Shared embedding-space contract.
+  slide_embedding_dim: 1024
+  contrastive_embedding_dim: 1024
+
+  # WSI branch.
+  patch_encoder:
+    name: "CONCHV1.5"
+    backend: "open-clip"
+    feature_dim: 768
+    input_resize: 448
+    normalization:
+      mean: "ImageNet default"
+      std: "ImageNet default"
+
+  slide_encoder:
+    type: "ABMIL gated attention"
+    in_dim: 768
+    hidden_dim: 1024
+    out_dim: 1024
+    attention_heads_main: 2
+    single_head_variant_supported: true
+    pre_attention:
+      hidden_layers: 3
+      layer_norm: true
+      activation: "GELU"
+      dropout: 0.1
+    gated_attention:
+      hidden_dim: 1024
+      dropout: 0.25
+      tanh_branch: true
+      sigmoid_branch: true
+      use_elementwise_gate: true
+    multi_head:
+      concat_heads: true
+      post_attention_projection: true
+      post_attention_out_dim: 1024
+
+  # RNA branch.
+  rna_encoder:
+    name: "scGPT (pan-cancer checkpoint)"
+    trainable: true
+    transformer_layers: 12
+    attention_heads: 8
+    token_dim: 512
+    expression_encoder_dropout: 0.2
+    projection_head_layers: 2
+    projection_out_dim: 1024
+    checkpoint_path: null
+
+  # DNA branch.
+  dna_encoder:
+    type: "4-layer MLP"
+    input_dim: 1673
+    hidden_dim: 1673
+    layers: 4
+    activation: "ReLU"
+    dropout: 0.2
+    output_dim: 1024
+
+  # Contrastive objective (exact temperature not provided in source config).
+  objective:
+    type: "cross-modal contrastive learning (InfoNCE-style)"
+    loss_name: "infonce"
+    bidirectional: true
+    temperature: null
+    normalize_embeddings: true
+    similarity: "cosine"
+    pairing:
+      use_wsi_rna: true
+      use_wsi_dna: true
+      skip_missing_modality: true
+    weights:
+      wsi_rna: 1.0
+      wsi_dna: 1.0
+
+  # Upstream preprocessing assumptions used by model-side validation.
+  preprocessing_contract:
+    patch_size: 512
+    patch_stride: 512
+    overlap: 0
+    target_magnification: 20
+
+  # Runtime/checkpoint interfaces from design.
+  interfaces:
+    patch_encoder_class: "PatchEncoder"
+    slide_encoder_class: "ThreadsSlideEncoder"
+    rna_encoder_class: "ScGPTRNAEncoder"
+    dna_encoder_class: "DNAMLPEncoder"
+    loss_class: "ContrastiveLoss"
+    model_class: "ThreadsModel"
+
+# Namespaced mirror (for modules that read cfg.model_threads.threads.*).
+threads:
+  name: "THREADS"
+  output_dim: 1024
+
+  patch_encoder:
+    name: "CONCHV1.5"
+    feature_dim: 768
+    input_resize: 448
+    normalization_mean: "ImageNet default"
+    normalization_std: "ImageNet default"
+
+  slide_encoder:
+    type: "ABMIL gated attention"
+    in_dim: 768
+    hidden_dim: 1024
+    out_dim: 1024
+    n_heads: 2
+    single_head_variant_supported: true
+    pre_attention_hidden_layers: 3
+    pre_attention_dropout: 0.1
+    attention_dropout: 0.25
+    activation: "GELU"
+
+  rna_encoder:
+    name: "scGPT (pan-cancer checkpoint)"
+    transformer_layers: 12
+    attention_heads: 8
+    projection_out_dim: 1024
+    expression_encoder_dropout: 0.2
+    trainable: true
+    checkpoint_path: null
+
+  dna_encoder:
+    type: "4-layer MLP"
+    input_dim: 1673
+    hidden_dim: 1673
+    output_dim: 1024
+    dropout: 0.2
+    activation: "ReLU"
+    layers: 4
+
+  multimodal_objective:
+    type: "cross-modal contrastive learning (InfoNCE-style)"
+    loss_name: "infonce"
+    temperature: null
+    bidirectional: true
+    normalize_embeddings: true
+    similarity: "cosine"
+    wsi_rna_weight: 1.0
+    wsi_dna_weight: 1.0
+    skip_missing_modality: true
+
+  invariants:
+    embedding_dim: 1024
+    patch_size: 512
+    target_magnification: 20

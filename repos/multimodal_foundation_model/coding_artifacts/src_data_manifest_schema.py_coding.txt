@@ -1,0 +1,566 @@
+## Code: `src/data/manifest_schema.py`
+```python
+"""Manifest schema contract for THREADS reproduction.
+
+This module defines the canonical sample-level metadata structure used across
+all stages of the pipeline.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+
+# Paper/config-grounded constants.
+DEFAULT_TARGET_MAGNIFICATION: str = "20x"
+DEFAULT_TARGET_MAGNIFICATION_INT: int = 20
+DEFAULT_PATCH_SIZE: int = 512
+DEFAULT_SLIDE_EMBEDDING_DIM: int = 1024
+
+# Canonical schema keys from design/config.
+MANIFEST_REQUIRED_KEYS: Tuple[str, ...] = (
+    "sample_id",
+    "patient_id",
+    "cohort",
+    "slide_path",
+    "magnification",
+    "rna_path",
+    "dna_path",
+    "task_labels",
+    "meta",
+)
+
+
+class ManifestSchemaError(Exception):
+    """Base exception for manifest schema failures."""
+
+
+class ManifestValidationError(ManifestSchemaError):
+    """Raised when a manifest record violates schema constraints."""
+
+
+class ManifestCoercionError(ManifestSchemaError):
+    """Raised when input cannot be coerced into a manifest record."""
+
+
+@dataclass(slots=True)
+class ManifestRecord:
+    """Canonical sample-level metadata record.
+
+    Attributes:
+        sample_id: Stable sample-level identifier.
+        patient_id: Stable patient-level identifier.
+        cohort: Cohort identifier (e.g., TCGA, GTEx, CPTAC).
+        slide_path: WSI path for preprocessing/feature extraction.
+        magnification: Integer magnification level for the source slide.
+        rna_path: Optional RNA profile path.
+        dna_path: Optional DNA profile path.
+        task_labels: Task-to-label mapping.
+        meta: Free-form metadata map.
+    """
+
+    sample_id: str = ""
+    patient_id: str = ""
+    cohort: str = ""
+    slide_path: str = ""
+    magnification: int = DEFAULT_TARGET_MAGNIFICATION_INT
+    rna_path: str = ""
+    dna_path: str = ""
+    task_labels: Dict[str, str] = field(default_factory=dict)
+    meta: Dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        strict_required_keys: bool = True,
+        coerce_task_labels_to_string: bool = True,
+        coerce_meta_to_string: bool = True,
+    ) -> "ManifestRecord":
+        """Build a manifest record from a mapping.
+
+        Args:
+            payload: Input mapping.
+            strict_required_keys: If True, reject missing required keys.
+            coerce_task_labels_to_string: If True, coerce task label values to str.
+            coerce_meta_to_string: If True, coerce metadata values to str.
+
+        Returns:
+            Parsed and validated record.
+        """
+        if not isinstance(payload, Mapping):
+            raise ManifestCoercionError(
+                f"Manifest payload must be a mapping, got {type(payload).__name__}."
+            )
+
+        if strict_required_keys:
+            missing_keys: List[str] = [
+                key for key in MANIFEST_REQUIRED_KEYS if key not in payload
+            ]
+            if missing_keys:
+                raise ManifestValidationError(
+                    f"Missing required manifest keys: {missing_keys}."
+                )
+
+        raw_task_labels: Any = payload.get("task_labels", {})
+        raw_meta: Any = payload.get("meta", {})
+
+        task_labels: Dict[str, str] = normalize_string_mapping(
+            raw_task_labels,
+            field_name="task_labels",
+            allow_empty=True,
+            coerce_values=coerce_task_labels_to_string,
+        )
+        meta: Dict[str, str] = normalize_string_mapping(
+            raw_meta,
+            field_name="meta",
+            allow_empty=True,
+            coerce_values=coerce_meta_to_string,
+        )
+
+        record: ManifestRecord = cls(
+            sample_id=normalize_non_empty_string(
+                payload.get("sample_id", ""),
+                field_name="sample_id",
+                allow_empty=False,
+            ),
+            patient_id=normalize_non_empty_string(
+                payload.get("patient_id", ""),
+                field_name="patient_id",
+                allow_empty=False,
+            ),
+            cohort=normalize_non_empty_string(
+                payload.get("cohort", ""),
+                field_name="cohort",
+                allow_empty=False,
+            ),
+            slide_path=normalize_non_empty_string(
+                payload.get("slide_path", ""),
+                field_name="slide_path",
+                allow_empty=False,
+            ),
+            magnification=normalize_magnification(
+                payload.get("magnification", DEFAULT_TARGET_MAGNIFICATION_INT)
+            ),
+            rna_path=normalize_non_empty_string(
+                payload.get("rna_path", ""),
+                field_name="rna_path",
+                allow_empty=True,
+            ),
+            dna_path=normalize_non_empty_string(
+                payload.get("dna_path", ""),
+                field_name="dna_path",
+                allow_empty=True,
+            ),
+            task_labels=task_labels,
+            meta=meta,
+        )
+        record.validate()
+        return record
+
+    def validate(self) -> None:
+        """Validate record fields against schema constraints."""
+        self.sample_id = normalize_non_empty_string(
+            self.sample_id,
+            field_name="sample_id",
+            allow_empty=False,
+        )
+        self.patient_id = normalize_non_empty_string(
+            self.patient_id,
+            field_name="patient_id",
+            allow_empty=False,
+        )
+        self.cohort = normalize_non_empty_string(
+            self.cohort,
+            field_name="cohort",
+            allow_empty=False,
+        )
+        self.slide_path = normalize_non_empty_string(
+            self.slide_path,
+            field_name="slide_path",
+            allow_empty=False,
+        )
+        self.rna_path = normalize_non_empty_string(
+            self.rna_path,
+            field_name="rna_path",
+            allow_empty=True,
+        )
+        self.dna_path = normalize_non_empty_string(
+            self.dna_path,
+            field_name="dna_path",
+            allow_empty=True,
+        )
+        self.magnification = normalize_magnification(self.magnification)
+        self.task_labels = normalize_string_mapping(
+            self.task_labels,
+            field_name="task_labels",
+            allow_empty=True,
+            coerce_values=True,
+        )
+        self.meta = normalize_string_mapping(
+            self.meta,
+            field_name="meta",
+            allow_empty=True,
+            coerce_values=True,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize record as a plain dictionary."""
+        return {
+            "sample_id": self.sample_id,
+            "patient_id": self.patient_id,
+            "cohort": self.cohort,
+            "slide_path": self.slide_path,
+            "magnification": int(self.magnification),
+            "rna_path": self.rna_path,
+            "dna_path": self.dna_path,
+            "task_labels": dict(self.task_labels),
+            "meta": dict(self.meta),
+        }
+
+    def has_task(self, task_name: str) -> bool:
+        """Return True if this record has a label for task_name."""
+        normalized_task_name: str = normalize_non_empty_string(
+            task_name,
+            field_name="task_name",
+            allow_empty=False,
+        )
+        return normalized_task_name in self.task_labels
+
+    def get_task_label(self, task_name: str, default: Optional[str] = None) -> Optional[str]:
+        """Get label string for task_name, returning default if missing."""
+        normalized_task_name: str = normalize_non_empty_string(
+            task_name,
+            field_name="task_name",
+            allow_empty=False,
+        )
+        return self.task_labels.get(normalized_task_name, default)
+
+    def has_rna(self) -> bool:
+        """Return True if RNA path is present."""
+        return bool(self.rna_path.strip())
+
+    def has_dna(self) -> bool:
+        """Return True if DNA path is present."""
+        return bool(self.dna_path.strip())
+
+
+def normalize_non_empty_string(value: Any, *, field_name: str, allow_empty: bool) -> str:
+    """Normalize a value to a string with explicit emptiness policy."""
+    if value is None:
+        normalized_value: str = ""
+    elif isinstance(value, Path):
+        normalized_value = str(value)
+    else:
+        normalized_value = str(value)
+
+    normalized_value = normalized_value.strip()
+    if not allow_empty and not normalized_value:
+        raise ManifestValidationError(f"Field '{field_name}' must be a non-empty string.")
+    return normalized_value
+
+
+def normalize_magnification(value: Any) -> int:
+    """Normalize magnification into canonical integer form.
+
+    Accepted examples:
+    - 20, 40
+    - "20", "40"
+    - "20x", "40x"
+    """
+    if value is None:
+        return DEFAULT_TARGET_MAGNIFICATION_INT
+
+    if isinstance(value, bool):
+        raise ManifestValidationError("Magnification cannot be boolean.")
+
+    if isinstance(value, (int,)):
+        magnification_int: int = int(value)
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise ManifestValidationError(
+                f"Magnification float must be integer-like, got {value!r}."
+            )
+        magnification_int = int(value)
+    elif isinstance(value, str):
+        normalized_value: str = value.strip().lower()
+        if normalized_value.endswith("x"):
+            normalized_value = normalized_value[:-1].strip()
+        if not normalized_value:
+            magnification_int = DEFAULT_TARGET_MAGNIFICATION_INT
+        else:
+            try:
+                magnification_int = int(normalized_value)
+            except ValueError as exc:
+                raise ManifestValidationError(
+                    f"Invalid magnification string: {value!r}."
+                ) from exc
+    else:
+        raise ManifestValidationError(
+            f"Invalid magnification type: {type(value).__name__}."
+        )
+
+    if magnification_int <= 0:
+        raise ManifestValidationError(
+            f"Magnification must be > 0, got {magnification_int}."
+        )
+    return magnification_int
+
+
+def normalize_string_mapping(
+    value: Any,
+    *,
+    field_name: str,
+    allow_empty: bool,
+    coerce_values: bool,
+) -> Dict[str, str]:
+    """Normalize mapping to Dict[str, str] with deterministic key ordering."""
+    if value is None:
+        value = {}
+
+    if not isinstance(value, Mapping):
+        raise ManifestValidationError(
+            f"Field '{field_name}' must be a mapping, got {type(value).__name__}."
+        )
+
+    normalized_mapping: Dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        normalized_key: str = normalize_non_empty_string(
+            raw_key,
+            field_name=f"{field_name}.key",
+            allow_empty=False,
+        )
+        if coerce_values:
+            normalized_value: str = normalize_non_empty_string(
+                raw_value,
+                field_name=f"{field_name}[{normalized_key}]",
+                allow_empty=True,
+            )
+        else:
+            if not isinstance(raw_value, str):
+                raise ManifestValidationError(
+                    f"Field '{field_name}[{normalized_key}]' must be str when coercion is disabled."
+                )
+            normalized_value = raw_value.strip()
+        normalized_mapping[normalized_key] = normalized_value
+
+    if not allow_empty and not normalized_mapping:
+        raise ManifestValidationError(f"Field '{field_name}' cannot be empty.")
+
+    # Deterministic order.
+    return dict(sorted(normalized_mapping.items(), key=lambda item: item[0]))
+
+
+def parse_manifest_records(
+    payloads: Sequence[Mapping[str, Any]],
+    *,
+    strict_required_keys: bool = True,
+) -> List[ManifestRecord]:
+    """Parse a sequence of raw payload mappings into validated records."""
+    if not isinstance(payloads, Sequence):
+        raise ManifestCoercionError(
+            f"payloads must be a sequence, got {type(payloads).__name__}."
+        )
+
+    parsed_records: List[ManifestRecord] = []
+    for index, payload in enumerate(payloads):
+        try:
+            record: ManifestRecord = ManifestRecord.from_dict(
+                payload,
+                strict_required_keys=strict_required_keys,
+            )
+        except ManifestSchemaError as exc:
+            raise ManifestValidationError(
+                f"Invalid manifest record at index {index}: {exc}"
+            ) from exc
+        parsed_records.append(record)
+
+    validate_manifest_records(parsed_records, enforce_unique_sample_id=True)
+    return parsed_records
+
+
+def validate_manifest_records(
+    records: Sequence[ManifestRecord],
+    *,
+    enforce_unique_sample_id: bool = True,
+) -> None:
+    """Validate a sequence of records and enforce cross-record invariants."""
+    if not isinstance(records, Sequence):
+        raise ManifestValidationError(
+            f"records must be a sequence, got {type(records).__name__}."
+        )
+
+    sample_ids_seen: Dict[str, int] = {}
+    for index, record in enumerate(records):
+        if not isinstance(record, ManifestRecord):
+            raise ManifestValidationError(
+                f"records[{index}] must be ManifestRecord, got {type(record).__name__}."
+            )
+        record.validate()
+        if enforce_unique_sample_id:
+            if record.sample_id in sample_ids_seen:
+                first_index: int = sample_ids_seen[record.sample_id]
+                raise ManifestValidationError(
+                    "Duplicate sample_id detected: "
+                    f"{record.sample_id!r} at indices {first_index} and {index}."
+                )
+            sample_ids_seen[record.sample_id] = index
+
+
+def deduplicate_manifest_records(
+    records: Sequence[ManifestRecord],
+    *,
+    keep: str = "first",
+) -> List[ManifestRecord]:
+    """Deduplicate records by sample_id while preserving stable order.
+
+    Args:
+        records: Input records.
+        keep: Either "first" or "last".
+    """
+    normalized_keep: str = keep.strip().lower()
+    if normalized_keep not in {"first", "last"}:
+        raise ManifestValidationError("keep must be either 'first' or 'last'.")
+
+    validate_manifest_records(records, enforce_unique_sample_id=False)
+
+    if normalized_keep == "first":
+        unique_records: List[ManifestRecord] = []
+        seen_sample_ids: set[str] = set()
+        for record in records:
+            if record.sample_id in seen_sample_ids:
+                continue
+            seen_sample_ids.add(record.sample_id)
+            unique_records.append(record)
+        return unique_records
+
+    # keep == last
+    latest_by_sample: Dict[str, ManifestRecord] = {}
+    order: List[str] = []
+    for record in records:
+        if record.sample_id not in latest_by_sample:
+            order.append(record.sample_id)
+        latest_by_sample[record.sample_id] = record
+    return [latest_by_sample[sample_id] for sample_id in order]
+
+
+def records_to_dicts(records: Sequence[ManifestRecord]) -> List[Dict[str, Any]]:
+    """Serialize records into list-of-dicts."""
+    validate_manifest_records(records, enforce_unique_sample_id=False)
+    return [record.to_dict() for record in records]
+
+
+def index_records_by_sample_id(records: Sequence[ManifestRecord]) -> Dict[str, ManifestRecord]:
+    """Build sample_id -> ManifestRecord index with uniqueness enforcement."""
+    validate_manifest_records(records, enforce_unique_sample_id=True)
+    return {record.sample_id: record for record in records}
+
+
+def group_records_by_patient_id(records: Sequence[ManifestRecord]) -> Dict[str, List[ManifestRecord]]:
+    """Group records by patient_id.
+
+    This grouping is the basis for patient-level aggregation (union of patches
+    across all WSIs for a patient).
+    """
+    validate_manifest_records(records, enforce_unique_sample_id=False)
+    grouped_records: Dict[str, List[ManifestRecord]] = {}
+    for record in records:
+        grouped_records.setdefault(record.patient_id, []).append(record)
+    return grouped_records
+
+
+def filter_records_by_cohort(
+    records: Sequence[ManifestRecord],
+    cohorts: Sequence[str],
+) -> List[ManifestRecord]:
+    """Filter records by exact cohort match."""
+    validate_manifest_records(records, enforce_unique_sample_id=False)
+    if not isinstance(cohorts, Sequence):
+        raise ManifestValidationError("cohorts must be a sequence of strings.")
+
+    normalized_cohorts: set[str] = {
+        normalize_non_empty_string(cohort, field_name="cohort", allow_empty=False)
+        for cohort in cohorts
+    }
+    return [record for record in records if record.cohort in normalized_cohorts]
+
+
+def filter_records_by_task(
+    records: Sequence[ManifestRecord],
+    task_name: str,
+) -> List[ManifestRecord]:
+    """Filter records that include task_name in task_labels."""
+    validate_manifest_records(records, enforce_unique_sample_id=False)
+    normalized_task_name: str = normalize_non_empty_string(
+        task_name,
+        field_name="task_name",
+        allow_empty=False,
+    )
+    return [record for record in records if normalized_task_name in record.task_labels]
+
+
+def ensure_modality_requirements(
+    records: Sequence[ManifestRecord],
+    *,
+    require_rna: bool,
+    require_dna: bool,
+) -> List[ManifestRecord]:
+    """Filter records by modality path availability."""
+    validate_manifest_records(records, enforce_unique_sample_id=False)
+
+    filtered_records: List[ManifestRecord] = []
+    for record in records:
+        if require_rna and not record.has_rna():
+            continue
+        if require_dna and not record.has_dna():
+            continue
+        filtered_records.append(record)
+    return filtered_records
+
+
+def assert_no_patient_overlap(
+    train_records: Sequence[ManifestRecord],
+    test_records: Sequence[ManifestRecord],
+) -> None:
+    """Assert patient-level disjointness between train and test record sets."""
+    validate_manifest_records(train_records, enforce_unique_sample_id=False)
+    validate_manifest_records(test_records, enforce_unique_sample_id=False)
+
+    train_patient_ids: set[str] = {record.patient_id for record in train_records}
+    test_patient_ids: set[str] = {record.patient_id for record in test_records}
+    overlap_patient_ids: set[str] = train_patient_ids.intersection(test_patient_ids)
+    if overlap_patient_ids:
+        raise ManifestValidationError(
+            "Patient leakage detected across splits. Overlap patient_ids: "
+            f"{sorted(overlap_patient_ids)}"
+        )
+
+
+__all__ = [
+    "DEFAULT_TARGET_MAGNIFICATION",
+    "DEFAULT_TARGET_MAGNIFICATION_INT",
+    "DEFAULT_PATCH_SIZE",
+    "DEFAULT_SLIDE_EMBEDDING_DIM",
+    "MANIFEST_REQUIRED_KEYS",
+    "ManifestSchemaError",
+    "ManifestValidationError",
+    "ManifestCoercionError",
+    "ManifestRecord",
+    "normalize_non_empty_string",
+    "normalize_magnification",
+    "normalize_string_mapping",
+    "parse_manifest_records",
+    "validate_manifest_records",
+    "deduplicate_manifest_records",
+    "records_to_dicts",
+    "index_records_by_sample_id",
+    "group_records_by_patient_id",
+    "filter_records_by_cohort",
+    "filter_records_by_task",
+    "ensure_modality_requirements",
+    "assert_no_patient_overlap",
+]
+```

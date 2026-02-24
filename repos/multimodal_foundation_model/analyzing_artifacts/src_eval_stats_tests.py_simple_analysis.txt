@@ -1,0 +1,10 @@
+Implemented the requested logic analysis in `src/eval/stats_tests.py`.
+
+What I added:
+- A full analysis-only specification for `StatsAnalyzer` aligned to:
+  - the paper’s statistical protocol (two-way ANOVA -> Tukey HSD, mixed-effects with dataset random effect, log-rank for KM),
+  - your design-constrained public interface (no extra public methods),
+  - `config.yaml` values (notably bootstrap CI with 100 replicates, significance flow).
+- Clear input/output contracts, execution order, validation rules, reproducibility requirements, and implementation checklist for coding phase.
+
+No executable code was added yet, and no tests were run (analysis doc only).

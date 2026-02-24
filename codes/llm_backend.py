@@ -53,8 +53,8 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
     return "\n\n".join(parts)
 
 
-def _run_cmd(cmd: List[str]) -> str:
-    p = subprocess.run(cmd, capture_output=True, text=True)
+def _run_cmd(cmd: List[str], input_text: str = "") -> str:
+    p = subprocess.run(cmd, input=input_text, capture_output=True, text=True)
     if p.returncode != 0:
         raise RuntimeError(f"LLM command failed: {' '.join(cmd)}\n{p.stderr.strip()}")
     return p.stdout.strip()
@@ -66,10 +66,15 @@ def chat(messages: List[Dict[str, str]], model: str) -> CompletionCompat:
 
     if provider in {"codex", "codex_local"}:
         cmd = shlex.split(os.getenv("P2C_CODEX_CMD", "codex exec"))
-        text = _run_cmd(cmd + [prompt])
+        # Send prompt via stdin to avoid shell/OS argument-length limits.
+        text = _run_cmd(cmd, input_text=prompt)
     elif provider in {"claude", "claude_code"}:
         cmd = shlex.split(os.getenv("P2C_CLAUDE_CMD", "claude -p"))
-        text = _run_cmd(cmd + [prompt])
+        # Try stdin first (handles long prompts). If CLI requires argv prompt, fallback.
+        try:
+            text = _run_cmd(cmd, input_text=prompt)
+        except RuntimeError:
+            text = _run_cmd(cmd + [prompt])
     else:
         raise ValueError(f"Unknown provider: {provider}")
 

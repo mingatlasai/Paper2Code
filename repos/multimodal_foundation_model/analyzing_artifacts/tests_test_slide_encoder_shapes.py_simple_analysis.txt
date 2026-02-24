@@ -1,0 +1,11 @@
+Implemented the requested logic analysis in `tests/test_slide_encoder_shapes.py`.
+
+What I wrote there:
+- A paper/config-aligned unit-test specification for `ThreadsSlideEncoder`.
+- Exact interface constraints from your design (`__init__`, `forward`, `attention_weights` only).
+- Shape and invariant requirements for single-head (`n_heads=1`) and main multi-head (`n_heads=2`) modes.
+- Masking correctness expectations (masked patch attention suppression, valid-token normalization).
+- Negative/error-case expectations for invalid ranks and mismatched dimensions.
+- A concrete test matrix naming intended test cases and assertions.
+
+No executable tests were added yet, only the analysis blueprint as requested.

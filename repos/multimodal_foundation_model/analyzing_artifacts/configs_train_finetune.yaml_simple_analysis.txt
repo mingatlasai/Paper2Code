@@ -1,0 +1,11 @@
+Created `configs/train/finetune.yaml` with a full logic analysis for `FinetuneModule`, aligned to the paper, your design interfaces, task spec, and `config.yaml`.
+
+What it now contains:
+- THREADS/CHIEF finetuning recipe (AdamW `2.5e-5`, `weight_decay=0`, 5 epochs, batch size 1, 2048 train patches, no early stopping, final epoch checkpoint).
+- ABMIL supervised baseline recipe (AdamW `3e-4`, `weight_decay=1e-5`, 20 epochs, 2048 train patches, final epoch checkpoint).
+- Explicit data/interface contracts tied to `FinetuneModule` public methods only.
+- Patient-level aggregation rule (`union_of_patches_across_all_wsis`) and eval-time all-patches rule.
+- Invariants, reproducibility controls, artifact/logging layout, and unresolved items kept as `null`/explicit unknowns (no invented values).
+
+Validation performed:
+- YAML parsed successfully (`yaml.safe_load`) and key checks passed.

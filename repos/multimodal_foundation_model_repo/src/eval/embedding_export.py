@@ -1,0 +1,670 @@
+"""Embedding export utilities for THREADS evaluation.
+
+This module implements the design-locked interface:
+- ``EmbeddingExporter.__init__(feature_store, model_ckpt, device)``
+- ``EmbeddingExporter.export_slide_embeddings(records, out_path)``
+- ``EmbeddingExporter.export_patient_embeddings(records, out_path)``
+
+Paper/config alignment:
+- Slide embedding width is fixed to 1024.
+- Slide embedding extraction uses all patches (no sampling).
+- Patient embedding uses union of patches across all WSIs of the patient.
+- Inference is deterministic and runs in evaluation mode only.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+
+from src.data.feature_store import FeatureStore
+from src.data.manifest_schema import ManifestRecord
+from src.models.slide_encoder_threads import ThreadsSlideEncoder
+from src.utils.io import write_json, write_parquet
+
+
+# -----------------------------------------------------------------------------
+# Config-anchored constants
+# -----------------------------------------------------------------------------
+DEFAULT_EMBEDDING_DIM: int = 1024
+DEFAULT_PATCH_FEATURE_DIM: int = 768
+DEFAULT_SLIDE_ENCODER_HIDDEN_DIM: int = 1024
+DEFAULT_SLIDE_ENCODER_HEADS: int = 2
+DEFAULT_SLIDE_ENCODER_DROPOUT: float = 0.1
+
+DEFAULT_INFERENCE_PRECISION_CUDA: str = "bf16"
+DEFAULT_INFERENCE_PRECISION_CPU: str = "fp32"
+
+DEFAULT_BATCH_SIZE_SLIDE_EXPORT: int = 1
+DEFAULT_MIN_PATCH_COUNT: int = 1
+
+DEFAULT_OUTPUT_LEVEL_SLIDE: str = "slide"
+DEFAULT_OUTPUT_LEVEL_PATIENT: str = "patient"
+
+DEFAULT_OUTPUT_EMBEDDING_COLUMN: str = "embedding"
+DEFAULT_OUTPUT_EMBEDDING_DIM_COLUMN: str = "embedding_dim"
+DEFAULT_OUTPUT_MODEL_COLUMN: str = "model_name"
+DEFAULT_OUTPUT_PRECISION_COLUMN: str = "precision"
+DEFAULT_OUTPUT_LEVEL_COLUMN: str = "level"
+DEFAULT_OUTPUT_STAGE_COLUMN: str = "stage"
+DEFAULT_OUTPUT_CREATED_AT_COLUMN: str = "created_at_utc"
+DEFAULT_OUTPUT_CHECKPOINT_COLUMN: str = "model_ckpt"
+
+DEFAULT_META_SUFFIX: str = ".meta.json"
+
+
+class EmbeddingExporterError(Exception):
+    """Base exception for embedding export failures."""
+
+
+class EmbeddingExporterConfigError(EmbeddingExporterError):
+    """Raised when exporter configuration is invalid."""
+
+
+class EmbeddingExporterCheckpointError(EmbeddingExporterError):
+    """Raised when checkpoint loading/compatibility fails."""
+
+
+class EmbeddingExporterInputError(EmbeddingExporterError):
+    """Raised when records or features are invalid."""
+
+
+class EmbeddingExporterRuntimeError(EmbeddingExporterError):
+    """Raised when inference/export execution fails."""
+
+
+@dataclass(frozen=True)
+class _DeviceSpec:
+    """Resolved device and autocast dtype metadata."""
+
+    device: torch.device
+    precision: str
+    autocast_dtype: Optional[torch.dtype]
+
+
+class EmbeddingExporter:
+    """Export slide-level and patient-level embeddings from stored patch features."""
+
+    def __init__(self, feature_store: FeatureStore, model_ckpt: str, device: str) -> None:
+        """Initialize exporter with feature store, checkpoint, and runtime device."""
+        self._feature_store: FeatureStore = self._validate_feature_store(feature_store)
+        self._model_ckpt: Path = self._validate_checkpoint_path(model_ckpt)
+        self._device_spec: _DeviceSpec = self._resolve_device(device)
+
+        self._model_name: str = "THREADS"
+        self._stage_name: str = "embed"
+        self._embedding_dim: int = DEFAULT_EMBEDDING_DIM
+
+        self._slide_encoder: ThreadsSlideEncoder = self._build_slide_encoder()
+        self._load_slide_encoder_checkpoint(self._slide_encoder, self._model_ckpt)
+        self._slide_encoder.eval()
+        self._slide_encoder.to(self._device_spec.device)
+
+    def export_slide_embeddings(self, records: list[ManifestRecord], out_path: str) -> str:
+        """Export one slide embedding per record/sample."""
+        validated_records: List[ManifestRecord] = self._validate_records(records)
+        output_path: Path = self._validate_output_path(out_path)
+
+        rows: List[Dict[str, Any]] = []
+        for record in validated_records:
+            sample_id: str = self._normalize_non_empty_string(record.sample_id, "record.sample_id")
+            patient_id: str = self._normalize_non_empty_string(record.patient_id, "record.patient_id")
+            cohort: str = self._normalize_non_empty_string(record.cohort, "record.cohort")
+
+            embedding: np.ndarray = self._embed_single_sample(sample_id)
+
+            rows.append(
+                self._build_output_row(
+                    embedding=embedding,
+                    level=DEFAULT_OUTPUT_LEVEL_SLIDE,
+                    sample_id=sample_id,
+                    patient_id=patient_id,
+                    cohort=cohort,
+                    source_sample_ids=(sample_id,),
+                )
+            )
+
+        frame: pd.DataFrame = self._rows_to_dataframe(rows)
+        self._validate_output_frame(frame=frame, level=DEFAULT_OUTPUT_LEVEL_SLIDE)
+        self._write_output(frame=frame, output_path=output_path)
+
+        return str(output_path)
+
+    def export_patient_embeddings(self, records: list[ManifestRecord], out_path: str) -> str:
+        """Export one patient embedding per patient using union-of-patches semantics."""
+        validated_records: List[ManifestRecord] = self._validate_records(records)
+        output_path: Path = self._validate_output_path(out_path)
+
+        records_by_patient: Dict[str, List[ManifestRecord]] = self._group_records_by_patient(validated_records)
+
+        rows: List[Dict[str, Any]] = []
+        for patient_id in sorted(records_by_patient.keys()):
+            patient_records: List[ManifestRecord] = records_by_patient[patient_id]
+            if len(patient_records) == 0:
+                continue
+
+            sample_ids: Tuple[str, ...] = tuple(
+                sorted(self._normalize_non_empty_string(item.sample_id, "record.sample_id") for item in patient_records)
+            )
+            cohort_values: List[str] = [self._normalize_non_empty_string(item.cohort, "record.cohort") for item in patient_records]
+            cohort: str = self._resolve_patient_cohort(cohort_values)
+
+            embedding: np.ndarray = self._embed_patient_union(sample_ids)
+
+            rows.append(
+                self._build_output_row(
+                    embedding=embedding,
+                    level=DEFAULT_OUTPUT_LEVEL_PATIENT,
+                    sample_id=None,
+                    patient_id=patient_id,
+                    cohort=cohort,
+                    source_sample_ids=sample_ids,
+                )
+            )
+
+        frame: pd.DataFrame = self._rows_to_dataframe(rows)
+        self._validate_output_frame(frame=frame, level=DEFAULT_OUTPUT_LEVEL_PATIENT)
+        self._write_output(frame=frame, output_path=output_path)
+
+        return str(output_path)
+
+    # ------------------------------------------------------------------
+    # Model and inference helpers
+    # ------------------------------------------------------------------
+    def _build_slide_encoder(self) -> ThreadsSlideEncoder:
+        return ThreadsSlideEncoder(
+            in_dim=DEFAULT_PATCH_FEATURE_DIM,
+            hidden_dim=DEFAULT_SLIDE_ENCODER_HIDDEN_DIM,
+            out_dim=DEFAULT_EMBEDDING_DIM,
+            n_heads=DEFAULT_SLIDE_ENCODER_HEADS,
+            dropout=DEFAULT_SLIDE_ENCODER_DROPOUT,
+        )
+
+    def _load_slide_encoder_checkpoint(self, slide_encoder: ThreadsSlideEncoder, checkpoint_path: Path) -> None:
+        try:
+            checkpoint_payload: Any = torch.load(checkpoint_path, map_location="cpu")
+        except Exception as exc:  # noqa: BLE001
+            raise EmbeddingExporterCheckpointError(
+                f"Failed to load checkpoint from {checkpoint_path}: {exc}"
+            ) from exc
+
+        state_dict: Dict[str, torch.Tensor] = self._extract_state_dict(checkpoint_payload)
+        slide_state_dict: Dict[str, torch.Tensor] = self._extract_slide_encoder_state_dict(state_dict)
+
+        if len(slide_state_dict) == 0:
+            raise EmbeddingExporterCheckpointError(
+                "No slide encoder weights found in checkpoint. "
+                "Expected keys with prefixes like '_slide_encoder.' or '_model._slide_encoder.'."
+            )
+
+        try:
+            result: Any = slide_encoder.load_state_dict(slide_state_dict, strict=True)
+            missing_keys: Sequence[str] = list(getattr(result, "missing_keys", []))
+            unexpected_keys: Sequence[str] = list(getattr(result, "unexpected_keys", []))
+        except Exception as strict_error:  # noqa: BLE001
+            try:
+                result = slide_encoder.load_state_dict(slide_state_dict, strict=False)
+                missing_keys = list(getattr(result, "missing_keys", []))
+                unexpected_keys = list(getattr(result, "unexpected_keys", []))
+            except Exception as non_strict_error:  # noqa: BLE001
+                raise EmbeddingExporterCheckpointError(
+                    "Failed to load slide encoder state dict. "
+                    f"strict_error={strict_error}; non_strict_error={non_strict_error}"
+                ) from non_strict_error
+
+        if len(missing_keys) > 0:
+            raise EmbeddingExporterCheckpointError(
+                f"Slide encoder checkpoint missing required keys: {list(missing_keys)[:20]}"
+            )
+        if len(unexpected_keys) > 0:
+            unexpected_preview: List[str] = [str(item) for item in list(unexpected_keys)[:20]]
+            raise EmbeddingExporterCheckpointError(
+                f"Slide encoder checkpoint has unexpected keys: {unexpected_preview}"
+            )
+
+    def _extract_state_dict(self, checkpoint_payload: Any) -> Dict[str, torch.Tensor]:
+        if isinstance(checkpoint_payload, Mapping):
+            if "state_dict" in checkpoint_payload and isinstance(checkpoint_payload["state_dict"], Mapping):
+                return {
+                    str(key): value
+                    for key, value in checkpoint_payload["state_dict"].items()
+                    if isinstance(value, torch.Tensor)
+                }
+            if "model" in checkpoint_payload and isinstance(checkpoint_payload["model"], Mapping):
+                return {
+                    str(key): value
+                    for key, value in checkpoint_payload["model"].items()
+                    if isinstance(value, torch.Tensor)
+                }
+            if all(isinstance(key, str) for key in checkpoint_payload.keys()):
+                return {
+                    str(key): value
+                    for key, value in checkpoint_payload.items()
+                    if isinstance(value, torch.Tensor)
+                }
+
+        raise EmbeddingExporterCheckpointError(
+            "Unsupported checkpoint format. Expected mapping with tensor state_dict/model weights."
+        )
+
+    def _extract_slide_encoder_state_dict(self, state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        candidate_prefixes: Tuple[str, ...] = (
+            "_slide_encoder.",
+            "slide_encoder.",
+            "model.slide_encoder.",
+            "model._slide_encoder.",
+            "_model._slide_encoder.",
+            "_model.slide_encoder.",
+            "threads_model._slide_encoder.",
+        )
+
+        extracted: Dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            normalized_key: str = str(key)
+            for prefix in candidate_prefixes:
+                if normalized_key.startswith(prefix):
+                    stripped_key: str = normalized_key[len(prefix):]
+                    extracted[stripped_key] = value
+                    break
+
+        # Fallback for bare slide-encoder-only state dicts.
+        if len(extracted) == 0:
+            has_module_like_keys: bool = any("." in str(key) for key in state_dict.keys())
+            if not has_module_like_keys:
+                extracted = {
+                    str(key): value for key, value in state_dict.items() if isinstance(value, torch.Tensor)
+                }
+
+        return extracted
+
+    def _embed_single_sample(self, sample_id: str) -> np.ndarray:
+        features_np, _coords_np = self._load_patch_features(sample_id)
+        embedding_tensor: torch.Tensor = self._infer_slide_embedding(features_np)
+        return self._tensor_to_embedding_vector(embedding_tensor)
+
+    def _embed_patient_union(self, sample_ids: Sequence[str]) -> np.ndarray:
+        if len(sample_ids) == 0:
+            raise EmbeddingExporterInputError("Cannot embed patient with empty sample_ids.")
+
+        feature_blocks: List[np.ndarray] = []
+        for sample_id in sample_ids:
+            features_np, _coords_np = self._load_patch_features(sample_id)
+            feature_blocks.append(features_np)
+
+        if len(feature_blocks) == 0:
+            raise EmbeddingExporterInputError("No feature blocks available for patient union embedding.")
+
+        union_features: np.ndarray = np.concatenate(feature_blocks, axis=0)
+        if union_features.ndim != 2 or int(union_features.shape[0]) < DEFAULT_MIN_PATCH_COUNT:
+            raise EmbeddingExporterInputError(
+                "Union feature tensor is invalid after concatenation. "
+                f"shape={tuple(union_features.shape)}"
+            )
+
+        embedding_tensor: torch.Tensor = self._infer_slide_embedding(union_features)
+        return self._tensor_to_embedding_vector(embedding_tensor)
+
+    def _load_patch_features(self, sample_id: str) -> Tuple[np.ndarray, np.ndarray]:
+        if not self._feature_store.exists(sample_id):
+            raise EmbeddingExporterInputError(
+                f"Missing feature artifact for sample_id={sample_id}."
+            )
+
+        try:
+            features_obj, coords_obj = self._feature_store.read_patch_features(sample_id)
+        except Exception as exc:  # noqa: BLE001
+            raise EmbeddingExporterInputError(
+                f"Failed reading feature artifact for sample_id={sample_id}: {exc}"
+            ) from exc
+
+        features_np: np.ndarray = np.asarray(features_obj, dtype=np.float32)
+        coords_np: np.ndarray = np.asarray(coords_obj, dtype=np.int64)
+
+        if features_np.ndim != 2:
+            raise EmbeddingExporterInputError(
+                f"features must be rank-2 for sample_id={sample_id}, got {tuple(features_np.shape)}"
+            )
+        if coords_np.ndim != 2 or int(coords_np.shape[1]) != 2:
+            raise EmbeddingExporterInputError(
+                f"coords must be rank-2 [N,2] for sample_id={sample_id}, got {tuple(coords_np.shape)}"
+            )
+        if int(features_np.shape[0]) != int(coords_np.shape[0]):
+            raise EmbeddingExporterInputError(
+                f"features/coords length mismatch for sample_id={sample_id}: "
+                f"{int(features_np.shape[0])} vs {int(coords_np.shape[0])}"
+            )
+        if int(features_np.shape[0]) < DEFAULT_MIN_PATCH_COUNT:
+            raise EmbeddingExporterInputError(
+                f"No patches available for sample_id={sample_id}."
+            )
+        if int(features_np.shape[1]) != DEFAULT_PATCH_FEATURE_DIM:
+            raise EmbeddingExporterInputError(
+                f"Patch feature width mismatch for sample_id={sample_id}: "
+                f"expected {DEFAULT_PATCH_FEATURE_DIM}, got {int(features_np.shape[1])}."
+            )
+        if not np.isfinite(features_np).all():
+            raise EmbeddingExporterInputError(
+                f"Non-finite patch features detected for sample_id={sample_id}."
+            )
+
+        return features_np, coords_np
+
+    def _infer_slide_embedding(self, features_np: np.ndarray) -> torch.Tensor:
+        feature_tensor: torch.Tensor = torch.from_numpy(features_np).to(torch.float32)
+        feature_tensor = feature_tensor.unsqueeze(0).to(self._device_spec.device)
+
+        patch_count: int = int(feature_tensor.shape[1])
+        patch_mask: torch.Tensor = torch.ones(
+            (DEFAULT_BATCH_SIZE_SLIDE_EXPORT, patch_count),
+            dtype=torch.bool,
+            device=self._device_spec.device,
+        )
+
+        with torch.inference_mode():
+            with self._autocast_context():
+                embedding_tensor: Any = self._slide_encoder(
+                    patch_features=feature_tensor,
+                    patch_mask=patch_mask,
+                )
+
+        if not isinstance(embedding_tensor, torch.Tensor):
+            raise EmbeddingExporterRuntimeError("slide encoder returned non-tensor output.")
+
+        if embedding_tensor.ndim != 2 or int(embedding_tensor.shape[0]) != 1:
+            raise EmbeddingExporterRuntimeError(
+                "slide encoder output must be shape [1, D], "
+                f"got {tuple(embedding_tensor.shape)}"
+            )
+        if int(embedding_tensor.shape[1]) != self._embedding_dim:
+            raise EmbeddingExporterRuntimeError(
+                f"Embedding dimension mismatch: expected {self._embedding_dim}, got {int(embedding_tensor.shape[1])}."
+            )
+        if self._validate_numeric_tensor(embedding_tensor) is False:
+            raise EmbeddingExporterRuntimeError("slide embedding contains NaN/Inf values.")
+
+        return embedding_tensor.detach()
+
+    def _tensor_to_embedding_vector(self, embedding_tensor: torch.Tensor) -> np.ndarray:
+        vector: np.ndarray = embedding_tensor.squeeze(0).detach().to(torch.float32).cpu().numpy()
+        if vector.ndim != 1 or int(vector.shape[0]) != self._embedding_dim:
+            raise EmbeddingExporterRuntimeError(
+                f"Embedding vector shape mismatch: expected ({self._embedding_dim},), got {tuple(vector.shape)}"
+            )
+        if not np.isfinite(vector).all():
+            raise EmbeddingExporterRuntimeError("Embedding vector contains NaN/Inf.")
+        return vector.astype(np.float32, copy=False)
+
+    def _autocast_context(self) -> Any:
+        if self._device_spec.device.type != "cuda":
+            return torch.autocast(device_type="cpu", enabled=False)
+
+        if self._device_spec.autocast_dtype is None:
+            return torch.autocast(device_type="cuda", enabled=False)
+
+        return torch.autocast(
+            device_type="cuda",
+            dtype=self._device_spec.autocast_dtype,
+            enabled=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Output and metadata helpers
+    # ------------------------------------------------------------------
+    def _build_output_row(
+        self,
+        *,
+        embedding: np.ndarray,
+        level: str,
+        sample_id: Optional[str],
+        patient_id: str,
+        cohort: str,
+        source_sample_ids: Sequence[str],
+    ) -> Dict[str, Any]:
+        created_at_utc: str = datetime.now(timezone.utc).isoformat()
+
+        row: Dict[str, Any] = {
+            DEFAULT_OUTPUT_LEVEL_COLUMN: str(level),
+            "sample_id": sample_id,
+            "patient_id": str(patient_id),
+            "cohort": str(cohort),
+            DEFAULT_OUTPUT_EMBEDDING_COLUMN: embedding.tolist(),
+            DEFAULT_OUTPUT_EMBEDDING_DIM_COLUMN: int(self._embedding_dim),
+            DEFAULT_OUTPUT_MODEL_COLUMN: self._model_name,
+            DEFAULT_OUTPUT_PRECISION_COLUMN: self._device_spec.precision,
+            DEFAULT_OUTPUT_STAGE_COLUMN: self._stage_name,
+            DEFAULT_OUTPUT_CHECKPOINT_COLUMN: str(self._model_ckpt),
+            DEFAULT_OUTPUT_CREATED_AT_COLUMN: created_at_utc,
+            "source_sample_ids": list(source_sample_ids),
+        }
+        return row
+
+    def _rows_to_dataframe(self, rows: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+        if len(rows) == 0:
+            raise EmbeddingExporterRuntimeError("No rows produced for embedding export.")
+
+        frame: pd.DataFrame = pd.DataFrame(list(rows))
+        if frame.empty:
+            raise EmbeddingExporterRuntimeError("Output dataframe is empty.")
+
+        return frame
+
+    def _validate_output_frame(self, frame: pd.DataFrame, level: str) -> None:
+        required_columns: Tuple[str, ...] = (
+            DEFAULT_OUTPUT_LEVEL_COLUMN,
+            "sample_id",
+            "patient_id",
+            "cohort",
+            DEFAULT_OUTPUT_EMBEDDING_COLUMN,
+            DEFAULT_OUTPUT_EMBEDDING_DIM_COLUMN,
+            DEFAULT_OUTPUT_MODEL_COLUMN,
+            DEFAULT_OUTPUT_PRECISION_COLUMN,
+            DEFAULT_OUTPUT_STAGE_COLUMN,
+            DEFAULT_OUTPUT_CHECKPOINT_COLUMN,
+            DEFAULT_OUTPUT_CREATED_AT_COLUMN,
+            "source_sample_ids",
+        )
+        missing_columns: List[str] = [column for column in required_columns if column not in frame.columns]
+        if len(missing_columns) > 0:
+            raise EmbeddingExporterRuntimeError(
+                f"Missing required output columns: {missing_columns}"
+            )
+
+        if not (frame[DEFAULT_OUTPUT_LEVEL_COLUMN].astype(str) == str(level)).all():
+            raise EmbeddingExporterRuntimeError(
+                f"Output level column contains values inconsistent with level={level!r}."
+            )
+
+        if not (frame[DEFAULT_OUTPUT_EMBEDDING_DIM_COLUMN].astype(int) == int(self._embedding_dim)).all():
+            raise EmbeddingExporterRuntimeError(
+                f"Output embedding_dim must be {self._embedding_dim} for all rows."
+            )
+
+        embeddings: List[Any] = frame[DEFAULT_OUTPUT_EMBEDDING_COLUMN].tolist()
+        for row_index, value in enumerate(embeddings):
+            vector: np.ndarray = np.asarray(value, dtype=np.float32)
+            if vector.ndim != 1 or int(vector.shape[0]) != self._embedding_dim:
+                raise EmbeddingExporterRuntimeError(
+                    f"Row {row_index} embedding shape mismatch: {tuple(vector.shape)}"
+                )
+            if not np.isfinite(vector).all():
+                raise EmbeddingExporterRuntimeError(
+                    f"Row {row_index} embedding contains NaN/Inf."
+                )
+
+        if level == DEFAULT_OUTPUT_LEVEL_SLIDE:
+            if frame["sample_id"].isna().any():
+                raise EmbeddingExporterRuntimeError("Slide export rows cannot contain null sample_id.")
+            duplicated_sample_ids: pd.Series = frame["sample_id"].astype(str).duplicated(keep=False)
+            if bool(duplicated_sample_ids.any()):
+                duplicates: List[str] = sorted(
+                    set(frame.loc[duplicated_sample_ids, "sample_id"].astype(str).tolist())
+                )
+                raise EmbeddingExporterRuntimeError(
+                    f"Duplicate sample_id rows detected in slide export: {duplicates[:20]}"
+                )
+
+        if level == DEFAULT_OUTPUT_LEVEL_PATIENT:
+            duplicated_patient_ids: pd.Series = frame["patient_id"].astype(str).duplicated(keep=False)
+            if bool(duplicated_patient_ids.any()):
+                duplicates = sorted(
+                    set(frame.loc[duplicated_patient_ids, "patient_id"].astype(str).tolist())
+                )
+                raise EmbeddingExporterRuntimeError(
+                    f"Duplicate patient_id rows detected in patient export: {duplicates[:20]}"
+                )
+
+    def _write_output(self, frame: pd.DataFrame, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            write_parquet(frame, output_path, sort_columns=False)
+        except Exception as exc:  # noqa: BLE001
+            raise EmbeddingExporterRuntimeError(
+                f"Failed writing parquet output to {output_path}: {exc}"
+            ) from exc
+
+        meta_path: Path = self._build_meta_path(output_path)
+        metadata: Dict[str, Any] = {
+            "artifact_path": str(output_path),
+            "levels": sorted(set(frame[DEFAULT_OUTPUT_LEVEL_COLUMN].astype(str).tolist())),
+            "row_count": int(frame.shape[0]),
+            "embedding_dim": int(self._embedding_dim),
+            "model_name": self._model_name,
+            "precision": self._device_spec.precision,
+            "stage": self._stage_name,
+            "model_ckpt": str(self._model_ckpt),
+            "schema_columns": list(frame.columns),
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+
+        try:
+            write_json(metadata, meta_path)
+        except Exception as exc:  # noqa: BLE001
+            raise EmbeddingExporterRuntimeError(
+                f"Failed writing metadata sidecar to {meta_path}: {exc}"
+            ) from exc
+
+    def _build_meta_path(self, output_path: Path) -> Path:
+        return output_path.with_name(f"{output_path.name}{DEFAULT_META_SUFFIX}")
+
+    # ------------------------------------------------------------------
+    # Validation helpers
+    # ------------------------------------------------------------------
+    def _validate_feature_store(self, feature_store: FeatureStore) -> FeatureStore:
+        if not isinstance(feature_store, FeatureStore):
+            raise EmbeddingExporterConfigError(
+                f"feature_store must be FeatureStore, got {type(feature_store).__name__}."
+            )
+        return feature_store
+
+    def _validate_checkpoint_path(self, model_ckpt: str) -> Path:
+        path_value: str = self._normalize_non_empty_string(model_ckpt, "model_ckpt")
+        checkpoint_path: Path = Path(path_value).expanduser().resolve()
+        if not checkpoint_path.exists() or not checkpoint_path.is_file():
+            raise EmbeddingExporterConfigError(
+                f"model checkpoint does not exist: {checkpoint_path}"
+            )
+        return checkpoint_path
+
+    def _validate_output_path(self, out_path: str) -> Path:
+        path_value: str = self._normalize_non_empty_string(out_path, "out_path")
+        output_path: Path = Path(path_value).expanduser().resolve()
+        suffix: str = output_path.suffix.lower()
+        if suffix != ".parquet":
+            raise EmbeddingExporterConfigError(
+                f"out_path must be a .parquet file, got {output_path}"
+            )
+        return output_path
+
+    def _resolve_device(self, device: str) -> _DeviceSpec:
+        device_str: str = self._normalize_non_empty_string(device, "device").lower()
+
+        if device_str.startswith("cuda"):
+            if not torch.cuda.is_available():
+                raise EmbeddingExporterConfigError(
+                    f"Requested CUDA device '{device}' but CUDA is unavailable."
+                )
+            torch_device: torch.device = torch.device(device_str)
+            return _DeviceSpec(
+                device=torch_device,
+                precision=DEFAULT_INFERENCE_PRECISION_CUDA,
+                autocast_dtype=torch.bfloat16,
+            )
+
+        if device_str == "cpu":
+            return _DeviceSpec(
+                device=torch.device("cpu"),
+                precision=DEFAULT_INFERENCE_PRECISION_CPU,
+                autocast_dtype=None,
+            )
+
+        raise EmbeddingExporterConfigError(
+            f"Unsupported device string: {device!r}."
+        )
+
+    def _validate_records(self, records: Sequence[ManifestRecord]) -> List[ManifestRecord]:
+        if not isinstance(records, Sequence):
+            raise EmbeddingExporterInputError(
+                f"records must be a sequence of ManifestRecord, got {type(records).__name__}."
+            )
+
+        validated: List[ManifestRecord] = []
+        for index, record in enumerate(records):
+            if not isinstance(record, ManifestRecord):
+                raise EmbeddingExporterInputError(
+                    f"records[{index}] must be ManifestRecord, got {type(record).__name__}."
+                )
+            _ = self._normalize_non_empty_string(record.sample_id, "record.sample_id")
+            _ = self._normalize_non_empty_string(record.patient_id, "record.patient_id")
+            _ = self._normalize_non_empty_string(record.cohort, "record.cohort")
+            validated.append(record)
+
+        if len(validated) == 0:
+            raise EmbeddingExporterInputError("records cannot be empty.")
+
+        validated.sort(key=lambda item: (item.patient_id, item.sample_id))
+        return validated
+
+    def _group_records_by_patient(self, records: Sequence[ManifestRecord]) -> Dict[str, List[ManifestRecord]]:
+        groups: Dict[str, List[ManifestRecord]] = {}
+        for record in records:
+            patient_id: str = self._normalize_non_empty_string(record.patient_id, "record.patient_id")
+            groups.setdefault(patient_id, []).append(record)
+
+        for patient_id in list(groups.keys()):
+            groups[patient_id] = sorted(groups[patient_id], key=lambda item: item.sample_id)
+
+        return groups
+
+    def _resolve_patient_cohort(self, cohort_values: Sequence[str]) -> str:
+        unique_cohorts: List[str] = sorted(set(str(value) for value in cohort_values if str(value).strip() != ""))
+        if len(unique_cohorts) == 0:
+            raise EmbeddingExporterInputError("Patient cohort set cannot be empty.")
+        if len(unique_cohorts) == 1:
+            return unique_cohorts[0]
+        return "|".join(unique_cohorts)
+
+    def _validate_numeric_tensor(self, tensor_value: torch.Tensor) -> bool:
+        return bool(torch.isfinite(tensor_value).all().item())
+
+    def _normalize_non_empty_string(self, value: Any, field_name: str) -> str:
+        normalized: str = "" if value is None else str(value).strip()
+        if normalized == "":
+            raise EmbeddingExporterInputError(f"{field_name} must be a non-empty string.")
+        return normalized
+
+
+__all__ = [
+    "EmbeddingExporterError",
+    "EmbeddingExporterConfigError",
+    "EmbeddingExporterCheckpointError",
+    "EmbeddingExporterInputError",
+    "EmbeddingExporterRuntimeError",
+    "EmbeddingExporter",
+]

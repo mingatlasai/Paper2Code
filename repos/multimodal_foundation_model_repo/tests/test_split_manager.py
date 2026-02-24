@@ -1,0 +1,426 @@
+"""Unit tests for split generation and split I/O contracts."""
+
+from __future__ import annotations
+
+from collections import Counter
+from pathlib import Path
+from typing import Dict, List, Mapping, Sequence, Tuple
+
+import pytest
+
+from src.data.manifest_schema import ManifestRecord
+from src.data.split_manager import (
+    DEFAULT_CV_FOLDS,
+    DEFAULT_FEWSHOT_K_VALUES,
+    DEFAULT_MC_SPLITS,
+    DEFAULT_TEST_SIZE,
+    OFFICIAL_SINGLE_FOLD_DATASETS,
+    SplitLoadError,
+    SplitManager,
+    SplitValidationError,
+)
+from src.utils.io import write_json
+
+
+DEFAULT_TASK_NAME: str = "label"
+DEFAULT_GROUP_BY: str = "patient_id"
+DEFAULT_SEED: int = 42
+DEFAULT_SAMPLES_PER_PATIENT: int = 2
+
+
+@pytest.fixture(name="sample_to_patient")
+def fixture_sample_to_patient() -> Dict[str, str]:
+    """Return deterministic sample-to-patient lookup used by all tests."""
+    records: List[ManifestRecord] = _make_balanced_records(
+        task_name=DEFAULT_TASK_NAME,
+        n_patients_per_class=5,
+        samples_per_patient=DEFAULT_SAMPLES_PER_PATIENT,
+    )
+    return {record.sample_id: record.patient_id for record in records}
+
+
+@pytest.fixture(name="balanced_records")
+def fixture_balanced_records() -> List[ManifestRecord]:
+    """Return records that satisfy 5-fold stratified-group feasibility."""
+    return _make_balanced_records(
+        task_name=DEFAULT_TASK_NAME,
+        n_patients_per_class=5,
+        samples_per_patient=DEFAULT_SAMPLES_PER_PATIENT,
+    )
+
+
+def test_constants_match_config_split_policy() -> None:
+    """Verify split constants are anchored to configured paper policy."""
+    assert DEFAULT_CV_FOLDS == 5
+    assert DEFAULT_MC_SPLITS == 50
+    assert DEFAULT_TEST_SIZE == 0.2
+    assert DEFAULT_FEWSHOT_K_VALUES == (1, 2, 4, 8, 16, 32)
+    assert OFFICIAL_SINGLE_FOLD_DATASETS == ("EBRAINS", "PANDA", "IMP")
+
+
+def test_make_cv_patient_stratified_and_deterministic(
+    tmp_path: Path,
+    balanced_records: List[ManifestRecord],
+    sample_to_patient: Mapping[str, str],
+) -> None:
+    """CV folds must be sample-disjoint, patient-disjoint, and deterministic."""
+    manager_a: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    splits_a: List[Dict[str, object]] = manager_a.make_cv(
+        records=balanced_records,
+        n_folds=DEFAULT_CV_FOLDS,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )
+
+    manager_b: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    splits_b: List[Dict[str, object]] = manager_b.make_cv(
+        records=balanced_records,
+        n_folds=DEFAULT_CV_FOLDS,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )
+
+    assert len(splits_a) == DEFAULT_CV_FOLDS
+    assert _canonicalize_splits(splits_a) == _canonicalize_splits(splits_b)
+
+    for split in splits_a:
+        _assert_split_schema(split)
+        _assert_no_sample_leakage(split)
+        _assert_no_patient_leakage(split, sample_to_patient)
+        assert split["split_type"] == "cv"
+        assert split["group_by"] == DEFAULT_GROUP_BY
+        assert split["stratify_by"] == DEFAULT_TASK_NAME
+        assert split["task_name"] == DEFAULT_TASK_NAME
+
+
+def test_make_monte_carlo_group_safe_and_deterministic(
+    tmp_path: Path,
+    balanced_records: List[ManifestRecord],
+    sample_to_patient: Mapping[str, str],
+) -> None:
+    """Monte Carlo splits must be leakage-safe and reproducible for fixed seed."""
+    manager_a: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    splits_a: List[Dict[str, object]] = manager_a.make_monte_carlo(
+        records=balanced_records,
+        n_splits=DEFAULT_MC_SPLITS,
+        test_size=DEFAULT_TEST_SIZE,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )
+
+    manager_b: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    splits_b: List[Dict[str, object]] = manager_b.make_monte_carlo(
+        records=balanced_records,
+        n_splits=DEFAULT_MC_SPLITS,
+        test_size=DEFAULT_TEST_SIZE,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )
+
+    assert len(splits_a) == DEFAULT_MC_SPLITS
+    assert _canonicalize_splits(splits_a) == _canonicalize_splits(splits_b)
+
+    for split in splits_a:
+        _assert_split_schema(split)
+        _assert_no_sample_leakage(split)
+        _assert_no_patient_leakage(split, sample_to_patient)
+        assert split["split_type"] == "mc"
+        assert split["group_by"] == DEFAULT_GROUP_BY
+        assert split["stratify_by"] == DEFAULT_TASK_NAME
+        assert split["test_size"] == pytest.approx(DEFAULT_TEST_SIZE)
+
+
+def test_make_fewshot_subset_fixed_test_and_class_counts(
+    tmp_path: Path,
+    balanced_records: List[ManifestRecord],
+) -> None:
+    """Few-shot train IDs are class-balanced subsets and preserve base test IDs."""
+    manager: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    base_split: Dict[str, object] = manager.make_cv(
+        records=balanced_records,
+        n_folds=DEFAULT_CV_FOLDS,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )[0]
+
+    for k_value in (1, 2, 4, 8):
+        fewshot: Dict[str, object] = manager.make_fewshot(base_split=base_split, k_per_class=k_value)
+        _assert_split_schema(fewshot)
+        assert fewshot["split_type"] == "fewshot"
+        assert fewshot["k_per_class"] == k_value
+
+        base_train_ids: set[str] = set(base_split["train_ids"])
+        fewshot_train_ids: List[str] = list(fewshot["train_ids"])
+
+        assert set(fewshot_train_ids).issubset(base_train_ids)
+        assert list(fewshot["test_ids"]) == list(base_split["test_ids"])
+
+        label_by_id: Mapping[str, str] = fewshot["label_by_id"]
+        class_counts: Counter[str] = Counter(label_by_id[sample_id] for sample_id in fewshot_train_ids)
+        assert class_counts["0"] == k_value
+        assert class_counts["1"] == k_value
+
+
+def test_make_fewshot_infeasible_k_raises(
+    tmp_path: Path,
+    balanced_records: List[ManifestRecord],
+) -> None:
+    """Requesting infeasible k should fail consistently."""
+    manager: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    base_split: Dict[str, object] = manager.make_cv(
+        records=balanced_records,
+        n_folds=DEFAULT_CV_FOLDS,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )[0]
+
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_fewshot(base_split=base_split, k_per_class=16)
+
+
+def test_make_fewshot_is_deterministic(
+    tmp_path: Path,
+    balanced_records: List[ManifestRecord],
+) -> None:
+    """Few-shot split derivation must be deterministic for same seed/base split/k."""
+    manager_a: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    manager_b: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+
+    base_split_a: Dict[str, object] = manager_a.make_cv(
+        records=balanced_records,
+        n_folds=DEFAULT_CV_FOLDS,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )[1]
+    base_split_b: Dict[str, object] = manager_b.make_cv(
+        records=balanced_records,
+        n_folds=DEFAULT_CV_FOLDS,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )[1]
+
+    fewshot_a: Dict[str, object] = manager_a.make_fewshot(base_split=base_split_a, k_per_class=2)
+    fewshot_b: Dict[str, object] = manager_b.make_fewshot(base_split=base_split_b, k_per_class=2)
+
+    assert fewshot_a == fewshot_b
+
+
+def test_save_split_and_load_official_roundtrip(tmp_path: Path, balanced_records: List[ManifestRecord]) -> None:
+    """Saved split can be loaded through official path resolution without mutation."""
+    manager: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    split_obj: Dict[str, object] = manager.make_cv(
+        records=balanced_records,
+        n_folds=DEFAULT_CV_FOLDS,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )[0]
+
+    task_name: str = "EBRAINS"
+    split_name: str = "official"
+    manager.save_split(task_name=task_name, split_name=split_name, split_obj=split_obj)
+
+    loaded: Dict[str, List[str]] = manager.load_official(task_name=task_name)
+    assert loaded["task_name"] == split_obj["task_name"]
+    assert loaded["fold_id"] == split_obj["fold_id"]
+    assert loaded["train_ids"] == split_obj["train_ids"]
+    assert loaded["test_ids"] == split_obj["test_ids"]
+
+
+def test_load_official_rejects_malformed_payload(tmp_path: Path) -> None:
+    """Malformed official split payload must raise SplitLoadError."""
+    manager: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    bad_payload: Dict[str, object] = {
+        "task_name": "broken_task",
+        "split": {
+            "task_name": "broken_task",
+            "fold_id": "0",
+            "train_ids": ["s1", "s2"],
+            # Missing required key: test_ids
+        },
+    }
+
+    destination: Path = tmp_path / "broken_task" / "official.json"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    write_json(bad_payload, destination)
+
+    with pytest.raises(SplitLoadError):
+        _ = manager.load_official(task_name="broken_task")
+
+
+def test_make_cv_and_mc_reject_empty_records(tmp_path: Path) -> None:
+    """Split generation must reject empty record collections."""
+    manager: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_cv(
+            records=[],
+            n_folds=DEFAULT_CV_FOLDS,
+            stratify_by=DEFAULT_TASK_NAME,
+            group_by=DEFAULT_GROUP_BY,
+        )
+
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_monte_carlo(
+            records=[],
+            n_splits=DEFAULT_MC_SPLITS,
+            test_size=DEFAULT_TEST_SIZE,
+            stratify_by=DEFAULT_TASK_NAME,
+            group_by=DEFAULT_GROUP_BY,
+        )
+
+
+def test_invalid_params_raise_validation_error(
+    tmp_path: Path,
+    balanced_records: List[ManifestRecord],
+) -> None:
+    """Invalid split/few-shot parameters must fail fast."""
+    manager: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_cv(
+            records=balanced_records,
+            n_folds=1,
+            stratify_by=DEFAULT_TASK_NAME,
+            group_by=DEFAULT_GROUP_BY,
+        )
+
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_monte_carlo(
+            records=balanced_records,
+            n_splits=0,
+            test_size=DEFAULT_TEST_SIZE,
+            stratify_by=DEFAULT_TASK_NAME,
+            group_by=DEFAULT_GROUP_BY,
+        )
+
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_monte_carlo(
+            records=balanced_records,
+            n_splits=1,
+            test_size=0.0,
+            stratify_by=DEFAULT_TASK_NAME,
+            group_by=DEFAULT_GROUP_BY,
+        )
+
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_monte_carlo(
+            records=balanced_records,
+            n_splits=1,
+            test_size=1.0,
+            stratify_by=DEFAULT_TASK_NAME,
+            group_by=DEFAULT_GROUP_BY,
+        )
+
+    base_split: Dict[str, object] = manager.make_cv(
+        records=balanced_records,
+        n_folds=DEFAULT_CV_FOLDS,
+        stratify_by=DEFAULT_TASK_NAME,
+        group_by=DEFAULT_GROUP_BY,
+    )[0]
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_fewshot(base_split=base_split, k_per_class=0)
+
+
+def test_missing_stratify_label_raises(tmp_path: Path) -> None:
+    """Records without the requested stratification key should fail."""
+    manager: SplitManager = SplitManager(split_dir=str(tmp_path), seed=DEFAULT_SEED)
+    records: List[ManifestRecord] = [
+        ManifestRecord(
+            sample_id="s_0",
+            patient_id="p_0",
+            cohort="COHORT",
+            slide_path="/tmp/s_0.svs",
+            magnification=20,
+            rna_path="",
+            dna_path="",
+            task_labels={},
+            meta={},
+        )
+    ]
+
+    with pytest.raises(SplitValidationError):
+        _ = manager.make_cv(
+            records=records,
+            n_folds=DEFAULT_CV_FOLDS,
+            stratify_by=DEFAULT_TASK_NAME,
+            group_by=DEFAULT_GROUP_BY,
+        )
+
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+def _make_balanced_records(
+    task_name: str,
+    n_patients_per_class: int,
+    samples_per_patient: int,
+) -> List[ManifestRecord]:
+    records: List[ManifestRecord] = []
+    patient_index: int = 0
+
+    for label in ("0", "1"):
+        for _ in range(n_patients_per_class):
+            patient_id: str = f"patient_{patient_index:02d}"
+            for sample_index in range(samples_per_patient):
+                sample_id: str = f"sample_{patient_index:02d}_{sample_index:02d}"
+                records.append(
+                    ManifestRecord(
+                        sample_id=sample_id,
+                        patient_id=patient_id,
+                        cohort="SYNTHETIC",
+                        slide_path=f"/tmp/{sample_id}.svs",
+                        magnification=20,
+                        rna_path="",
+                        dna_path="",
+                        task_labels={task_name: label},
+                        meta={},
+                    )
+                )
+            patient_index += 1
+
+    return records
+
+
+def _assert_split_schema(split: Mapping[str, object]) -> None:
+    assert "task_name" in split
+    assert "fold_id" in split
+    assert "train_ids" in split
+    assert "test_ids" in split
+
+    train_ids: Sequence[str] = split["train_ids"]  # type: ignore[assignment]
+    test_ids: Sequence[str] = split["test_ids"]  # type: ignore[assignment]
+
+    assert isinstance(train_ids, list)
+    assert isinstance(test_ids, list)
+    assert len(train_ids) > 0
+    assert len(test_ids) > 0
+
+
+def _assert_no_sample_leakage(split: Mapping[str, object]) -> None:
+    train_ids: set[str] = set(split["train_ids"])  # type: ignore[arg-type]
+    test_ids: set[str] = set(split["test_ids"])  # type: ignore[arg-type]
+    assert train_ids.isdisjoint(test_ids)
+
+
+def _assert_no_patient_leakage(
+    split: Mapping[str, object],
+    sample_to_patient: Mapping[str, str],
+) -> None:
+    train_ids: List[str] = list(split["train_ids"])  # type: ignore[arg-type]
+    test_ids: List[str] = list(split["test_ids"])  # type: ignore[arg-type]
+
+    train_patients: set[str] = {sample_to_patient[sample_id] for sample_id in train_ids}
+    test_patients: set[str] = {sample_to_patient[sample_id] for sample_id in test_ids}
+
+    assert train_patients.isdisjoint(test_patients)
+
+
+def _canonicalize_splits(splits: Sequence[Mapping[str, object]]) -> Tuple[Tuple[str, Tuple[str, ...], Tuple[str, ...]], ...]:
+    canonical_rows: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = []
+    for split in splits:
+        fold_id: str = str(split["fold_id"])
+        train_ids: Tuple[str, ...] = tuple(split["train_ids"])  # type: ignore[arg-type]
+        test_ids: Tuple[str, ...] = tuple(split["test_ids"])  # type: ignore[arg-type]
+        canonical_rows.append((fold_id, train_ids, test_ids))
+    return tuple(canonical_rows)

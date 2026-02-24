@@ -1,0 +1,107 @@
+**Reproduction Roadmap (No Code Yet)**
+
+1. **Scope and fidelity targets**
+1. Reproduce the THREADS pipeline in two tiers:
+2. **Tier A (full-paper target):** pretraining + 54-task benchmark + baselines + ablations (requires private data and high compute).
+3. **Tier B (public-only target):** same pipeline on publicly available cohorts (TCGA/GTEx/CPTAC/EBRAINS/BRACS/BCNB/PANDA/IMP/etc.), with clear “partial reproduction” labeling.
+4. Lock software stack close to paper: Python `3.10.12`, PyTorch `2.3.0`, CUDA `12.3`.
+
+2. **Paper-grounded methodology to implement**
+1. **Input unit:** whole-slide image (WSI), variable size.
+2. **WSI preprocessing:** tissue segmentation, 512x512 non-overlapping patches at 20x (~0.5 um/px), background removal.
+3. **Patch encoder:** CONCHV1.5 (ViT-L based), resize patch 512->448, ImageNet mean/std normalization.
+4. **Slide encoder (THREADS):** ABMIL-style gated attention, multi-head variant (paper’s main config uses 2 heads), output slide embedding dim `1024`.
+5. **Molecular branches for multimodal pretraining:**
+6. RNA branch: modified scGPT initialized from pan-cancer checkpoint, fully fine-tuned, projection to `1024`.
+7. DNA branch: multi-hot variant vector (length `1673`) through 4-layer MLP to `1024`.
+8. **Pretraining objective:** cross-modal contrastive alignment between slide embedding and molecular embedding (InfoNCE-style).
+9. **Model selection:** RankMe smooth-rank monitoring; keep checkpoints when rank improves.
+
+3. **Data plan**
+1. **Pretraining target dataset (MBTG-47K):** 47,171 paired WSI-molecular samples, from MGH/BWH/TCGA/GTEx.
+2. **Reality check:** MGH/BWH are private, so exact replication is blocked without data-use agreements.
+3. **Public approximation path:**
+4. Use TCGA + GTEx paired WSI + RNA as main pretraining substrate.
+5. Optionally add public mutation datasets for DNA branch approximation where pairings exist.
+6. Track all exclusions exactly as paper style: magnification metadata, frozen/benign/non-diagnostic exclusions, missing pair exclusions.
+7. For downstream, implement all public tasks first, then plug in private cohorts if accessible.
+
+4. **Implementation phases**
+1. **Phase 1: Data schema and manifests**
+2. Build unified sample manifest with fields: slide path, patient ID, cohort, task(s), magnification, molecular file path, split ID.
+3. Build patient-level grouping logic for tasks with multiple WSIs/patient.
+4. **Phase 2: WSI preprocessing pipeline**
+5. Tissue segmentation model interface (FPN-based as described, or compatible replacement if unavailable).
+6. Patch extraction at exact geometry and magnification; deterministic patch indexing.
+7. Feature extraction backends for CONCHV1.5 and baseline encoders.
+8. **Phase 3: THREADS model modules**
+9. Implement pre-attention projection network and gated attention heads.
+10. Implement single-head and multi-head variants, with concatenation + post-attention projection.
+11. Implement RNA encoder wrapper around scGPT and DNA MLP encoder.
+12. **Phase 4: Multimodal pretraining**
+13. DDP training on multi-GPU.
+14. Warmup + cosine schedule; early stop/checkpoint by RankMe.
+15. Save encoder checkpoints and metadata for exact reproducibility.
+16. **Phase 5: Embedding extraction**
+17. Slide-level embedding: all patches, no sampling.
+18. Patient-level embedding: union of all patches from all WSIs of patient (for THREADS/PRISM/CHIEF protocol).
+19. **Phase 6: Downstream evaluation**
+20. Linear probing for classification and CoxNet for survival, with fixed hyperparameters (no tuning).
+21. Fine-tuning experiments for THREADS and baseline fine-tuning protocols.
+22. **Phase 7: Extended experiments**
+23. Transferability (train on full source cohort, test on full external cohort + 100 bootstraps).
+24. Few-shot (`k in {1,2,4,8,16,32}` per class).
+25. Retrieval (`mAP@1/5/10`, L2 distance).
+26. Molecular prompting using class-wise molecular prototypes.
+27. Scaling-law ablations (data fraction and attention-head/model variants).
+
+5. **Experimental settings to mirror**
+1. **Pretraining compute:** 4x80GB A100, batch size `300` per GPU, up to `101` epochs.
+2. Warmup: 5 epochs, LR to `1e-5`; then cosine decay.
+3. Optimizer: AdamW (some beta/weight-decay values are partly unreadable in parse; confirm from final PDF/supplement).
+4. **Embedding extraction compute:** 1x24GB 3090Ti, bf16 for THREADS.
+5. **Linear probing (classification):** sklearn logistic regression, `C=0.5`, solver `lbfgs`, `max_iter=10000`, class_weight balanced.
+6. **Linear probing (survival):** CoxNet (`10000` iters), alpha `0.07` for OS, `0.01` for PFS, with noted task-specific exceptions.
+7. **THREADS fine-tuning:** AdamW, LR `2.5e-5`, weighted cross-entropy, 5 epochs, batch size 1, sample 2048 patches/batch, no early stopping, no WD/LLRD/grad accumulation.
+8. **ABMIL scratch baseline:** 20 epochs, LR `3e-4`, AdamW, WD `1e-5`, 2048 random patches per WSI during train, all patches at test.
+9. **GIGAPATH fine-tuning baseline:** follow official recipe (frozen patch encoder, grad accumulation 32, WD 0.05, LLRD 0.95, 5 epochs, warmup+cosine).
+
+6. **Evaluation protocol**
+1. **Task families:** subtyping/grading, mutation, IHC, treatment/survival (54 total tasks).
+2. **Splits:** official splits where provided; otherwise 5-fold 80:20 CV or 50-fold Monte Carlo depending on cohort size.
+3. **Few-shot splits:** derived from each k=All train fold, fixed test set per task.
+4. **Metrics:**
+5. Binary classification: macro-AUC.
+6. Multi-class subtyping: balanced accuracy.
+7. Grading: quadratic weighted Cohen kappa.
+8. Survival: concordance index.
+9. **Uncertainty reporting:** mean±SE for multi-fold; 95% CI via bootstrapping for single-fold tasks.
+10. **Statistics:** two-way ANOVA + Tukey HSD per task; mixed-effects model across tasks/families; log-rank for KM curves.
+
+7. **Reproducibility controls**
+1. Fix seeds for data split, patch sampling, training, and bootstraps.
+2. Version-lock all model weights/checkpoints (CONCHV1.5, scGPT, PRISM/Virchow/GIGAPATH/CHIEF).
+3. Persist split files, manifests, and patient-group mappings.
+4. Store per-task config files so no hidden hyperparameter drift.
+5. Add pipeline checksums for extracted patch features and final embeddings.
+6. Log hardware precision mode (bf16/fp16/fp32) per model exactly as paper.
+
+8. **Known ambiguities and missing details to resolve before coding**
+1. Extended Data hyperparameter table values are partially unreadable in the provided parse (some AdamW, decay, schedule constants missing).
+2. Exact contrastive loss formula details (temperature handling, bidirectional loss weighting) are not fully visible.
+3. Exact RankMe trigger logic details (frequency, checkpoint tie-breaking) need confirmation from full methods/equations.
+4. Tissue segmentation training data and exact FPN checkpoint are in-house; replacement strategy required.
+5. Several benchmark tasks include private cohorts (MGH/BWH/internal treatment cohorts), preventing full public replication.
+6. PRISM fine-tuning recipe is explicitly unavailable; only linear-probe/embedding use appears feasible.
+7. Some tables/splits appear OCR-corrupted; official split assets from `patho-bench`/HF dataset should be treated as source of truth.
+
+9. **Practical execution order**
+1. Reproduce preprocessing + embedding extraction first on 2-3 public cohorts.
+2. Validate linear probing pipeline end-to-end with fixed metrics/splits.
+3. Add THREADS pretraining on TCGA+GTEx public pairs.
+4. Expand to full public benchmark.
+5. Add fine-tuning baselines.
+6. Add transferability, few-shot, retrieval, prompting, and scaling ablations.
+7. Only then attempt full-paper parity if private datasets become available.
+
+If you want, next I can convert this into a concrete implementation checklist with repository structure (`configs/`, `datasets/`, `models/`, `train/`, `eval/`) and milestone-by-milestone deliverables.

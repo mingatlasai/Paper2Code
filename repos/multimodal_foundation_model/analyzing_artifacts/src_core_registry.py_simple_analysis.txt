@@ -1,0 +1,12 @@
+Implemented the requested logic analysis in `src/core/registry.py`.
+
+What’s included in `src/core/registry.py`:
+- Registry responsibilities and scope aligned to the paper, plan, design, and `config.yaml`
+- Exact factory targets based on the provided interfaces (no extra public APIs invented)
+- Stage-aware assembly rules (`preprocess`, `pretrain`, `embed`, `eval`)
+- Config-to-key resolution and normalization strategy
+- Component-by-component construction constraints (THREADS, RNA, DNA, loss, evaluators)
+- Paper-locked invariants and fail-fast rules for unknown/null hyperparameters
+- Error model, reproducibility/audit requirements, and implementation/test sequencing
+
+No executable registry code was added yet, only the structured analysis as requested.

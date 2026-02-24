@@ -1,0 +1,15 @@
+Implemented the requested logic analysis in `src/train/finetune_module.py`.
+
+What I wrote there:
+- A full paper-aligned logic spec for `FinetuneModule` (analysis only, no code).
+- Strict adherence to your design interface:
+  - `__init__(slide_encoder, head_out_dim, task_type, optim_cfg)`
+  - `training_step(...)`
+  - `validation_step(...)`
+  - `predict_step(...)`
+- Explicit mapping to `config.yaml` constraints (THREADS fine-tuning recipe, optimizer/loss/epoch/patch policies).
+- Clear contracts for inputs, outputs, failure handling, reproducibility, and integration boundaries.
+- Guardrails for unresolved/unspecified survival fine-tuning behavior (fail-fast unless explicitly configured).
+
+File created:
+- `src/train/finetune_module.py`

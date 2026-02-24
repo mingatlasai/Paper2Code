@@ -1,0 +1,9 @@
+Implemented the requested logic analysis in `src/models/losses.py`.
+
+What was added:
+- A full analysis-only module docstring for `ContrastiveLoss` aligned with the paper, design interfaces, task constraints, and provided `config.yaml`.
+- Explicit contract coverage for:
+  - `__init__(temperature: float, bidirectional: bool)`
+  - `forward(z_wsi: object, z_mol: object) -> float`
+- InfoNCE/bidirectional behavior, shape/pairing invariants, config binding rules, numerical stability, failure modes, and test guidance.
+- Clear handling of unresolved paper details (temperature default not hardcoded).

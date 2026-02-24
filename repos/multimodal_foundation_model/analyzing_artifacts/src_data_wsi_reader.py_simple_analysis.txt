@@ -1,0 +1,9 @@
+Implemented the requested logic analysis in `src/data/wsi_reader.py`.
+
+It now documents, in paper/config-aligned detail:
+
+- Exact `WSIReader` interface responsibilities from your design (`open/read_region/get_mpp/close`)
+- Magnification-aware reading constraints for `20x`, `512x512`, stride `512`, no overlap
+- Metadata and coordinate contracts needed by `patch_tiler.py` and `tissue_segmenter.py`
+- Error handling, determinism, resource-safety, and reproducibility expectations
+- Clear boundaries so no design/interface drift is introduced

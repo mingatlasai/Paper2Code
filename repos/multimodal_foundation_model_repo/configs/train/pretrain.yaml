@@ -1,0 +1,103 @@
+# configs/train/pretrain.yaml
+# Pretraining configuration for THREADS.
+# Values are constrained by provided config.yaml and paper-grounded specs.
+
+pretrain:
+  name: "threads_pretrain"
+  stage: "pretrain"
+
+  objective:
+    type: "cross-modal contrastive learning (InfoNCE-style)"
+    bidirectional: null
+    temperature: null
+    loss_weights:
+      wsi_rna: null
+      wsi_dna: null
+    skip_missing_modality: true
+    fail_if_no_valid_pair_in_batch: true
+
+  hardware:
+    distributed: "DDP"
+    gpus: 4
+    gpu_type: "NVIDIA A100 80GB"
+    world_size: 4
+
+  precision:
+    mode: "AMP"
+    amp_dtype: null
+    autocast_enabled: true
+    grad_scaler_enabled: true
+
+  optimizer:
+    name: "AdamW"
+    learning_rate: 1.0e-5
+    betas: null
+    eps: null
+    weight_decay: null
+    zero_grad_set_to_none: true
+
+  scheduler:
+    type: "cosine decay"
+    max_epochs: 101
+    step_unit: "epoch"
+    warmup:
+      enabled: true
+      epochs: 5
+      start_lr: 0.0
+      peak_lr: 1.0e-5
+    cosine:
+      final_lr: null
+
+  training:
+    batch_size_per_gpu: 300
+    global_batch_size: 1200
+    gradient_accumulation_steps: 1
+    max_epochs: 101
+    log_every_n_steps: 10
+    val_every_n_epochs: 1
+    seed: 42
+    deterministic: true
+
+  rankme:
+    enabled: true
+    eps: 1.0e-7
+    start_after_warmup: true
+    first_monitor_epoch: 6
+    monitor_split: "train"
+    save_when_improves: true
+    save_rule: "strictly_greater"
+
+  checkpointing:
+    dirpath: "outputs/checkpoints/pretrain"
+    filename_template: "threads_pretrain_epoch{epoch:03d}_rankme{rankme:.6f}"
+    save_last: true
+    save_weights_only: false
+    include_optimizer_state: true
+    include_scheduler_state: true
+    resume_from: null
+
+  io_contract:
+    required_batch_keys:
+      - "patch_features"
+      - "patch_mask"
+    optional_rna_keys:
+      - "gene_ids"
+      - "expr_vals"
+      - "gene_mask"
+    optional_dna_keys:
+      - "dna_multi_hot"
+
+  logging:
+    required_metrics:
+      - "train/loss_total"
+      - "train/loss_wsi_rna"
+      - "train/loss_wsi_dna"
+      - "train/rankme"
+      - "train/lr"
+
+  invariants:
+    patch_size: 512
+    target_magnification: "20x"
+    slide_embedding_dim: 1024
+    dna_input_dim: 1673
+    molecular_embedding_dim: 1024

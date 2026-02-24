@@ -1,0 +1,6 @@
+Implemented the requested logic analysis in `src/models/slide_encoder_threads.py`.
+
+It now documents, without code, the full slide-encoder contract aligned with:
+- the paper methodology,
+- your fixed design interfaces,
+- and `config.yaml` constraints (ABMIL gated attention, 2-head main setting, 1024-d output, mask-aware aggregation, integration points, validation and failure rules).

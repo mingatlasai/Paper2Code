@@ -1,0 +1,185 @@
+# configs/default.yaml
+# Top-level runtime configuration for THREADS reproduction.
+# This file composes stage-specific configs and mirrors paper-grounded defaults from config.yaml.
+
+defaults:
+  - data/pretrain_public@pretrain_public
+  - data/downstream_public@downstream_public
+  - model/threads@model_threads
+  - train/pretrain@train_pretrain
+  - train/finetune@train_finetune
+  - eval/linear_probe@eval_linear_probe
+  - eval/survival@eval_survival
+  - _self_
+
+project:
+  name: "threads_reproduction"
+  paper: "Molecular-driven Foundation Model for Oncologic Pathology"
+
+environment:
+  python_version: "3.10.12"
+  pytorch_version: "2.3.0"
+  cuda_version: "12.3"
+
+runtime:
+  stage: "preprocess"
+
+preprocessing:
+  target_magnification: "20x"
+  patch_size: 512
+  patch_stride: 512
+  overlap: 0
+  tissue_segmentation:
+    method: "FPN fine-tuned from segmentation_models_pytorch"
+    checkpoint: null
+  patch_encoder_input_resize: 448
+  patch_encoder_normalization:
+    mean: "ImageNet default"
+    std: "ImageNet default"
+
+model:
+  slide_embedding_dim: 1024
+  slide_encoder:
+    type: "ABMIL gated attention"
+    attention_heads_main: 2
+    single_head_variant_supported: true
+  patch_encoder:
+    name: "CONCHV1.5"
+  rna_encoder:
+    name: "scGPT (pan-cancer checkpoint)"
+    transformer_layers: 12
+    attention_heads: 8
+    projection_out_dim: 1024
+  dna_encoder:
+    type: "4-layer MLP"
+    input_dim: 1673
+    output_dim: 1024
+    dropout: 0.2
+
+pretraining:
+  hardware:
+    gpus: 4
+    gpu_type: "NVIDIA A100 80GB"
+    distributed: "DDP"
+    precision: "AMP (type not explicitly stated in text)"
+  optimizer:
+    name: "AdamW"
+    learning_rate: 1.0e-5
+    betas: null
+    weight_decay: null
+  scheduler:
+    warmup_epochs: 5
+    warmup_start_lr: 0.0
+    peak_lr: 1.0e-5
+    type: "cosine decay"
+    final_lr: null
+  training:
+    batch_size_per_gpu: 300
+    max_epochs: 101
+    early_stopping: "RankMe-based checkpoint selection"
+    rankme_eps: 1.0e-7
+    rankme_start_after_warmup: true
+  objective:
+    type: "cross-modal contrastive learning (InfoNCE-style)"
+
+embedding_extraction:
+  slide_level:
+    use_all_patches: true
+    patch_sampling: "none"
+  patient_level:
+    aggregation: "union of patches across all WSIs for a patient"
+  hardware:
+    gpus: 1
+    gpu_type: "NVIDIA 3090Ti 24GB"
+    precision: "bf16"
+
+linear_probe:
+  classification:
+    model: "LogisticRegression (scikit-learn)"
+    C: 0.5
+    solver: "lbfgs"
+    max_iter: 10000
+    class_weight: "balanced"
+    hyperparameter_search: false
+  survival:
+    model: "CoxNet (sksurv)"
+    max_iter: 10000
+    alpha:
+      overall_survival: 0.07
+      progression_free_survival: 0.01
+    alpha_exceptions:
+      - task: "CPTAC-CCRCC overall survival"
+        model: "CHIEF"
+        alpha: 0.01
+      - task: "BOEHMK progression-free survival"
+        model: "PRISM"
+        alpha: 0.02
+
+finetuning_threads:
+  optimizer:
+    name: "AdamW"
+    learning_rate: 2.5e-5
+    weight_decay: 0.0
+    layerwise_lr_decay: false
+    gradient_accumulation: false
+  training:
+    epochs: 5
+    batch_size: 1
+    patches_per_batch: 2048
+    early_stopping: false
+    checkpoint_selection: "final epoch"
+  loss:
+    classification: "weighted cross-entropy"
+  hardware:
+    gpus: 1
+    gpu_type: "NVIDIA 3090Ti 24GB"
+    precision: "bf16"
+
+baselines:
+  gigapath_finetune:
+    patch_encoder_frozen: true
+    optimizer: "AdamW"
+    learning_rate_effective: 2.5e-4
+    gradient_accumulation_steps: 32
+    weight_decay: 0.05
+    layerwise_lr_decay: 0.95
+    epochs: 5
+    warmup_epochs: 1
+    scheduler: "half-cycle cosine"
+    early_stopping: false
+    precision: "fp16"
+    hardware: "1x NVIDIA A100 80GB"
+  chief_finetune:
+    recipe: "same as THREADS finetuning"
+    precision: "fp32"
+    hardware: "1x NVIDIA 3090Ti 24GB"
+  abmil_supervised:
+    epochs: 20
+    batch_size: 1
+    learning_rate: 3.0e-4
+    optimizer: "AdamW"
+    weight_decay: 1.0e-5
+    train_patch_sampling: 2048
+    test_uses_all_patches: true
+    early_stopping: false
+
+evaluation:
+  split_policy:
+    official_single_fold_datasets: ["EBRAINS", "PANDA", "IMP"]
+    otherwise:
+      options: ["5-fold 80:20 cross-validation", "50-fold bootstrapping/Monte Carlo"]
+    stratification: "label- and patient-stratified (except noted dataset-specific constraints)"
+  few_shot:
+    k_values: [1, 2, 4, 8, 16, 32]
+  metrics:
+    binary_classification: "macro-AUC"
+    multiclass_subtyping: "balanced accuracy"
+    grading: "quadratic weighted Cohen's kappa"
+    survival: "concordance index (c-index)"
+  statistics:
+    per_task: "two-way ANOVA then Tukey HSD if ANOVA p<0.05"
+    across_tasks: "mixed-effects model with dataset random effect"
+    km_curves: "log-rank test"
+    confidence_intervals:
+      multi_fold: "mean ± standard error"
+      single_fold: "95% CI via non-parametric bootstrap (100 replicates)"

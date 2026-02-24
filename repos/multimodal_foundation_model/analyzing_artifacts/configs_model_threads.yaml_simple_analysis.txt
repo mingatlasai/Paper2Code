@@ -1,0 +1,11 @@
+Implemented the requested logic analysis in:
+
+- `configs/model/threads.yaml`
+
+What I wrote there is paper-aligned and design-constrained, including:
+
+- Single-source model hyperparameter/contracts for THREADS.
+- Exact interface bindings matching your design (`ThreadsSlideEncoder`, `ScGPTRNAEncoder`, `DNAMLPEncoder`, `ContrastiveLoss`, `ThreadsModel`).
+- Config-grounded constants (`1024`, `1673`, `2` heads, `0.2` DNA dropout, `512@20x`, `448` resize).
+- Clear loss/path logic for WSI↔RNA/DNA contrastive training.
+- Explicit unresolved fields left as `null`/open where paper/config do not provide exact values (for fidelity).

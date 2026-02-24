@@ -1,0 +1,11 @@
+Implemented the logic analysis in `configs/data/pretrain_public.yaml`.
+
+It now defines, in a paper-aligned and config-constrained way:
+
+- Public-only pretraining scope (TCGA/GTEx only) with explicit private-data exclusions
+- Manifest schema and filtering rules mapped to `ManifestRecord`
+- Modality availability and gating (`WSI+RNA` enabled, `DNA` structurally defined but disabled for public pretraining)
+- Datamodule/ManifestStore contracts for `src/data/manifest_store.py` and `src/data/datamodules.py`
+- I/O roots, model-alignment constants, runtime constraints, validation checks, and known gaps
+
+File: `configs/data/pretrain_public.yaml`

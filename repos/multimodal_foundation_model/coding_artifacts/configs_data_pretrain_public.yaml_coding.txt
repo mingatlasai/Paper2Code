@@ -1,0 +1,229 @@
+## Code: configs/data/pretrain_public.yaml
+```python
+# Logic analysis for public pretraining data configuration.
+# Scope: Defines pretraining manifests, cohort filters (TCGA/GTEx public),
+# modality availability (RNA/DNA), and I/O roots.
+# Consumers: src/data/manifest_store.py and src/data/datamodules.py
+# Constraint: Values are restricted to provided config.yaml + paper text.
+
+pretrain_public:
+  config_version: "1.0"
+  intent: "THREADS public-only pretraining (partial reproduction)"
+  paper_id: "Molecular-driven Foundation Model for Oncologic Pathology"
+
+  reproduction_scope:
+    mode: "public_only"
+    target_tier: "Tier B"
+    includes:
+      - "TCGA paired WSI+RNA"
+      - "GTEx paired WSI+RNA"
+    excludes:
+      - "MGH private paired WSI+RNA"
+      - "BWH private paired WSI+DNA"
+    rationale: "Full MBTG-47K cannot be reproduced without private cohorts."
+
+  manifests:
+    # ManifestStore.load() should read these paths and map rows to ManifestRecord.
+    # Required ManifestRecord keys are fixed by design:
+    # sample_id, patient_id, cohort, slide_path, magnification, rna_path, dna_path, task_labels, meta
+    root_dir: "data/processed/manifests"
+    format: "parquet"
+    files:
+      tcga: "data/processed/manifests/pretrain_tcga_manifest.parquet"
+      gtex: "data/processed/manifests/pretrain_gtex_manifest.parquet"
+      merged_public: "data/processed/manifests/pretrain_public_merged.parquet"
+
+    required_columns:
+      - "sample_id"
+      - "patient_id"
+      - "cohort"
+      - "slide_path"
+      - "magnification"
+      - "rna_path"
+      - "dna_path"
+      - "task_labels"
+      - "meta"
+
+    defaults:
+      dna_path: ""
+      task_labels: {}
+      meta: {}
+      magnification_fallback: "20x"
+
+    hard_filters:
+      cohort_allowlist: ["TCGA", "GTEx"]
+      magnification_required: true
+      allowed_magnifications: ["20x", "40x"]
+      requires_slide_path: true
+      requires_patient_id: true
+      requires_rna_pair: true
+      exclude_frozen_tissue_when_annotated: true
+      exclude_missing_metadata: true
+
+    pairing_policy:
+      unit: "sample_level"
+      join_key_priority:
+        - "sample_id"
+        - "patient_id"
+      one_slide_to_one_molecular_pair_required: true
+      unresolved_pairs: "drop_and_log"
+
+    deduplication:
+      key: "sample_id"
+      keep: "first_stable"
+      on_conflict: "log_conflict_and_drop_later_duplicates"
+
+  cohort_registry:
+    tcga:
+      source_name: "TCGA"
+      availability: "public"
+      paired_modality: "RNA"
+      reported_pairs: 10209
+      rna_gene_policy:
+        selected_gene_count_before_vocab_filter: 4917
+        genes_after_scgpt_vocab_filter: 4848
+        expression_unit: "TPM"
+        transform: "log2(TPM)"
+        batch_effect_normalization: "none"
+    gtex:
+      source_name: "GTEx"
+      availability: "public"
+      paired_modality: "RNA"
+      reported_pairs: 9507
+      rna_gene_policy:
+        selected_gene_count_before_vocab_filter: 5000
+        genes_after_scgpt_vocab_filter: 4932
+        expression_unit: "TPM"
+        transform: "log2(TPM)"
+        batch_effect_normalization: "none"
+
+  modalities:
+    # Used by datamodules.py to emit valid multimodal batches for ThreadsModel.training_step().
+    wsi:
+      enabled: true
+      field: "slide_path"
+      required: true
+      preprocessing_contract:
+        target_magnification: "20x"
+        patch_size: 512
+        patch_stride: 512
+        overlap: 0
+        tissue_segmentation_method: "FPN fine-tuned from segmentation_models_pytorch"
+        tissue_segmentation_checkpoint: null
+        patch_encoder_name: "CONCHV1.5"
+        patch_encoder_input_resize: 448
+        patch_encoder_normalization_mean: "ImageNet default"
+        patch_encoder_normalization_std: "ImageNet default"
+
+    rna:
+      enabled: true
+      field: "rna_path"
+      required: true
+      encoder_name: "scGPT (pan-cancer checkpoint)"
+      transformer_layers: 12
+      attention_heads: 8
+      projection_out_dim: 1024
+      missing_policy: "drop_sample"
+
+    dna:
+      enabled: false
+      field: "dna_path"
+      required: false
+      reason_disabled: "Public pretraining scope uses TCGA/GTEx RNA pairs only; BWH DNA is private."
+      encoder_contract:
+        type: "4-layer MLP"
+        input_dim: 1673
+        output_dim: 1024
+        dropout: 0.2
+      missing_policy: "ignore"
+
+  datamodule_contract:
+    # Interface alignment with Data structures and interfaces design.
+    manifest_store:
+      class_name: "ManifestStore"
+      load_from: "pretrain_public.manifests.files.merged_public"
+      filter_by_cohorts: ["TCGA", "GTEx"]
+
+    batch_construction:
+      emits_keys:
+        - "sample_id"
+        - "patient_id"
+        - "patch_features_or_patches"
+        - "patch_mask"
+        - "gene_ids"
+        - "expr_vals"
+        - "gene_mask"
+      optional_keys:
+        - "dna_multi_hot"
+      pairing_assertion: "Each emitted WSI sample must include RNA tensors."
+      patient_aggregation_rule_for_pretrain: "none"
+
+    split_strategy:
+      primary: "train_val_from_manifest"
+      fallback_if_no_official_split: "make_cv"
+      fallback_cv_n_folds: 5
+      group_by: "patient_id"
+      stratify_by: "cohort"
+
+  io_roots:
+    # Canonical paths consumed across preprocess -> pretrain -> embed flow.
+    raw_root: "data/raw"
+    interim_root: "data/interim"
+    processed_root: "data/processed"
+    features_root: "data/processed/features"
+    embeddings_root: "data/processed/embeddings"
+    splits_root: "data/processed/splits"
+    logs_root: "runs"
+    artifacts_layout: "runs/{date}/{stage}/{run_id}"
+
+  model_alignment:
+    # Constants required by downstream modules; keep synchronized with configs/model/threads.yaml.
+    slide_embedding_dim: 1024
+    slide_encoder_type: "ABMIL gated attention"
+    slide_encoder_attention_heads_main: 2
+    single_head_variant_supported: true
+    objective_type: "cross-modal contrastive learning (InfoNCE-style)"
+
+  pretraining_runtime_constraints:
+    hardware:
+      gpus: 4
+      gpu_type: "NVIDIA A100 80GB"
+      distributed: "DDP"
+      precision: "AMP (type not explicitly stated in text)"
+    optimizer:
+      name: "AdamW"
+      learning_rate: 1.0e-5
+      betas: null
+      weight_decay: null
+    scheduler:
+      warmup_epochs: 5
+      warmup_start_lr: 0.0
+      peak_lr: 1.0e-5
+      type: "cosine decay"
+      final_lr: null
+    training:
+      batch_size_per_gpu: 300
+      max_epochs: 101
+      early_stopping: "RankMe-based checkpoint selection"
+      rankme_eps: 1.0e-7
+      rankme_start_after_warmup: true
+
+  quality_checks:
+    manifest_validation:
+      enforce_schema: true
+      enforce_unique_sample_id: true
+      enforce_non_null_paths: ["slide_path", "rna_path"]
+      enforce_allowed_cohorts: ["TCGA", "GTEx"]
+    leakage_prevention:
+      ensure_patient_non_overlap_between_splits: true
+    preprocessing_validation:
+      enforce_patch_size: 512
+      enforce_stride: 512
+      enforce_target_magnification: "20x"
+
+  known_gaps:
+    - "Exact private-data MBTG-47K parity is unavailable in public-only mode."
+    - "In-house tissue segmentation checkpoint is unavailable (config keeps checkpoint=null)."
+    - "Some pretraining optimizer/scheduler values remain unreadable in paper parse and are left null by design."
+    - "DNA branch is architecturally defined but disabled in public-only pretraining manifests."
+```

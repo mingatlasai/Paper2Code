@@ -1,0 +1,8 @@
+Implemented the requested logic analysis in `src/models/dna_encoder_mlp.py`.
+
+It is now a paper-aligned, config-bound blueprint (no executable code yet) covering:
+- Exact interface contract from design (`DNAMLPEncoder.__init__`, `forward`)
+- Required dimensions and defaults from `config.yaml` (`1673 -> 1024`, dropout `0.2`)
+- Internal 4-layer MLP logic and validation rules
+- Integration contracts with `threads_model`, datamodules, and losses
+- Failure modes, reproducibility constraints, and coding-phase test checklist.

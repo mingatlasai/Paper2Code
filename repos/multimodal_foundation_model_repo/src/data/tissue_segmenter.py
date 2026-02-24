@@ -1,0 +1,721 @@
+"""Tissue/background segmentation for WSI preprocessing.
+
+This module implements the design-locked interface:
+- ``TissueSegmenter.__init__(ckpt_path: str, device: str) -> None``
+- ``TissueSegmenter.predict_mask(slide: object, target_magnification: int) -> object``
+- ``TissueSegmenter.postprocess(mask: object) -> object``
+
+Paper/config alignment:
+- Segmentation approach: FPN from segmentation-models-pytorch when checkpoint is provided.
+- Preprocessing target magnification default: 20x.
+- If in-house checkpoint is unavailable (expected in public reproduction), a deterministic
+  fallback detector is used and annotated in output metadata.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Tuple
+import math
+
+import numpy as np
+from scipy import ndimage
+
+try:
+    import torch
+    import torch.nn.functional as torch_functional
+except Exception:  # pragma: no cover - optional at import time
+    torch = None  # type: ignore[assignment]
+    torch_functional = None  # type: ignore[assignment]
+
+try:
+    import segmentation_models_pytorch as smp
+except Exception:  # pragma: no cover - optional at import time
+    smp = None  # type: ignore[assignment]
+
+
+DEFAULT_TARGET_MAGNIFICATION: int = 20
+DEFAULT_PATCH_SIZE: int = 512
+DEFAULT_SEGMENTER_METHOD: str = "FPN fine-tuned from segmentation_models_pytorch"
+DEFAULT_FPN_ENCODER_NAME: str = "resnet34"
+DEFAULT_FPN_IN_CHANNELS: int = 3
+DEFAULT_FPN_CLASSES: int = 1
+DEFAULT_PAD_VALUE: int = 255
+
+# Morphology defaults are deterministic and conservative.
+DEFAULT_BINARY_OPEN_ITERS: int = 1
+DEFAULT_BINARY_CLOSE_ITERS: int = 2
+DEFAULT_MIN_COMPONENT_AREA_PIXELS: int = 64
+DEFAULT_MIN_COMPONENT_AREA_RATIO: float = 1.0e-5
+DEFAULT_MAX_INFER_SIDE: int = 4096
+DEFAULT_EPS: float = 1.0e-6
+
+
+class TissueSegmenterError(Exception):
+    """Base exception for tissue segmentation failures."""
+
+
+class TissueSegmenterInitError(TissueSegmenterError):
+    """Raised when segmenter initialization fails."""
+
+
+class TissueSegmenterInferenceError(TissueSegmenterError):
+    """Raised when segmentation inference fails."""
+
+
+class TissueSegmenterMetadataError(TissueSegmenterError):
+    """Raised when slide metadata is insufficient for segmentation."""
+
+
+@dataclass(frozen=True)
+class _MaskPacket:
+    """Internal mask container returned by ``predict_mask`` and ``postprocess``."""
+
+    mask: np.ndarray
+    level: int
+    downsample: float
+    target_magnification: int
+    mpp: Optional[float]
+    method: str
+    source: str
+    slide_width_level0: int
+    slide_height_level0: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return JSON-safe dict with numpy mask retained as ndarray object."""
+        return {
+            "mask": self.mask,
+            "level": self.level,
+            "downsample": self.downsample,
+            "target_magnification": self.target_magnification,
+            "mpp": self.mpp,
+            "method": self.method,
+            "source": self.source,
+            "slide_width_level0": self.slide_width_level0,
+            "slide_height_level0": self.slide_height_level0,
+        }
+
+
+class TissueSegmenter:
+    """WSI tissue segmentation wrapper.
+
+    The class first tries checkpointed FPN inference when possible. If model loading
+    is unavailable (no checkpoint, no torch/smp, or incompatible checkpoint), it falls
+    back to deterministic color-based tissue detection.
+    """
+
+    def __init__(self, ckpt_path: str, device: str) -> None:
+        """Initialize tissue segmenter.
+
+        Args:
+            ckpt_path: Path to FPN checkpoint. Empty/None-like values trigger fallback.
+            device: Runtime device string (e.g., ``"cpu"``, ``"cuda"``, ``"cuda:0"``).
+
+        Raises:
+            TissueSegmenterInitError: If device is invalid or checkpoint loading fails
+                when explicit checkpoint is provided.
+        """
+        normalized_ckpt_path: str = "" if ckpt_path is None else str(ckpt_path).strip()
+        normalized_device: str = self._normalize_device(device)
+
+        self._device: str = normalized_device
+        self._checkpoint_path: str = normalized_ckpt_path
+        self._model: Optional[Any] = None
+        self._use_model_inference: bool = False
+        self._source: str = "fallback_heuristic"
+        self._method: str = DEFAULT_SEGMENTER_METHOD
+
+        if normalized_ckpt_path:
+            self._model = self._initialize_fpn_model(normalized_ckpt_path)
+            self._use_model_inference = True
+            self._source = "checkpoint_fpn"
+
+    def predict_mask(self, slide: object, target_magnification: int) -> object:
+        """Predict tissue mask from an open WSI handle.
+
+        Args:
+            slide: Open slide handle from ``src/data/wsi_reader.py``.
+            target_magnification: Requested magnification (paper default is 20x).
+
+        Returns:
+            A dictionary object with fields:
+            - ``mask``: uint8 binary mask (1=tissue, 0=background), in selected level frame.
+            - ``level``: pyramid level used for segmentation.
+            - ``downsample``: level downsample vs level-0.
+            - ``target_magnification``: input target magnification.
+            - ``mpp``: best-effort level-0 MPP (optional).
+            - ``method``: segmentation method descriptor.
+            - ``source``: ``checkpoint_fpn`` or ``fallback_heuristic``.
+            - ``slide_width_level0``, ``slide_height_level0``.
+
+        Raises:
+            TissueSegmenterMetadataError: If slide metadata is invalid.
+            TissueSegmenterInferenceError: If segmentation fails.
+        """
+        validated_target_magnification: int = self._validate_target_magnification(target_magnification)
+        level, downsample, width_level0, height_level0 = self._resolve_inference_level(
+            slide=slide,
+            target_magnification=validated_target_magnification,
+        )
+
+        rgb_image: np.ndarray = self._read_full_level_rgb(
+            slide=slide,
+            level=level,
+            downsample=downsample,
+            width_level0=width_level0,
+            height_level0=height_level0,
+        )
+
+        if self._use_model_inference and self._model is not None:
+            raw_mask: np.ndarray = self._infer_with_fpn(rgb_image)
+        else:
+            raw_mask = self._infer_with_fallback(rgb_image)
+
+        processed_packet: Dict[str, Any] = self.postprocess(
+            _MaskPacket(
+                mask=raw_mask,
+                level=level,
+                downsample=downsample,
+                target_magnification=validated_target_magnification,
+                mpp=self._extract_slide_mpp(slide),
+                method=self._method,
+                source=self._source,
+                slide_width_level0=width_level0,
+                slide_height_level0=height_level0,
+            ).to_dict()
+        )
+        return processed_packet
+
+    def postprocess(self, mask: object) -> object:
+        """Postprocess raw segmentation output to deterministic binary tissue mask.
+
+        Args:
+            mask: Either a numpy array or a mask packet dictionary.
+
+        Returns:
+            Same shape/type semantics as input container with cleaned binary mask.
+
+        Raises:
+            TissueSegmenterInferenceError: If mask format is unsupported.
+        """
+        if isinstance(mask, Mapping):
+            if "mask" not in mask:
+                raise TissueSegmenterInferenceError("Mask packet mapping must contain key 'mask'.")
+            mask_array: np.ndarray = self._coerce_mask_array(mask["mask"])
+            cleaned_mask: np.ndarray = self._postprocess_binary_mask(mask_array)
+            output_packet: Dict[str, Any] = dict(mask)
+            output_packet["mask"] = cleaned_mask
+            return output_packet
+
+        mask_array = self._coerce_mask_array(mask)
+        return self._postprocess_binary_mask(mask_array)
+
+    def _normalize_device(self, device: str) -> str:
+        """Normalize and validate runtime device string."""
+        normalized_device: str = "cpu" if device is None else str(device).strip().lower()
+        if normalized_device == "":
+            normalized_device = "cpu"
+
+        if normalized_device.startswith("cuda"):
+            if torch is None or not torch.cuda.is_available():
+                raise TissueSegmenterInitError(
+                    f"Requested CUDA device '{device}' but CUDA is unavailable."
+                )
+            return normalized_device
+
+        if normalized_device == "cpu":
+            return "cpu"
+
+        raise TissueSegmenterInitError(
+            f"Unsupported device '{device}'. Expected 'cpu' or 'cuda[:index]'."
+        )
+
+    def _initialize_fpn_model(self, ckpt_path: str) -> Any:
+        """Load FPN model checkpoint for tissue segmentation."""
+        checkpoint_file: Path = Path(ckpt_path).expanduser().resolve()
+        if not checkpoint_file.exists() or not checkpoint_file.is_file():
+            raise TissueSegmenterInitError(f"Checkpoint not found: {checkpoint_file}")
+
+        if torch is None:
+            raise TissueSegmenterInitError("PyTorch is unavailable; cannot load FPN checkpoint.")
+        if smp is None:
+            raise TissueSegmenterInitError(
+                "segmentation_models_pytorch is unavailable; cannot load FPN checkpoint."
+            )
+
+        try:
+            model: Any = smp.FPN(
+                encoder_name=DEFAULT_FPN_ENCODER_NAME,
+                encoder_weights=None,
+                in_channels=DEFAULT_FPN_IN_CHANNELS,
+                classes=DEFAULT_FPN_CLASSES,
+                activation=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise TissueSegmenterInitError(f"Failed to construct FPN model: {exc}") from exc
+
+        try:
+            checkpoint_data: Any = torch.load(checkpoint_file, map_location="cpu")
+        except Exception as exc:  # noqa: BLE001
+            raise TissueSegmenterInitError(
+                f"Failed to load checkpoint file {checkpoint_file}: {exc}"
+            ) from exc
+
+        state_dict: Dict[str, Any] = self._extract_state_dict(checkpoint_data)
+        cleaned_state_dict: Dict[str, Any] = self._clean_state_dict_keys(state_dict)
+
+        try:
+            model.load_state_dict(cleaned_state_dict, strict=True)
+        except Exception as strict_error:  # noqa: BLE001
+            try:
+                model.load_state_dict(cleaned_state_dict, strict=False)
+            except Exception as non_strict_error:  # noqa: BLE001
+                raise TissueSegmenterInitError(
+                    "Failed to load segmentation checkpoint with both strict and non-strict mode. "
+                    f"strict_error={strict_error}; non_strict_error={non_strict_error}"
+                ) from non_strict_error
+
+        model.eval()
+        model.to(self._device)
+        return model
+
+    def _extract_state_dict(self, checkpoint_data: Any) -> Dict[str, Any]:
+        """Extract a model state dictionary from common checkpoint structures."""
+        if isinstance(checkpoint_data, Mapping):
+            if "state_dict" in checkpoint_data and isinstance(checkpoint_data["state_dict"], Mapping):
+                return dict(checkpoint_data["state_dict"])
+            if "model" in checkpoint_data and isinstance(checkpoint_data["model"], Mapping):
+                return dict(checkpoint_data["model"])
+            if all(isinstance(key, str) for key in checkpoint_data.keys()):
+                return dict(checkpoint_data)
+
+        raise TissueSegmenterInitError(
+            "Checkpoint format is unsupported; expected state_dict-like mapping."
+        )
+
+    def _clean_state_dict_keys(self, state_dict: Mapping[str, Any]) -> Dict[str, Any]:
+        """Strip common distributed/trainer prefixes from checkpoint keys."""
+        cleaned: Dict[str, Any] = {}
+        for key, value in state_dict.items():
+            normalized_key: str = str(key)
+            for prefix in ("module.", "model.", "net."):
+                if normalized_key.startswith(prefix):
+                    normalized_key = normalized_key[len(prefix):]
+            cleaned[normalized_key] = value
+        return cleaned
+
+    def _validate_target_magnification(self, target_magnification: int) -> int:
+        """Validate target magnification with paper-aligned default constraints."""
+        if isinstance(target_magnification, bool):
+            raise TissueSegmenterMetadataError("target_magnification cannot be bool.")
+        try:
+            target_magnification_int: int = int(target_magnification)
+        except Exception as exc:  # noqa: BLE001
+            raise TissueSegmenterMetadataError(
+                f"Invalid target_magnification value: {target_magnification!r}"
+            ) from exc
+
+        if target_magnification_int <= 0:
+            raise TissueSegmenterMetadataError(
+                f"target_magnification must be > 0, got {target_magnification_int}."
+            )
+        return target_magnification_int
+
+    def _resolve_inference_level(
+        self,
+        slide: object,
+        target_magnification: int,
+    ) -> Tuple[int, float, int, int]:
+        """Resolve pyramid level closest to requested magnification."""
+        level_dimensions_raw: Any = getattr(slide, "level_dimensions", None)
+        level_downsamples_raw: Any = getattr(slide, "level_downsamples", None)
+
+        if level_dimensions_raw is None or level_downsamples_raw is None:
+            raise TissueSegmenterMetadataError(
+                "Slide handle does not expose level_dimensions/level_downsamples."
+            )
+
+        level_dimensions: Tuple[Tuple[int, int], ...] = tuple(
+            (int(pair[0]), int(pair[1])) for pair in level_dimensions_raw
+        )
+        level_downsamples: Tuple[float, ...] = tuple(float(value) for value in level_downsamples_raw)
+
+        if len(level_dimensions) == 0 or len(level_downsamples) == 0:
+            raise TissueSegmenterMetadataError("Slide has no pyramid levels.")
+
+        if len(level_dimensions) != len(level_downsamples):
+            raise TissueSegmenterMetadataError(
+                "Slide pyramid metadata mismatch: len(level_dimensions) != len(level_downsamples)."
+            )
+
+        width_level0: int = int(level_dimensions[0][0])
+        height_level0: int = int(level_dimensions[0][1])
+        if width_level0 <= 0 or height_level0 <= 0:
+            raise TissueSegmenterMetadataError(
+                f"Invalid level-0 dimensions: {(width_level0, height_level0)}"
+            )
+
+        scan_magnification: Optional[float] = self._extract_scan_magnification(slide)
+        if scan_magnification is None:
+            desired_downsample: float = 1.0
+        else:
+            desired_downsample = float(scan_magnification) / float(target_magnification)
+            if not math.isfinite(desired_downsample) or desired_downsample <= 0.0:
+                desired_downsample = 1.0
+
+        best_level: int = 0
+        best_error: float = float("inf")
+        for level_index, level_downsample in enumerate(level_downsamples):
+            error_value: float = abs(float(level_downsample) - desired_downsample)
+            if error_value < best_error:
+                best_error = error_value
+                best_level = level_index
+
+        selected_downsample: float = float(level_downsamples[best_level])
+        if selected_downsample <= 0.0:
+            raise TissueSegmenterMetadataError(
+                f"Resolved non-positive downsample at level={best_level}: {selected_downsample}"
+            )
+
+        return best_level, selected_downsample, width_level0, height_level0
+
+    def _extract_scan_magnification(self, slide: object) -> Optional[float]:
+        """Extract scanning magnification from slide metadata when available."""
+        properties: Mapping[str, Any] = getattr(slide, "properties", {})
+        if not isinstance(properties, Mapping):
+            properties = {}
+
+        objective_keys: Tuple[str, ...] = (
+            "openslide.objective-power",
+            "openslide.objective_power",
+            "aperio.AppMag",
+            "objective_power",
+            "objective",
+        )
+        for key in objective_keys:
+            if key in properties:
+                value: Optional[float] = _safe_float(properties[key])
+                if value is not None and value > 0.0:
+                    return value
+
+        mpp_value: Optional[float] = self._extract_slide_mpp(slide)
+        if mpp_value is not None and mpp_value > 0.0:
+            inferred_mag: float = 10.0 / mpp_value
+            if math.isfinite(inferred_mag) and inferred_mag > 0.0:
+                return inferred_mag
+
+        return None
+
+    def _extract_slide_mpp(self, slide: object) -> Optional[float]:
+        """Extract level-0 MPP from slide metadata if present."""
+        properties: Mapping[str, Any] = getattr(slide, "properties", {})
+        if not isinstance(properties, Mapping):
+            return None
+
+        mpp_keys: Tuple[str, ...] = (
+            "openslide.mpp-x",
+            "openslide.mpp_x",
+            "aperio.MPP",
+            "mpp",
+            "mpp_x",
+        )
+        for key in mpp_keys:
+            if key in properties:
+                value: Optional[float] = _safe_float(properties[key])
+                if value is not None and value > 0.0:
+                    return value
+        return None
+
+    def _read_full_level_rgb(
+        self,
+        slide: object,
+        level: int,
+        downsample: float,
+        width_level0: int,
+        height_level0: int,
+    ) -> np.ndarray:
+        """Read full image at selected level as RGB uint8 array."""
+        level_dimensions_raw: Any = getattr(slide, "level_dimensions", None)
+        if isinstance(level_dimensions_raw, (list, tuple)) and len(level_dimensions_raw) > int(level):
+            level_width_raw, level_height_raw = level_dimensions_raw[int(level)]
+            width_level = max(1, int(level_width_raw))
+            height_level = max(1, int(level_height_raw))
+        else:
+            width_level = max(1, int(round(float(width_level0) / float(downsample))))
+            height_level = max(1, int(round(float(height_level0) / float(downsample))))
+
+        backend: Optional[str] = getattr(slide, "backend", None)
+        raw_object: Any = getattr(slide, "raw", None)
+        if backend is None or raw_object is None:
+            raise TissueSegmenterInferenceError(
+                "Slide handle must expose 'backend' and 'raw' attributes."
+            )
+
+        if str(backend).lower() == "openslide":
+            try:
+                region: Any = raw_object.read_region((0, 0), int(level), (int(width_level), int(height_level)))
+                if hasattr(region, "convert"):
+                    region = region.convert("RGB")
+                rgb_array: np.ndarray = np.asarray(region, dtype=np.uint8)
+            except Exception as exc:  # noqa: BLE001
+                raise TissueSegmenterInferenceError(
+                    f"Failed reading OpenSlide level {level} image: {exc}"
+                ) from exc
+        else:
+            try:
+                if hasattr(slide, "level_cache") and int(level) in slide.level_cache:
+                    level_array: np.ndarray = np.asarray(slide.level_cache[int(level)])
+                else:
+                    series_object: Any = raw_object.series[0]
+                    levels_raw: Any = getattr(series_object, "levels", [series_object])
+                    level_object: Any = levels_raw[int(level)]
+                    level_array = np.asarray(level_object.asarray())
+            except Exception as exc:  # noqa: BLE001
+                raise TissueSegmenterInferenceError(
+                    f"Failed reading tifffile level {level} image: {exc}"
+                ) from exc
+
+            if level_array.ndim == 2:
+                rgb_array = np.stack([level_array, level_array, level_array], axis=-1)
+            elif level_array.ndim == 3 and level_array.shape[2] >= 3:
+                rgb_array = level_array[:, :, :3]
+            else:
+                raise TissueSegmenterInferenceError(
+                    f"Unsupported tifffile level image shape: {level_array.shape}"
+                )
+            rgb_array = _to_uint8(rgb_array)
+
+        if rgb_array.ndim != 3 or rgb_array.shape[2] != 3:
+            raise TissueSegmenterInferenceError(
+                f"Expected RGB image [H, W, 3], got shape={rgb_array.shape}."
+            )
+
+        if rgb_array.dtype != np.uint8:
+            rgb_array = rgb_array.astype(np.uint8, copy=False)
+
+        return rgb_array
+
+    def _infer_with_fpn(self, rgb_image: np.ndarray) -> np.ndarray:
+        """Run FPN inference and return binary mask."""
+        if torch is None or torch_functional is None:
+            raise TissueSegmenterInferenceError("PyTorch is required for FPN inference.")
+        if self._model is None:
+            raise TissueSegmenterInferenceError("FPN model is not initialized.")
+
+        input_tensor: torch.Tensor = self._prepare_model_input(rgb_image)
+        original_height: int = int(rgb_image.shape[0])
+        original_width: int = int(rgb_image.shape[1])
+
+        if max(original_height, original_width) > DEFAULT_MAX_INFER_SIDE:
+            scale: float = float(DEFAULT_MAX_INFER_SIDE) / float(max(original_height, original_width))
+            resized_height: int = max(1, int(round(original_height * scale)))
+            resized_width: int = max(1, int(round(original_width * scale)))
+            input_tensor = torch_functional.interpolate(
+                input_tensor,
+                size=(resized_height, resized_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        with torch.inference_mode():
+            try:
+                logits: torch.Tensor = self._model(input_tensor)
+            except Exception as exc:  # noqa: BLE001
+                raise TissueSegmenterInferenceError(f"FPN forward pass failed: {exc}") from exc
+
+            if logits.ndim != 4 or logits.shape[1] != 1:
+                raise TissueSegmenterInferenceError(
+                    f"Unexpected segmentation logits shape: {tuple(logits.shape)}"
+                )
+
+            probabilities: torch.Tensor = torch.sigmoid(logits)
+            if probabilities.shape[-2:] != (original_height, original_width):
+                probabilities = torch_functional.interpolate(
+                    probabilities,
+                    size=(original_height, original_width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+            mask_float: np.ndarray = probabilities[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+
+        binary_mask: np.ndarray = (mask_float >= 0.5).astype(np.uint8)
+        return binary_mask
+
+    def _prepare_model_input(self, rgb_image: np.ndarray) -> Any:
+        """Prepare normalized model input tensor [1, 3, H, W]."""
+        if torch is None:
+            raise TissueSegmenterInferenceError("PyTorch is required for model preprocessing.")
+
+        rgb_float: np.ndarray = rgb_image.astype(np.float32) / 255.0
+        mean: np.ndarray = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
+        std: np.ndarray = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
+        normalized: np.ndarray = (rgb_float - mean.reshape(1, 1, 3)) / std.reshape(1, 1, 3)
+
+        chw: np.ndarray = np.transpose(normalized, (2, 0, 1))
+        tensor: torch.Tensor = torch.from_numpy(chw).unsqueeze(0).to(self._device)
+        return tensor
+
+    def _infer_with_fallback(self, rgb_image: np.ndarray) -> np.ndarray:
+        """Deterministic non-learning fallback tissue detector.
+
+        Strategy:
+        - Compute grayscale intensity and HSV-like saturation proxy.
+        - Otsu threshold each signal.
+        - Mark tissue where image is darker than gray threshold OR more saturated than
+          saturation threshold.
+        """
+        rgb_float: np.ndarray = rgb_image.astype(np.float32) / 255.0
+        red_channel: np.ndarray = rgb_float[:, :, 0]
+        green_channel: np.ndarray = rgb_float[:, :, 1]
+        blue_channel: np.ndarray = rgb_float[:, :, 2]
+
+        grayscale: np.ndarray = (
+            0.2989 * red_channel + 0.5870 * green_channel + 0.1140 * blue_channel
+        ).astype(np.float32, copy=False)
+
+        max_channel: np.ndarray = np.max(rgb_float, axis=2)
+        min_channel: np.ndarray = np.min(rgb_float, axis=2)
+        saturation: np.ndarray = np.divide(
+            max_channel - min_channel,
+            np.maximum(max_channel, DEFAULT_EPS),
+        ).astype(np.float32, copy=False)
+
+        gray_threshold: float = _otsu_threshold(grayscale)
+        saturation_threshold: float = _otsu_threshold(saturation)
+
+        dark_region_mask: np.ndarray = grayscale < gray_threshold
+        colorful_region_mask: np.ndarray = saturation > saturation_threshold
+
+        tissue_mask: np.ndarray = np.logical_or(dark_region_mask, colorful_region_mask)
+        return tissue_mask.astype(np.uint8)
+
+    def _coerce_mask_array(self, mask: object) -> np.ndarray:
+        """Coerce input mask object to binary uint8 ndarray."""
+        mask_array: np.ndarray = np.asarray(mask)
+        if mask_array.ndim != 2:
+            raise TissueSegmenterInferenceError(
+                f"Mask must be 2D. Got shape={mask_array.shape}."
+            )
+        if mask_array.size == 0:
+            raise TissueSegmenterInferenceError("Mask cannot be empty.")
+
+        if mask_array.dtype == np.bool_:
+            return mask_array.astype(np.uint8)
+
+        if np.issubdtype(mask_array.dtype, np.floating):
+            finite_array: np.ndarray = np.nan_to_num(mask_array.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            return (finite_array > 0.5).astype(np.uint8)
+
+        if np.issubdtype(mask_array.dtype, np.integer):
+            return (mask_array > 0).astype(np.uint8)
+
+        raise TissueSegmenterInferenceError(
+            f"Unsupported mask dtype: {mask_array.dtype}."
+        )
+
+    def _postprocess_binary_mask(self, binary_mask: np.ndarray) -> np.ndarray:
+        """Apply deterministic morphological cleanup to a binary mask."""
+        mask_bool: np.ndarray = binary_mask.astype(bool, copy=False)
+
+        mask_bool = ndimage.binary_opening(mask_bool, iterations=DEFAULT_BINARY_OPEN_ITERS)
+        mask_bool = ndimage.binary_closing(mask_bool, iterations=DEFAULT_BINARY_CLOSE_ITERS)
+        mask_bool = ndimage.binary_fill_holes(mask_bool)
+
+        labeled_mask, component_count = ndimage.label(mask_bool)
+        if component_count <= 0:
+            return np.zeros_like(binary_mask, dtype=np.uint8)
+
+        area_threshold: int = max(
+            DEFAULT_MIN_COMPONENT_AREA_PIXELS,
+            int(round(float(mask_bool.size) * DEFAULT_MIN_COMPONENT_AREA_RATIO)),
+        )
+
+        component_sizes: np.ndarray = np.bincount(labeled_mask.ravel())
+        keep_component_mask: np.ndarray = component_sizes >= area_threshold
+        keep_component_mask[0] = False
+
+        cleaned_mask: np.ndarray = keep_component_mask[labeled_mask]
+
+        if not np.any(cleaned_mask):
+            largest_component_index: int = int(np.argmax(component_sizes[1:]) + 1)
+            cleaned_mask = labeled_mask == largest_component_index
+
+        return cleaned_mask.astype(np.uint8)
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Best-effort float parser with finite check."""
+    try:
+        parsed_value: float = float(str(value).strip())
+    except Exception:  # noqa: BLE001
+        return None
+    if not math.isfinite(parsed_value):
+        return None
+    return parsed_value
+
+
+def _otsu_threshold(image: np.ndarray) -> float:
+    """Compute Otsu threshold for a float image in [0, 1] range."""
+    flattened: np.ndarray = np.asarray(image, dtype=np.float32).ravel()
+    if flattened.size == 0:
+        return 0.5
+
+    flattened = np.clip(flattened, 0.0, 1.0)
+    histogram, bin_edges = np.histogram(flattened, bins=256, range=(0.0, 1.0))
+    histogram = histogram.astype(np.float64, copy=False)
+
+    total_count: float = float(np.sum(histogram))
+    if total_count <= 0.0:
+        return 0.5
+
+    probability: np.ndarray = histogram / total_count
+    cumulative_probability: np.ndarray = np.cumsum(probability)
+    cumulative_mean: np.ndarray = np.cumsum(probability * np.arange(256, dtype=np.float64))
+
+    global_mean: float = float(cumulative_mean[-1])
+
+    numerator: np.ndarray = (global_mean * cumulative_probability - cumulative_mean) ** 2
+    denominator: np.ndarray = cumulative_probability * (1.0 - cumulative_probability)
+
+    valid_mask: np.ndarray = denominator > 0.0
+    between_class_variance: np.ndarray = np.zeros_like(numerator)
+    between_class_variance[valid_mask] = numerator[valid_mask] / denominator[valid_mask]
+
+    best_index: int = int(np.argmax(between_class_variance))
+    threshold: float = float(bin_edges[min(best_index + 1, len(bin_edges) - 1)])
+    return threshold
+
+
+def _to_uint8(array: np.ndarray) -> np.ndarray:
+    """Convert numeric array to uint8 deterministically."""
+    if array.dtype == np.uint8:
+        return array
+
+    if np.issubdtype(array.dtype, np.integer):
+        return np.clip(array, 0, 255).astype(np.uint8)
+
+    float_array: np.ndarray = np.asarray(array, dtype=np.float32)
+    float_array = np.nan_to_num(float_array, nan=0.0, posinf=0.0, neginf=0.0)
+
+    min_value: float = float(np.min(float_array))
+    max_value: float = float(np.max(float_array))
+
+    if max_value <= min_value:
+        return np.zeros_like(float_array, dtype=np.uint8)
+
+    normalized: np.ndarray = (float_array - min_value) / (max_value - min_value)
+    return np.rint(np.clip(normalized, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+__all__ = [
+    "DEFAULT_TARGET_MAGNIFICATION",
+    "DEFAULT_PATCH_SIZE",
+    "DEFAULT_SEGMENTER_METHOD",
+    "TissueSegmenterError",
+    "TissueSegmenterInitError",
+    "TissueSegmenterInferenceError",
+    "TissueSegmenterMetadataError",
+    "TissueSegmenter",
+]

@@ -1,0 +1,149 @@
+----------------------------------------
+[Required packages]
+- torch==2.3.0
+- torchvision==0.18.0
+- pytorch-lightning==2.3.3
+- hydra-core==1.3.2
+- omegaconf==2.3.0
+- timm==1.0.7
+- open-clip-torch==2.24.0
+- openslide-python==1.3.1
+- h5py==3.11.0
+- numpy==1.26.4
+- pandas==2.2.2
+- polars==1.4.1
+- pyarrow==17.0.0
+- scikit-learn==1.5.1
+- scikit-survival==0.23.0
+- scipy==1.13.1
+- statsmodels==0.14.2
+- lifelines==0.29.0
+- segmentation-models-pytorch==0.3.3
+- monai==1.3.2
+- opencv-python-headless==4.10.0.84
+- einops==0.8.0
+- matplotlib==3.9.1
+- seaborn==0.13.2
+- wandb==0.17.6
+- mlflow==2.14.3
+- PyYAML==6.0.2
+- jsonschema==4.23.0
+- tqdm==4.66.5
+- rich==13.7.1
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['configs/default.yaml', 'Top-level runtime config; imports data/model/train/eval sub-configs. All modules should read paths and switches from here via Hydra/OmegaConf.']
+- ['configs/data/pretrain_public.yaml', 'Defines pretraining manifests, cohort filters (TCGA/GTEx public), modality availability (RNA/DNA), and I/O roots. Used by manifest_store.py and datamodules.py.']
+- ['configs/data/downstream_public.yaml', 'Defines downstream tasks, split strategy (official/CV/MC), patient grouping keys, and metric mapping. Consumed by split_manager.py and run_eval.py.']
+- ['configs/model/threads.yaml', 'Single source of model hyperparameters (dims, heads, dropout, temperature). Imported by threads_model.py, slide_encoder_threads.py, and losses.py.']
+- ['configs/train/pretrain.yaml', 'Pretraining optimizer/scheduler/DDP/precision settings; used by pretrain_module.py and checkpointing.py.']
+- ['configs/train/finetune.yaml', 'Finetuning recipe for THREADS/ABMIL-style training; used by finetune_module.py.']
+- ['configs/eval/linear_probe.yaml', 'Fixed linear probe settings (C=0.5, lbfgs, max_iter=10000); used by linear_probe.py.']
+- ['configs/eval/survival.yaml', 'CoxNet alpha defaults and task-specific overrides; used by survival_eval.py.']
+- ['src/core/config.py', 'Hydra/OmegaConf loader and validation layer. Exposes typed getters used by all pipelines; must run before object construction.']
+- ['src/core/registry.py', 'Factory registry for encoders/models/evaluators by string key from config. Decouples CLI from concrete class imports.']
+- ['src/core/logging_utils.py', 'Unified logging, run IDs, artifact paths, W&B/MLflow hooks. Imported by all run_*.py pipelines.']
+- ['src/utils/seeding.py', 'Global seed setup for Python/NumPy/Torch/DDP determinism. Must execute at start of main.py and each pipeline.']
+- ['src/utils/io.py', 'Reusable file I/O helpers for parquet/json/yaml/h5; shared by manifest_store.py, embedding_export.py, stats_tests.py.']
+- ['src/utils/metrics.py', 'Central metric helpers (AUC, balanced accuracy, QWK, c-index wrappers). Imported by linear_probe.py, survival_eval.py, prompting_eval.py.']
+- ['src/data/manifest_schema.py', 'Dataclass/pydantic schema for sample-level metadata. Dependency root for all data modules to keep field names consistent.']
+- ['src/data/manifest_store.py', 'Loads/saves filtered manifests from schema; provides cohort/task queries. Used by preprocessing, training, embedding, evaluation pipelines.']
+- ['src/data/split_manager.py', 'Implements official split loading, patient-stratified CV/MC, few-shot derivation. Depends on manifest schema and utils/seeding.']
+- ['src/data/wsi_reader.py', 'OpenSlide adapter for reading magnification-aware regions and metadata. Required by patch_tiler.py and tissue_segmenter.py.']
+- ['src/data/tissue_segmenter.py', 'Tissue/background segmentation wrapper (SMP/MONAI model). Takes WSI handle from wsi_reader.py and outputs masks for patch extraction.']
+- ['src/data/patch_tiler.py', 'Computes non-overlapping 512x512@20x coords on tissue regions and extracts patches. Depends on wsi_reader.py + tissue masks.']
+- ['src/data/feature_store.py', 'Persistent patch feature storage (HDF5/Parquet + coords + metadata). Producer: run_preprocess.py, consumer: datamodules.py and embedding_export.py.']
+- ['src/data/datamodules.py', 'PyTorch Lightning DataModules for pretraining/finetuning/eval. Reads manifests, splits, feature_store and emits modality-aligned batches.']
+- ['src/models/patch_encoder.py', 'Abstract interface for patch feature extractors and concrete adapter contract (encode(), feature_dim()). Used by preprocessing and optional online encoding.']
+- ['src/models/slide_encoder_threads.py', 'THREADS slide encoder (gated ABMIL, multi-head concat/project, output 1024). Depends on torch/einops; used by threads_model.py and finetune_module.py.']
+- ['src/models/rna_encoder_scgpt.py', 'scGPT wrapper with projection head to 1024. Exposes forward for gene IDs + expression values. Used only in multimodal pretraining/prompt construction.']
+- ['src/models/dna_encoder_mlp.py', 'DNA multi-hot MLP encoder (input 1673 -> 1024). Used in pretraining batches with mutation/CNV data.']
+- ['src/models/losses.py', 'Contrastive loss implementations (InfoNCE, optional bidirectional). Used by threads_model.py and validated in pretrain_module.py.']
+- ['src/models/threads_model.py', 'Composes slide + RNA + DNA branches and computes pretraining loss; exports slide embeddings. Central model object for pretraining and embedding stages.']
+- ['src/train/callbacks_rankme.py', 'RankMe checkpoint criterion callback computed after warmup. Depends on embedding snapshots from pretrain module.']
+- ['src/train/checkpointing.py', 'Checkpoint naming/versioning, best-rank persistence, resume logic. Used by run_pretrain.py and run_finetune-like flow.']
+- ['src/train/pretrain_module.py', 'LightningModule for multimodal pretraining; configures AdamW + warmup/cosine scheduler; logs contrastive/rank metrics.']
+- ['src/train/finetune_module.py', 'LightningModule for downstream supervised tuning on slide embeddings with task-specific heads/losses.']
+- ['src/eval/embedding_export.py', 'Loads model checkpoint + patch features and emits slide/patient embeddings for all tasks. Dependency bridge between training and classical evaluators.']
+- ['src/eval/linear_probe.py', 'Sklearn logistic regression training/evaluation with fixed params and metric routing. Depends on split_manager.py + utils/metrics.py.']
+- ['src/eval/survival_eval.py', 'CoxNet evaluation pipeline with alpha defaults/overrides and c-index calculation. Depends on scikit-survival + split_manager.py.']
+- ['src/eval/retrieval_eval.py', 'L2 nearest-neighbor retrieval and mAP@1/5/10. Consumes exported embeddings and labels.']
+- ['src/eval/prompting_eval.py', 'Molecular prompting logic: build class prototypes from molecular embeddings, classify by nearest prompt, compute risk-score prompts.']
+- ['src/eval/stats_tests.py', 'ANOVA, Tukey HSD, mixed-effects, bootstrap CI utilities. Runs after metric aggregation to reproduce statistical claims.']
+- ['src/pipelines/run_preprocess.py', 'Orchestrates WSI -> mask -> patches -> patch embeddings -> feature store. Depends on data + patch_encoder + logging_utils.']
+- ['src/pipelines/run_pretrain.py', 'Orchestrates datamodule + threads model + pretrain module + rankme callback + checkpointing.']
+- ['src/pipelines/run_embed.py', 'Orchestrates checkpoint loading and embedding export for slide/patient-level artifacts.']
+- ['src/pipelines/run_eval.py', 'Runs linear probe/survival/retrieval/prompting/stat-tests from exported embeddings and split specs.']
+- ['main.py', 'CLI entrypoint: load config, seed, dispatch to pipeline stage. Imports only core config/logging and run_* modules.']
+- ['tests/test_split_manager.py', 'Unit tests for patient-stratified split correctness, leakage checks, and few-shot derivation consistency.']
+- ['tests/test_slide_encoder_shapes.py', 'Unit tests for single/multi-head slide encoder tensor shapes, masks, and output dimension invariants.']
+- ['tests/test_linear_probe_pipeline.py', 'Smoke tests that exported embeddings + splits produce valid metrics and deterministic results with fixed seeds.']
+- ['README.md', 'Execution order, environment setup, data assumptions, reproduction tiers (public-only vs full), and known limitations.']
+
+----------------------------------------
+[Task list]
+- README.md
+- configs/default.yaml
+- configs/data/pretrain_public.yaml
+- configs/data/downstream_public.yaml
+- configs/model/threads.yaml
+- configs/train/pretrain.yaml
+- configs/train/finetune.yaml
+- configs/eval/linear_probe.yaml
+- configs/eval/survival.yaml
+- src/core/config.py
+- src/core/registry.py
+- src/core/logging_utils.py
+- src/utils/seeding.py
+- src/utils/io.py
+- src/utils/metrics.py
+- src/data/manifest_schema.py
+- src/data/manifest_store.py
+- src/data/split_manager.py
+- src/data/wsi_reader.py
+- src/data/tissue_segmenter.py
+- src/data/patch_tiler.py
+- src/data/feature_store.py
+- src/models/patch_encoder.py
+- src/data/datamodules.py
+- src/models/slide_encoder_threads.py
+- src/models/rna_encoder_scgpt.py
+- src/models/dna_encoder_mlp.py
+- src/models/losses.py
+- src/models/threads_model.py
+- src/train/callbacks_rankme.py
+- src/train/checkpointing.py
+- src/train/pretrain_module.py
+- src/train/finetune_module.py
+- src/eval/embedding_export.py
+- src/eval/linear_probe.py
+- src/eval/survival_eval.py
+- src/eval/retrieval_eval.py
+- src/eval/prompting_eval.py
+- src/eval/stats_tests.py
+- src/pipelines/run_preprocess.py
+- src/pipelines/run_pretrain.py
+- src/pipelines/run_embed.py
+- src/pipelines/run_eval.py
+- main.py
+- tests/test_split_manager.py
+- tests/test_slide_encoder_shapes.py
+- tests/test_linear_probe_pipeline.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+Global constants shared across modules: embedding_dim=1024, patch_size=512, target_magnification=20, linear_probe defaults (C=0.5/lbfgs/max_iter=10000), survival defaults (alpha OS=0.07, PFS=0.01 with task-specific overrides), and seed handling. Shared contracts: ManifestRecord schema keys, split JSON schema (train_ids/test_ids/fold_id/task_name), feature store schema (sample_id, coords, features, encoder_name, precision), and metrics output schema (task, fold, metric_name, value, ci_low, ci_high, model_name). All pipelines must use the same patient aggregation rule (union patches for THREADS-style patient embedding) and the same logging artifact layout (runs/{date}/{stage}/{run_id}).
+
+----------------------------------------
+[Anything UNCLEAR]
+Still unclear: exact missing hyperparameters from partially unreadable extended tables (some AdamW/scheduler details), exact contrastive loss formulation details (temperature use and weighting), exact RankMe save rule details, and availability/licensing of private datasets (MGH/BWH/internal cohorts) required for full 54-task parity. Need explicit decision on public-only reproduction scope vs private-data extension.
+

@@ -1,0 +1,13 @@
+Implemented the requested logic analysis in `src/data/manifest_schema.py`.
+
+It now documents, in a paper/config-aligned way:
+
+- Canonical `ManifestRecord` fields and meanings.
+- Required vs conditional field rules (`rna_path`/`dna_path`).
+- Patient-level aggregation invariant (union of patches across WSIs).
+- Split/leakage guarantees tied to `sample_id`/`patient_id`.
+- Task-label semantics and metric routing alignment.
+- Public-only vs full-private compatibility without changing schema keys.
+- Validation policy and implementation guardrails for later coding.
+
+No executable schema code was added yet, per your instruction.

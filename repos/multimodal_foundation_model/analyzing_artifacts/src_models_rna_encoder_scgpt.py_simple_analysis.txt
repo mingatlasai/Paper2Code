@@ -1,0 +1,12 @@
+Implemented the requested logic analysis in `src/models/rna_encoder_scgpt.py`.
+
+It is now a structured, paper-aligned blueprint (no executable code) covering:
+- Exact required interface from the design:
+  - `ScGPTRNAEncoder.__init__(ckpt_path: str, out_dim: int, trainable: bool)`
+  - `ScGPTRNAEncoder.forward(gene_ids, expr_vals, gene_mask)`
+- Config-bound constraints from `config.yaml` only (12 layers, 8 heads, 1024 output).
+- Input/output contracts, masking rules, trainable/frozen behavior, and fail-fast validation.
+- Integration points with `src/models/threads_model.py` and `src/eval/prompting_eval.py`.
+- Reproducibility requirements and coding-phase test checklist.
+
+File: `src/models/rna_encoder_scgpt.py`

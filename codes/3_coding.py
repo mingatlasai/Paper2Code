@@ -17,6 +17,7 @@ parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
 parser.add_argument('--output_dir',type=str, default="")
 parser.add_argument('--output_repo_dir',type=str, default="")
+parser.add_argument('--resume', action='store_true')
 
 args    = parser.parse_args()
 paper_name = args.paper_name
@@ -162,6 +163,17 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     if todo_file_name == "config.yaml":
         continue
 
+    repo_file_path = os.path.join(output_repo_dir, todo_file_name)
+    save_todo_file_name = todo_file_name.replace("/", "_")
+    artifact_path = os.path.join(artifact_output_dir, f"{save_todo_file_name}_coding.txt")
+    if args.resume and os.path.exists(repo_file_path) and os.path.exists(artifact_path):
+        with open(repo_file_path, "r", encoding="utf-8") as f:
+            done_file_dict[todo_file_name] = f.read()
+        if todo_file_name not in done_file_lst:
+            done_file_lst.append(todo_file_name)
+        print(f"[RESUME] Skip completed coding: {todo_file_name}")
+        continue
+
     instruction_msg = get_write_msg(todo_file_name, detailed_logic_analysis_dict[todo_file_name], done_file_lst)
     trajectories.extend(instruction_msg)
 
@@ -178,13 +190,10 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     # save
     # save_dir_name = f"{paper_name}_repo"
     os.makedirs(f'{output_repo_dir}', exist_ok=True)
-    save_todo_file_name = todo_file_name.replace("/", "_")
-
-
     print_response(completion_json)
 
     # save artifacts
-    with open(f'{artifact_output_dir}/{save_todo_file_name}_coding.txt', 'w') as f:
+    with open(artifact_path, 'w') as f:
         f.write(completion_json['choices'][0]['message']['content'])
 
 

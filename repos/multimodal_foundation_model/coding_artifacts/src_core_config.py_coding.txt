@@ -1,0 +1,606 @@
+## Code: src/core/config.py
+```python
+"""Core configuration loading and validation for THREADS reproduction.
+
+This module provides a single typed entry point (`ExperimentConfig`) to load,
+validate, and serialize project configuration.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, Optional
+
+from hydra import compose, initialize_config_dir
+from omegaconf import DictConfig, OmegaConf
+
+
+class ConfigError(Exception):
+    """Base exception for configuration-related failures."""
+
+
+class ConfigLoadError(ConfigError):
+    """Raised when configuration loading/composition fails."""
+
+
+class ConfigValidationError(ConfigError):
+    """Raised when configuration values fail validation."""
+
+
+class ConfigInvariantError(ConfigValidationError):
+    """Raised when paper-locked invariants are violated."""
+
+
+class ConfigStageError(ConfigValidationError):
+    """Raised when runtime stage resolution fails."""
+
+
+_ALLOWED_STAGES = ("preprocess", "pretrain", "embed", "eval")
+_DEFAULT_PROJECT_NAME = "threads_reproduction"
+_DEFAULT_STAGE = "preprocess"
+_DEFAULT_SEED = 42
+
+
+@dataclass(slots=True)
+class ExperimentConfig:
+    """Resolved experiment configuration.
+
+    Attributes:
+        project_name: Project identifier.
+        seed: Global deterministic seed.
+        stage: Canonical runtime stage.
+    """
+
+    project_name: str = _DEFAULT_PROJECT_NAME
+    seed: int = _DEFAULT_SEED
+    stage: str = _DEFAULT_STAGE
+    _raw_cfg: Optional[DictConfig] = field(default=None, repr=False)
+    _resolved_cfg: Dict[str, Any] = field(default_factory=dict, repr=False)
+    _config_path: str = field(default="", repr=False)
+    _validated: bool = field(default=False, repr=False)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> "ExperimentConfig":
+        """Create an ExperimentConfig from a YAML config path.
+
+        Args:
+            path: Path to the root YAML config (typically configs/default.yaml).
+
+        Returns:
+            A validated ExperimentConfig instance.
+
+        Raises:
+            ConfigLoadError: If the file cannot be loaded/composed.
+            ConfigStageError: If stage resolution fails.
+            ConfigValidationError: If validation fails.
+        """
+        config_path_obj: Path = Path(path).expanduser().resolve()
+        if not config_path_obj.exists() or not config_path_obj.is_file():
+            raise ConfigLoadError(
+                f"Config file does not exist or is not a file: {config_path_obj}"
+            )
+
+        cfg: DictConfig = cls._load_with_hydra_or_plain_yaml(config_path_obj)
+
+        project_name: str = cls._as_str(
+            cls._get_nested(cfg, ("project", "name"), _DEFAULT_PROJECT_NAME),
+            key_path="project.name",
+        )
+        seed: int = cls._resolve_seed(cfg)
+        stage: str = cls._normalize_stage(cfg)
+
+        resolved_cfg: Dict[str, Any] = cls._to_plain_dict(cfg)
+        instance = cls(
+            project_name=project_name,
+            seed=seed,
+            stage=stage,
+            _raw_cfg=cfg,
+            _resolved_cfg=resolved_cfg,
+            _config_path=str(config_path_obj),
+            _validated=False,
+        )
+        instance.validate()
+        return instance
+
+    def validate(self) -> None:
+        """Validate loaded configuration against design and paper constraints.
+
+        Raises:
+            ConfigValidationError: For missing sections, bad types, or invalid values.
+            ConfigInvariantError: For paper-locked constant mismatches.
+        """
+        if self._raw_cfg is None:
+            raise ConfigValidationError("Configuration is not loaded.")
+
+        cfg: DictConfig = self._raw_cfg
+        self._validate_required_top_level_sections(cfg)
+        self._validate_stage(cfg)
+        self._validate_types(cfg)
+        self._validate_paper_invariants(cfg)
+        self._validate_shared_contracts(cfg)
+        self._validate_stage_specific_required_values(cfg)
+
+        self._validated = True
+        self._resolved_cfg = self._to_plain_dict(cfg)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return resolved configuration as a JSON/YAML-serializable mapping.
+
+        Returns:
+            Fully resolved configuration dictionary.
+
+        Raises:
+            ConfigValidationError: If called before validation.
+        """
+        if not self._validated:
+            raise ConfigValidationError(
+                "Configuration has not been validated. Call validate() first."
+            )
+        return dict(self._resolved_cfg)
+
+    @staticmethod
+    def _load_with_hydra_or_plain_yaml(config_path_obj: Path) -> DictConfig:
+        """Load configuration via Hydra compose, with plain YAML fallback."""
+        config_dir: str = str(config_path_obj.parent)
+        config_name: str = config_path_obj.stem
+
+        hydra_error: Optional[Exception] = None
+        try:
+            with initialize_config_dir(config_dir=config_dir, version_base=None):
+                cfg = compose(config_name=config_name)
+            if not isinstance(cfg, DictConfig):
+                raise ConfigLoadError("Hydra compose did not return DictConfig.")
+            return cfg
+        except Exception as exc:  # noqa: BLE001 - preserves original cause.
+            hydra_error = exc
+
+        try:
+            cfg = OmegaConf.load(config_path_obj)
+            if not isinstance(cfg, DictConfig):
+                raise ConfigLoadError("OmegaConf.load did not return DictConfig.")
+            return cfg
+        except Exception as exc:  # noqa: BLE001 - preserves original cause.
+            raise ConfigLoadError(
+                "Failed to load configuration with both Hydra compose and "
+                f"plain YAML loading: {config_path_obj}"
+            ) from exc if hydra_error is None else hydra_error
+
+    @classmethod
+    def _normalize_stage(cls, cfg: DictConfig) -> str:
+        """Normalize runtime stage aliasing and validate allowed stage values."""
+        runtime_stage_raw: Any = cls._get_nested(cfg, ("runtime", "stage"), None)
+        runtime_mode_raw: Any = cls._get_nested(cfg, ("runtime", "mode"), None)
+
+        runtime_stage: Optional[str] = (
+            cls._as_optional_str(runtime_stage_raw) if runtime_stage_raw is not None else None
+        )
+        runtime_mode: Optional[str] = (
+            cls._as_optional_str(runtime_mode_raw) if runtime_mode_raw is not None else None
+        )
+
+        if runtime_stage and runtime_mode and runtime_stage != runtime_mode:
+            raise ConfigStageError(
+                "Stage mismatch between runtime.stage and runtime.mode: "
+                f"{runtime_stage!r} vs {runtime_mode!r}."
+            )
+
+        chosen: str = runtime_stage or runtime_mode or _DEFAULT_STAGE
+        chosen = chosen.strip().lower()
+        if chosen not in _ALLOWED_STAGES:
+            raise ConfigStageError(
+                f"Unsupported stage {chosen!r}. Allowed: {_ALLOWED_STAGES}."
+            )
+        return chosen
+
+    @classmethod
+    def _resolve_seed(cls, cfg: DictConfig) -> int:
+        """Resolve a deterministic seed from known config locations."""
+        candidates: Iterable[tuple[tuple[str, ...], int]] = (
+            (("runtime", "seed"), _DEFAULT_SEED),
+            (("train_pretrain", "pretrain", "training", "seed"), _DEFAULT_SEED),
+            (("pretraining", "training", "seed"), _DEFAULT_SEED),
+            (("train_finetune", "finetune", "reproducibility", "seed"), _DEFAULT_SEED),
+            (("downstream_public", "downstream_public", "split_policy", "seed"), _DEFAULT_SEED),
+        )
+        for key_path, fallback in candidates:
+            raw_value: Any = cls._get_nested(cfg, key_path, None)
+            if raw_value is not None:
+                return cls._as_int(raw_value, key_path=".".join(key_path), default=fallback)
+        return _DEFAULT_SEED
+
+    def _validate_required_top_level_sections(self, cfg: DictConfig) -> None:
+        required_sections: tuple[str, ...] = (
+            "project",
+            "environment",
+            "runtime",
+            "preprocessing",
+            "model",
+            "pretraining",
+            "embedding_extraction",
+            "linear_probe",
+            "finetuning_threads",
+            "baselines",
+            "evaluation",
+        )
+        for section in required_sections:
+            if self._get_nested(cfg, (section,), None) is None:
+                raise ConfigValidationError(
+                    f"Missing required top-level section: {section!r} "
+                    f"(config: {self._config_path})."
+                )
+
+    def _validate_stage(self, cfg: DictConfig) -> None:
+        normalized_stage: str = self._normalize_stage(cfg)
+        if normalized_stage != self.stage:
+            self.stage = normalized_stage
+
+    def _validate_types(self, cfg: DictConfig) -> None:
+        _ = self._as_str(
+            self._get_nested(cfg, ("project", "name"), _DEFAULT_PROJECT_NAME),
+            key_path="project.name",
+        )
+        _ = self._as_str(
+            self._get_nested(cfg, ("project", "paper"), ""),
+            key_path="project.paper",
+        )
+        _ = self._as_str(
+            self._get_nested(cfg, ("environment", "python_version"), "3.10.12"),
+            key_path="environment.python_version",
+        )
+        _ = self._as_int(
+            self._get_nested(cfg, ("preprocessing", "patch_size"), 512),
+            key_path="preprocessing.patch_size",
+            default=512,
+        )
+        _ = self._as_int(
+            self._get_nested(cfg, ("model", "slide_embedding_dim"), 1024),
+            key_path="model.slide_embedding_dim",
+            default=1024,
+        )
+        _ = self._as_float(
+            self._get_nested(cfg, ("linear_probe", "classification", "C"), 0.5),
+            key_path="linear_probe.classification.C",
+            default=0.5,
+        )
+        _ = self._as_int(
+            self._get_nested(cfg, ("linear_probe", "classification", "max_iter"), 10000),
+            key_path="linear_probe.classification.max_iter",
+            default=10000,
+        )
+        _ = self._as_int(
+            self._get_nested(cfg, ("linear_probe", "survival", "max_iter"), 10000),
+            key_path="linear_probe.survival.max_iter",
+            default=10000,
+        )
+
+    def _validate_paper_invariants(self, cfg: DictConfig) -> None:
+        # Preprocessing invariants.
+        self._expect_equal(cfg, ("preprocessing", "target_magnification"), "20x")
+        self._expect_equal(cfg, ("preprocessing", "patch_size"), 512)
+        self._expect_equal(cfg, ("preprocessing", "patch_stride"), 512)
+        self._expect_equal(cfg, ("preprocessing", "overlap"), 0)
+        self._expect_equal(cfg, ("preprocessing", "patch_encoder_input_resize"), 448)
+
+        # Model invariants.
+        self._expect_equal(cfg, ("model", "slide_embedding_dim"), 1024)
+        self._expect_equal(cfg, ("model", "slide_encoder", "type"), "ABMIL gated attention")
+        self._expect_equal(cfg, ("model", "slide_encoder", "attention_heads_main"), 2)
+        self._expect_equal(cfg, ("model", "rna_encoder", "projection_out_dim"), 1024)
+        self._expect_equal(cfg, ("model", "dna_encoder", "input_dim"), 1673)
+        self._expect_equal(cfg, ("model", "dna_encoder", "output_dim"), 1024)
+        self._expect_equal(cfg, ("model", "dna_encoder", "dropout"), 0.2)
+
+        # Pretraining invariants.
+        self._expect_equal(cfg, ("pretraining", "optimizer", "name"), "AdamW")
+        self._expect_float_close(cfg, ("pretraining", "optimizer", "learning_rate"), 1.0e-5)
+        self._expect_equal(cfg, ("pretraining", "scheduler", "warmup_epochs"), 5)
+        self._expect_float_close(cfg, ("pretraining", "scheduler", "peak_lr"), 1.0e-5)
+        self._expect_equal(cfg, ("pretraining", "training", "batch_size_per_gpu"), 300)
+        self._expect_equal(cfg, ("pretraining", "training", "max_epochs"), 101)
+        self._expect_float_close(cfg, ("pretraining", "training", "rankme_eps"), 1.0e-7)
+
+        # Embedding extraction invariants.
+        self._expect_equal(
+            cfg,
+            ("embedding_extraction", "patient_level", "aggregation"),
+            "union of patches across all WSIs for a patient",
+        )
+
+        # Linear probe invariants.
+        self._expect_equal(
+            cfg,
+            ("linear_probe", "classification", "model"),
+            "LogisticRegression (scikit-learn)",
+        )
+        self._expect_float_close(cfg, ("linear_probe", "classification", "C"), 0.5)
+        self._expect_equal(cfg, ("linear_probe", "classification", "solver"), "lbfgs")
+        self._expect_equal(cfg, ("linear_probe", "classification", "max_iter"), 10000)
+        self._expect_equal(cfg, ("linear_probe", "classification", "class_weight"), "balanced")
+        self._expect_equal(
+            cfg,
+            ("linear_probe", "classification", "hyperparameter_search"),
+            False,
+        )
+
+        self._expect_equal(cfg, ("linear_probe", "survival", "model"), "CoxNet (sksurv)")
+        self._expect_equal(cfg, ("linear_probe", "survival", "max_iter"), 10000)
+        self._expect_float_close(
+            cfg,
+            ("linear_probe", "survival", "alpha", "overall_survival"),
+            0.07,
+        )
+        self._expect_float_close(
+            cfg,
+            ("linear_probe", "survival", "alpha", "progression_free_survival"),
+            0.01,
+        )
+        self._validate_alpha_exceptions(cfg)
+
+        # Finetuning THREADS invariants.
+        self._expect_equal(cfg, ("finetuning_threads", "optimizer", "name"), "AdamW")
+        self._expect_float_close(
+            cfg,
+            ("finetuning_threads", "optimizer", "learning_rate"),
+            2.5e-5,
+        )
+        self._expect_float_close(
+            cfg,
+            ("finetuning_threads", "optimizer", "weight_decay"),
+            0.0,
+        )
+        self._expect_equal(
+            cfg,
+            ("finetuning_threads", "optimizer", "layerwise_lr_decay"),
+            False,
+        )
+        self._expect_equal(
+            cfg,
+            ("finetuning_threads", "optimizer", "gradient_accumulation"),
+            False,
+        )
+        self._expect_equal(cfg, ("finetuning_threads", "training", "epochs"), 5)
+        self._expect_equal(cfg, ("finetuning_threads", "training", "batch_size"), 1)
+        self._expect_equal(
+            cfg,
+            ("finetuning_threads", "training", "patches_per_batch"),
+            2048,
+        )
+        self._expect_equal(
+            cfg,
+            ("finetuning_threads", "training", "early_stopping"),
+            False,
+        )
+
+    def _validate_shared_contracts(self, cfg: DictConfig) -> None:
+        # Optional cross-checks against composed configs, only when those keys exist.
+        if self._get_nested(cfg, ("model_threads", "model", "slide_embedding_dim"), None) is not None:
+            self._expect_equal(cfg, ("model_threads", "model", "slide_embedding_dim"), 1024)
+
+        if (
+            self._get_nested(
+                cfg,
+                ("downstream_public", "downstream_public", "shared_constants", "embedding_dim"),
+                None,
+            )
+            is not None
+        ):
+            self._expect_equal(
+                cfg,
+                ("downstream_public", "downstream_public", "shared_constants", "embedding_dim"),
+                1024,
+            )
+            self._expect_equal(
+                cfg,
+                (
+                    "downstream_public",
+                    "downstream_public",
+                    "shared_constants",
+                    "patient_aggregation_rule",
+                ),
+                "union_of_patches_across_all_wsis",
+            )
+
+        if (
+            self._get_nested(
+                cfg,
+                ("pretrain_public", "pretrain_public", "model_alignment", "slide_embedding_dim"),
+                None,
+            )
+            is not None
+        ):
+            self._expect_equal(
+                cfg,
+                ("pretrain_public", "pretrain_public", "model_alignment", "slide_embedding_dim"),
+                1024,
+            )
+
+    def _validate_stage_specific_required_values(self, cfg: DictConfig) -> None:
+        # Do not invent unresolved paper values; require explicit values only when stage needs them.
+        if self.stage != "pretrain":
+            return
+
+        required_non_null_paths: tuple[tuple[str, ...], ...] = (
+            ("pretraining", "optimizer", "betas"),
+            ("pretraining", "optimizer", "weight_decay"),
+            ("pretraining", "scheduler", "final_lr"),
+        )
+
+        model_temperature_paths: tuple[tuple[str, ...], ...] = (
+            ("model", "objective", "temperature"),
+            ("model_threads", "model", "objective", "temperature"),
+            ("model_threads", "threads", "multimodal_objective", "temperature"),
+        )
+
+        for key_path in required_non_null_paths:
+            value: Any = self._get_nested(cfg, key_path, None)
+            if value is None:
+                raise ConfigValidationError(
+                    "Missing required non-null pretraining value for stage 'pretrain': "
+                    f"{'.'.join(key_path)} (config: {self._config_path})."
+                )
+
+        temperature_value: Any = None
+        for key_path in model_temperature_paths:
+            candidate: Any = self._get_nested(cfg, key_path, None)
+            if candidate is not None:
+                temperature_value = candidate
+                break
+        if temperature_value is None:
+            raise ConfigValidationError(
+                "Missing required non-null InfoNCE temperature for stage 'pretrain'. "
+                "Expected one of: "
+                "model.objective.temperature, "
+                "model_threads.model.objective.temperature, "
+                "model_threads.threads.multimodal_objective.temperature."
+            )
+
+    def _validate_alpha_exceptions(self, cfg: DictConfig) -> None:
+        raw_exceptions: Any = self._get_nested(
+            cfg,
+            ("linear_probe", "survival", "alpha_exceptions"),
+            [],
+        )
+        if raw_exceptions is None:
+            raw_exceptions = []
+        if not isinstance(raw_exceptions, (list, tuple)):
+            raise ConfigValidationError(
+                "linear_probe.survival.alpha_exceptions must be a list of mappings."
+            )
+
+        observed: set[tuple[str, str, float]] = set()
+        for item in raw_exceptions:
+            if not isinstance(item, Mapping):
+                raise ConfigValidationError(
+                    "Each alpha exception must be a mapping with task/model/alpha keys."
+                )
+            task: str = self._as_str(item.get("task", ""), key_path="alpha_exceptions[].task")
+            model_name: str = self._as_str(
+                item.get("model", ""),
+                key_path="alpha_exceptions[].model",
+            )
+            alpha: float = self._as_float(
+                item.get("alpha", float("nan")),
+                key_path="alpha_exceptions[].alpha",
+                default=float("nan"),
+            )
+            observed.add((task, model_name, alpha))
+
+        required: set[tuple[str, str, float]] = {
+            ("CPTAC-CCRCC overall survival", "CHIEF", 0.01),
+            ("BOEHMK progression-free survival", "PRISM", 0.02),
+        }
+        if not required.issubset(observed):
+            raise ConfigInvariantError(
+                "linear_probe.survival.alpha_exceptions does not include all required "
+                f"paper exceptions. Missing: {sorted(required.difference(observed))}."
+            )
+
+    @staticmethod
+    def _to_plain_dict(cfg: DictConfig) -> Dict[str, Any]:
+        container: Any = OmegaConf.to_container(cfg, resolve=True)
+        if container is None:
+            return {}
+        if not isinstance(container, dict):
+            raise ConfigValidationError(
+                "Resolved configuration container is not a mapping."
+            )
+        return container
+
+    @staticmethod
+    def _get_nested(cfg: Any, key_path: Iterable[str], default: Any) -> Any:
+        current: Any = cfg
+        for key in key_path:
+            if isinstance(current, DictConfig):
+                if key not in current:
+                    return default
+                current = current[key]
+                continue
+            if isinstance(current, Mapping):
+                if key not in current:
+                    return default
+                current = current[key]
+                continue
+            return default
+        return current
+
+    def _expect_equal(self, cfg: DictConfig, key_path: tuple[str, ...], expected: Any) -> None:
+        actual: Any = self._get_nested(cfg, key_path, default=None)
+        if actual != expected:
+            raise ConfigInvariantError(
+                f"Invariant violation at {'.'.join(key_path)}: expected {expected!r}, "
+                f"got {actual!r} (config: {self._config_path})."
+            )
+
+    def _expect_float_close(
+        self,
+        cfg: DictConfig,
+        key_path: tuple[str, ...],
+        expected: float,
+        tolerance: float = 1e-12,
+    ) -> None:
+        actual_raw: Any = self._get_nested(cfg, key_path, default=None)
+        if actual_raw is None:
+            raise ConfigInvariantError(
+                f"Invariant violation at {'.'.join(key_path)}: expected {expected!r}, got None "
+                f"(config: {self._config_path})."
+            )
+        actual: float = self._as_float(
+            actual_raw,
+            key_path=".".join(key_path),
+            default=expected,
+        )
+        if abs(actual - expected) > tolerance:
+            raise ConfigInvariantError(
+                f"Invariant violation at {'.'.join(key_path)}: expected {expected!r}, "
+                f"got {actual!r} (config: {self._config_path})."
+            )
+
+    @staticmethod
+    def _as_str(value: Any, key_path: str) -> str:
+        if isinstance(value, str):
+            return value
+        raise ConfigValidationError(
+            f"Expected string at {key_path}, got {type(value).__name__}: {value!r}."
+        )
+
+    @staticmethod
+    def _as_optional_str(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        raise ConfigValidationError(
+            f"Expected optional string, got {type(value).__name__}: {value!r}."
+        )
+
+    @staticmethod
+    def _as_int(value: Any, key_path: str, default: int) -> int:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            raise ConfigValidationError(
+                f"Expected int at {key_path}, got bool: {value!r}."
+            )
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        raise ConfigValidationError(
+            f"Expected int at {key_path}, got {type(value).__name__}: {value!r}."
+        )
+
+    @staticmethod
+    def _as_float(value: Any, key_path: str, default: float) -> float:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            raise ConfigValidationError(
+                f"Expected float at {key_path}, got bool: {value!r}."
+            )
+        if isinstance(value, (int, float)):
+            return float(value)
+        raise ConfigValidationError(
+            f"Expected float at {key_path}, got {type(value).__name__}: {value!r}."
+        )
+```

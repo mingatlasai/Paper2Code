@@ -1,0 +1,9 @@
+Implemented the requested logic analysis in `src/utils/io.py`.
+
+It now contains a structured, paper-aligned analysis for reusable I/O helpers covering:
+- scope and module responsibilities,
+- strict data contracts for manifest/splits/features/embeddings/metrics,
+- config fidelity constraints from `config.yaml`,
+- validation/error-handling/determinism policies,
+- planned helper API surface (analysis-only, no implementation),
+- testability and definition-of-done criteria.

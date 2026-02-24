@@ -1,0 +1,11 @@
+Implemented the requested logic analysis in `src/data/manifest_store.py`.
+
+It now documents, in paper/config-aligned detail:
+
+- Exact `ManifestStore` interface behavior (`load/filter/upsert/save`) per design
+- Required schema keys and invariants tied to `src/data/manifest_schema.py`
+- Config-driven constraints from `config.yaml`, `configs/default.yaml`, `configs/data/pretrain_public.yaml`, and `configs/data/downstream_public.yaml`
+- Stage-specific expectations for preprocess/pretrain/embed/eval
+- Determinism, validation/error policy, and public-only vs private-data handling boundaries
+
+If you want, I can next produce the actual implementation for `ManifestStore` following this analysis.

@@ -1,0 +1,10 @@
+Implemented the requested logic analysis in `src/train/callbacks_rankme.py:1`.
+
+What’s included in that file:
+- Paper-aligned RankMe definition and checkpoint criterion.
+- Exact warmup/start logic tied to `config.yaml` (`warmup_epochs=5`, `eps=1e-7`).
+- Strict interface constraints matching your design (`__init__`, `compute_rankme`, `on_train_epoch_end` only).
+- Runtime contract with `PretrainModule` for embedding snapshots.
+- Numerical stability, DDP consistency, logging/artifact expectations, and failure handling.
+- Conservative decisions for ambiguous paper details (strict improvement tie-break, rank-0 decision in DDP).
+- Test expectations to guide implementation and verification later.

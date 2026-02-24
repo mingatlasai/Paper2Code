@@ -1,0 +1,10 @@
+Implemented the requested logic analysis in `src/utils/seeding.py` (new file).
+
+What I added:
+- A full analysis-only specification for deterministic seed handling across Python/NumPy/Torch/DDP.
+- Paper/config-aligned constraints and invariants from `config.yaml`.
+- Required public interface contracts for seeding utilities.
+- Stage-by-stage integration requirements for `main.py` and all pipelines.
+- Determinism guardrails, failure modes, provenance logging requirements, and test expectations.
+
+No executable code was added yet, consistent with your instruction.

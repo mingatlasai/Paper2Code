@@ -1,0 +1,390 @@
+----------------------------------------
+[Implementation approach]
+We will build a modular PyTorch pipeline that reproduces THREADS with minimal complexity: (1) WSI preprocessing and patch feature extraction, (2) THREADS multimodal pretraining (WSI↔RNA/DNA contrastive), (3) embedding export, (4) downstream evaluation (linear probe, CoxNet), and (5) optional fine-tuning/retrieval/prompting. We will rely on open-source libraries: PyTorch Lightning (training orchestration), timm/open-clip (vision backbones), OpenSlide + h5py (WSI IO/features), scikit-learn + scikit-survival (evaluation), MONAI/segmentation-models-pytorch (tissue mask model), Hydra + OmegaConf (config), pandas/polars (metadata), and Weights & Biases/MLflow (tracking). The architecture is config-driven, dataset-agnostic, and supports exact split files for reproducibility.
+
+----------------------------------------
+[File list]
+- main.py
+- configs/default.yaml
+- configs/data/pretrain_public.yaml
+- configs/data/downstream_public.yaml
+- configs/model/threads.yaml
+- configs/train/pretrain.yaml
+- configs/train/finetune.yaml
+- configs/eval/linear_probe.yaml
+- configs/eval/survival.yaml
+- src/core/config.py
+- src/core/registry.py
+- src/core/logging_utils.py
+- src/data/manifest_schema.py
+- src/data/manifest_store.py
+- src/data/split_manager.py
+- src/data/wsi_reader.py
+- src/data/tissue_segmenter.py
+- src/data/patch_tiler.py
+- src/data/feature_store.py
+- src/data/datamodules.py
+- src/models/patch_encoder.py
+- src/models/slide_encoder_threads.py
+- src/models/rna_encoder_scgpt.py
+- src/models/dna_encoder_mlp.py
+- src/models/threads_model.py
+- src/models/losses.py
+- src/train/pretrain_module.py
+- src/train/finetune_module.py
+- src/train/callbacks_rankme.py
+- src/train/checkpointing.py
+- src/eval/embedding_export.py
+- src/eval/linear_probe.py
+- src/eval/survival_eval.py
+- src/eval/retrieval_eval.py
+- src/eval/prompting_eval.py
+- src/eval/stats_tests.py
+- src/pipelines/run_preprocess.py
+- src/pipelines/run_pretrain.py
+- src/pipelines/run_embed.py
+- src/pipelines/run_eval.py
+- src/utils/seeding.py
+- src/utils/io.py
+- src/utils/metrics.py
+- tests/test_split_manager.py
+- tests/test_slide_encoder_shapes.py
+- tests/test_linear_probe_pipeline.py
+- README.md
+
+----------------------------------------
+[Data structures and interfaces]
+```mermaid
+classDiagram
+    class MainApp {
+        +__init__(cfg_path: str) None
+        +run(stage: str) None
+        +run_preprocess() None
+        +run_pretrain() None
+        +run_embed() None
+        +run_eval() None
+    }
+
+    class ExperimentConfig {
+        +project_name: str
+        +seed: int
+        +stage: str
+        +from_yaml(path: str) ExperimentConfig
+        +validate() None
+        +to_dict() dict
+    }
+
+    class ManifestRecord {
+        +sample_id: str
+        +patient_id: str
+        +cohort: str
+        +slide_path: str
+        +magnification: int
+        +rna_path: str
+        +dna_path: str
+        +task_labels: dict[str, str]
+        +meta: dict[str, str]
+    }
+
+    class ManifestStore {
+        +__init__(manifest_path: str) None
+        +load() list[ManifestRecord]
+        +filter_by_cohort(cohorts: list[str]) list[ManifestRecord]
+        +filter_by_task(task_name: str) list[ManifestRecord]
+        +upsert(records: list[ManifestRecord]) None
+        +save(path: str) None
+    }
+
+    class SplitManager {
+        +__init__(split_dir: str, seed: int) None
+        +load_official(task_name: str) dict[str, list[str]]
+        +make_cv(records: list[ManifestRecord], n_folds: int, stratify_by: str, group_by: str) list[dict]
+        +make_monte_carlo(records: list[ManifestRecord], n_splits: int, test_size: float, stratify_by: str, group_by: str) list[dict]
+        +make_fewshot(base_split: dict, k_per_class: int) dict
+        +save_split(task_name: str, split_name: str, split_obj: dict) None
+    }
+
+    class WSIReader {
+        +__init__(backend: str) None
+        +open(slide_path: str) object
+        +read_region(slide: object, x: int, y: int, w: int, h: int, level: int) bytes
+        +get_mpp(slide: object) float
+        +close(slide: object) None
+    }
+
+    class TissueSegmenter {
+        +__init__(ckpt_path: str, device: str) None
+        +predict_mask(slide: object, target_magnification: int) object
+        +postprocess(mask: object) object
+    }
+
+    class PatchTiler {
+        +__init__(patch_size: int, stride: int, target_magnification: int) None
+        +tile(slide: object, tissue_mask: object) list[tuple[int, int]]
+        +extract(slide: object, coords: list[tuple[int, int]]) list[bytes]
+    }
+
+    class FeatureStore {
+        +__init__(root_dir: str, fmt: str) None
+        +write_patch_features(sample_id: str, features: object, coords: object) str
+        +read_patch_features(sample_id: str) tuple[object, object]
+        +exists(sample_id: str) bool
+        +delete(sample_id: str) None
+    }
+
+    class PatchEncoder {
+        <<interface>>
+        +encode(patches: object) object
+        +feature_dim() int
+    }
+
+    class ConchPatchEncoder {
+        +__init__(model_name: str, device: str, precision: str) None
+        +preprocess(patches: object) object
+        +encode(patches: object) object
+        +feature_dim() int
+    }
+
+    class ThreadsSlideEncoder {
+        +__init__(in_dim: int, hidden_dim: int, out_dim: int, n_heads: int, dropout: float) None
+        +forward(patch_features: object, patch_mask: object) object
+        +attention_weights() object
+    }
+
+    class ScGPTRNAEncoder {
+        +__init__(ckpt_path: str, out_dim: int, trainable: bool) None
+        +forward(gene_ids: object, expr_vals: object, gene_mask: object) object
+    }
+
+    class DNAMLPEncoder {
+        +__init__(in_dim: int, hidden_dim: int, out_dim: int, dropout: float) None
+        +forward(dna_multi_hot: object) object
+    }
+
+    class ContrastiveLoss {
+        +__init__(temperature: float, bidirectional: bool) None
+        +forward(z_wsi: object, z_mol: object) float
+    }
+
+    class ThreadsModel {
+        +__init__(patch_encoder: PatchEncoder, slide_encoder: ThreadsSlideEncoder, rna_encoder: ScGPTRNAEncoder, dna_encoder: DNAMLPEncoder, loss_fn: ContrastiveLoss) None
+        +forward_wsi(patches: object, patch_mask: object) object
+        +forward_rna(gene_ids: object, expr_vals: object, gene_mask: object) object
+        +forward_dna(dna_multi_hot: object) object
+        +training_step(batch: dict[str, object]) dict[str, float]
+        +extract_slide_embedding(batch: dict[str, object]) object
+    }
+
+    class RankMeCallback {
+        +__init__(start_epoch: int, eps: float) None
+        +compute_rankme(embeddings: object) float
+        +on_train_epoch_end(trainer: object, pl_module: object) None
+    }
+
+    class PretrainModule {
+        +__init__(model: ThreadsModel, optim_cfg: dict, sched_cfg: dict) None
+        +configure_optimizers() object
+        +training_step(batch: dict, batch_idx: int) float
+        +validation_step(batch: dict, batch_idx: int) dict[str, float]
+    }
+
+    class FinetuneModule {
+        +__init__(slide_encoder: ThreadsSlideEncoder, head_out_dim: int, task_type: str, optim_cfg: dict) None
+        +training_step(batch: dict, batch_idx: int) float
+        +validation_step(batch: dict, batch_idx: int) dict[str, float]
+        +predict_step(batch: dict, batch_idx: int) object
+    }
+
+    class EmbeddingExporter {
+        +__init__(feature_store: FeatureStore, model_ckpt: str, device: str) None
+        +export_slide_embeddings(records: list[ManifestRecord], out_path: str) str
+        +export_patient_embeddings(records: list[ManifestRecord], out_path: str) str
+    }
+
+    class LinearProbeEvaluator {
+        +__init__(c_value: float, max_iter: int, solver: str, class_weight: str) None
+        +fit(x_train: object, y_train: object) None
+        +predict_proba(x_test: object) object
+        +score_binary_auc(y_true: object, y_prob: object) float
+        +score_multiclass_bacc(y_true: object, y_pred: object) float
+        +score_qwk(y_true: object, y_pred: object) float
+    }
+
+    class SurvivalEvaluator {
+        +__init__(alpha: float, max_iter: int) None
+        +fit(x_train: object, y_time: object, y_event: object) None
+        +predict_risk(x_test: object) object
+        +score_c_index(y_time: object, y_event: object, risk: object) float
+    }
+
+    class RetrievalEvaluator {
+        +__init__(metric: str, top_k: list[int]) None
+        +build_index(x_ref: object, y_ref: object) None
+        +query(x_q: object) object
+        +map_at_k(y_q: object, retrieved_labels: object, k: int) float
+    }
+
+    class PromptingEvaluator {
+        +build_molecular_prompts(z_mol: object, y: object) dict[str, object]
+        +classify_by_nearest_prompt(z_wsi: object, prompts: dict[str, object]) object
+        +risk_score(z_wsi: object, high_prompt: object, low_prompt: object) object
+    }
+
+    class StatsAnalyzer {
+        +anova_two_way(results_df: object) object
+        +tukey_hsd(results_df: object) object
+        +mixed_effects(results_df: object) object
+        +bootstrap_ci(values: object, n_boot: int) tuple[float, float]
+    }
+
+    MainApp --> ExperimentConfig
+    MainApp --> ManifestStore
+    MainApp --> SplitManager
+    MainApp --> WSIReader
+    MainApp --> TissueSegmenter
+    MainApp --> PatchTiler
+    MainApp --> FeatureStore
+    MainApp --> PretrainModule
+    MainApp --> EmbeddingExporter
+    MainApp --> LinearProbeEvaluator
+    MainApp --> SurvivalEvaluator
+    MainApp --> RetrievalEvaluator
+    MainApp --> PromptingEvaluator
+    MainApp --> StatsAnalyzer
+
+    ConchPatchEncoder ..|> PatchEncoder
+    ThreadsModel --> PatchEncoder
+    ThreadsModel --> ThreadsSlideEncoder
+    ThreadsModel --> ScGPTRNAEncoder
+    ThreadsModel --> DNAMLPEncoder
+    ThreadsModel --> ContrastiveLoss
+
+    PretrainModule --> ThreadsModel
+    PretrainModule --> RankMeCallback
+    FinetuneModule --> ThreadsSlideEncoder
+```
+
+----------------------------------------
+[Program call flow]
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as UserCLI
+    participant M as MainApp
+    participant C as ExperimentConfig
+    participant MS as ManifestStore
+    participant SM as SplitManager
+    participant WR as WSIReader
+    participant TS as TissueSegmenter
+    participant PT as PatchTiler
+    participant PE as ConchPatchEncoder
+    participant FS as FeatureStore
+    participant TM as ThreadsModel
+    participant PM as PretrainModule
+    participant RK as RankMeCallback
+    participant EX as EmbeddingExporter
+    participant LP as LinearProbeEvaluator
+    participant SV as SurvivalEvaluator
+    participant RT as RetrievalEvaluator
+    participant PR as PromptingEvaluator
+    participant ST as StatsAnalyzer
+
+    U->>M: main.py --stage preprocess/pretrain/embed/eval --config configs/default.yaml
+    M->>C: from_yaml(cfg_path)
+    C-->>M: ExperimentConfig
+    M->>C: validate()
+
+    alt stage == preprocess
+        M->>MS: load()
+        MS-->>M: list[ManifestRecord]
+        loop for each ManifestRecord
+            M->>WR: open(slide_path)
+            WR-->>M: slide_handle
+            M->>TS: predict_mask(slide_handle, 20x)
+            TS-->>M: tissue_mask
+            M->>PT: tile(slide_handle, tissue_mask)
+            PT-->>M: coords
+            M->>PT: extract(slide_handle, coords)
+            PT-->>M: patches
+            M->>PE: preprocess(patches)
+            PE-->>M: batch_tensor
+            M->>PE: encode(batch_tensor)
+            PE-->>M: patch_features
+            M->>FS: write_patch_features(sample_id, patch_features, coords)
+            FS-->>M: feature_uri
+            M->>WR: close(slide_handle)
+        end
+    end
+
+    alt stage == pretrain
+        M->>MS: load()
+        MS-->>M: paired pretrain records
+        M->>SM: load_official("pretrain") / make_cv(...)
+        SM-->>M: split object
+        M->>TM: __init__(patch_encoder, slide_encoder, rna_encoder, dna_encoder, contrastive_loss)
+        M->>PM: __init__(TM, optim_cfg, sched_cfg)
+        M->>RK: __init__(start_epoch=5, eps=1e-7)
+        loop epoch until max_epochs or early stop
+            PM->>TM: training_step(batch)
+            TM-->>PM: {loss, z_wsi, z_mol}
+            PM-->>M: optimizer/scheduler step
+            M->>RK: on_train_epoch_end(trainer, PM)
+            RK->>RK: compute_rankme(train_embeddings)
+            RK-->>M: save_checkpoint_if_rank_improves
+        end
+    end
+
+    alt stage == embed
+        M->>MS: filter_by_cohort(eval cohorts)
+        MS-->>M: eval records
+        M->>EX: __init__(feature_store, model_ckpt, device)
+        M->>EX: export_slide_embeddings(records, out_path)
+        EX-->>M: slide_embeddings.parquet
+        M->>EX: export_patient_embeddings(records, out_path)
+        EX-->>M: patient_embeddings.parquet
+    end
+
+    alt stage == eval
+        M->>MS: filter_by_task(task_name)
+        MS-->>M: task records
+        M->>SM: load_official(task) / make_cv / make_monte_carlo
+        SM-->>M: folds
+        loop each fold
+            alt classification task
+                M->>LP: __init__(C=0.5, max_iter=10000, solver=lbfgs, class_weight=balanced)
+                M->>LP: fit(X_train, y_train)
+                M->>LP: predict_proba(X_test)
+                M->>LP: score_binary_auc/score_multiclass_bacc/score_qwk(...)
+                LP-->>M: fold metric
+            else survival task
+                M->>SV: __init__(alpha, max_iter=10000)
+                M->>SV: fit(X_train, time_train, event_train)
+                M->>SV: predict_risk(X_test)
+                M->>SV: score_c_index(...)
+                SV-->>M: fold metric
+            end
+        end
+
+        opt retrieval evaluation
+            M->>RT: build_index(X_ref, y_ref)
+            M->>RT: query(X_query)
+            M->>RT: map_at_k(k in [1,5,10])
+            RT-->>M: mAP@k metrics
+        end
+
+        opt molecular prompting evaluation
+            M->>PR: build_molecular_prompts(Z_mol_support, y_support)
+            M->>PR: classify_by_nearest_prompt(Z_wsi_test, prompts)
+            PR-->>M: predictions/risk_scores
+        end
+
+        M->>ST: bootstrap_ci + anova_two_way + tukey_hsd + mixed_effects
+        ST-->>M: aggregate report tables + significance
+        M-->>U: metrics.json + csv tables + plots
+    end
+```
+
+----------------------------------------
+[Anything UNCLEAR]
+Unclear items to confirm before coding: exact unreadable pretraining hyperparameters from Extended Data Table 50 (full AdamW betas, final LR, exact weight-decay values per branch), exact InfoNCE bidirectional weighting/temperature details, precise RankMe checkpoint selection rule, unavailable private datasets (MGH/BWH/internal cohorts) needed for full fidelity, and exact pretrained checkpoints/licensing for CONCHV1.5/PRISM/CHIEF compatibility.
+

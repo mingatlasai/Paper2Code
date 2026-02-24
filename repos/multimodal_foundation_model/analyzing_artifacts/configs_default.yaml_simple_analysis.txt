@@ -1,0 +1,9 @@
+Updated `configs/default.yaml` with a full top-level logic analysis config that is:
+
+- Hydra-composed via `defaults` importing `data`, `model`, `pretrain`, `train`, and `eval`
+- Strictly aligned to the provided `config.yaml` and paper constraints
+- Explicit about known unknowns (`null` for unreadable/unspecified hyperparameters)
+- Structured for all stages (`preprocess`, `pretrain`, `embed`, `eval`)
+- Backward-safe by keeping both `runtime.stage` and `runtime.mode`
+
+File updated: `configs/default.yaml`

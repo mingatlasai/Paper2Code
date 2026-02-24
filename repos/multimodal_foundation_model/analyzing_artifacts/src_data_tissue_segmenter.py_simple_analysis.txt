@@ -1,0 +1,5 @@
+Completed. I added the full logic analysis to:
+
+- `src/data/tissue_segmenter.py`
+
+It is aligned to the paper, your provided `config.yaml`, and the exact design interface (`__init__`, `predict_mask`, `postprocess`) without adding non-design public methods.

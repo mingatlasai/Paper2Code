@@ -1,0 +1,12 @@
+Implemented the requested logic analysis in:
+
+- `src/pipelines/run_eval.py`
+
+It now contains a full, paper-aligned orchestration plan for evaluation stage covering:
+
+- split resolution (`official`/CV/MC/few-shot),
+- embedding selection (slide vs patient),
+- dispatch to linear probe / survival / retrieval / prompting evaluators,
+- fixed hyperparameter and metric routing from `config.yaml`,
+- statistical workflow (ANOVA → Tukey, mixed-effects, CI policy),
+- reproducibility controls, guardrails, and public-only scope behavior.

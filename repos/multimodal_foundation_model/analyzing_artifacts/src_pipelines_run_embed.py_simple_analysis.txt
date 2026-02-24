@@ -1,0 +1,9 @@
+Created and filled `src/pipelines/run_embed.py` with a full analysis-only orchestration spec for the embed stage.
+
+It now covers:
+- paper/config-locked constraints (`1024` dim, all-patches export, patient union-of-patches, bf16 target),
+- stage inputs/preconditions,
+- end-to-end call flow using only design interfaces,
+- invariants, failure policy, reproducibility controls, and downstream integration contracts.
+
+No executable code was added.

@@ -1,0 +1,10 @@
+Implemented the logic analysis in `configs/train/pretrain.yaml` and validated it parses as YAML.
+
+Key properties of the new file:
+- Paper-aligned pretraining contracts for optimizer/scheduler/DDP/precision.
+- Strict use of provided config values (`batch_size_per_gpu=300`, `max_epochs=101`, warmup `5`, peak LR `1e-5`, RankMe `eps=1e-7`, etc.).
+- Unspecified paper values kept as `null` (no invented hyperparameters).
+- Explicit mapping to `pretrain_module.py` and `checkpointing.py` responsibilities.
+- Invariants and unresolved-items section included for implementation safety.
+
+File: `configs/train/pretrain.yaml`

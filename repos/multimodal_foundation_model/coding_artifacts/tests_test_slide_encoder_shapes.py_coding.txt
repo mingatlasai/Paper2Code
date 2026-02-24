@@ -1,0 +1,271 @@
+## Code: `tests/test_slide_encoder_shapes.py`
+```python
+"""Unit tests for THREADS slide encoder shape and masking contracts."""
+
+from __future__ import annotations
+
+from typing import Tuple
+
+import pytest
+import torch
+
+from src.models.slide_encoder_threads import (
+    DEFAULT_HIDDEN_DIM,
+    DEFAULT_INPUT_DIM,
+    DEFAULT_NUM_HEADS,
+    DEFAULT_OUTPUT_DIM,
+    ThreadsSlideEncoder,
+    SlideEncoderInputError,
+    SlideEncoderRuntimeError,
+)
+
+
+DEFAULT_BATCH_SIZE: int = 2
+DEFAULT_NUM_PATCHES: int = 64
+DEFAULT_DROPOUT: float = 0.0
+DEFAULT_ATOL: float = 1.0e-6
+DEFAULT_RTOL: float = 1.0e-6
+DEFAULT_SEED: int = 42
+
+
+def _make_features_and_mask(
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_patches: int = DEFAULT_NUM_PATCHES,
+    in_dim: int = DEFAULT_INPUT_DIM,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create deterministic synthetic inputs with all-valid mask."""
+    torch.manual_seed(DEFAULT_SEED)
+    features: torch.Tensor = torch.randn(batch_size, num_patches, in_dim, dtype=torch.float32)
+    patch_mask: torch.Tensor = torch.ones(batch_size, num_patches, dtype=torch.bool)
+    return features, patch_mask
+
+
+def _build_encoder(n_heads: int) -> ThreadsSlideEncoder:
+    """Create encoder using config-aligned defaults."""
+    encoder: ThreadsSlideEncoder = ThreadsSlideEncoder(
+        in_dim=DEFAULT_INPUT_DIM,
+        hidden_dim=DEFAULT_HIDDEN_DIM,
+        out_dim=DEFAULT_OUTPUT_DIM,
+        n_heads=n_heads,
+        dropout=DEFAULT_DROPOUT,
+    )
+    encoder.eval()
+    return encoder
+
+
+def test_constants_match_config_policy() -> None:
+    """Verify paper/config aligned constants used by the encoder."""
+    assert DEFAULT_INPUT_DIM == 768
+    assert DEFAULT_HIDDEN_DIM == 1024
+    assert DEFAULT_OUTPUT_DIM == 1024
+    assert DEFAULT_NUM_HEADS == 2
+
+
+def test_attention_weights_before_forward_raises() -> None:
+    """Calling attention_weights before a forward pass must raise."""
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=1)
+    with pytest.raises(SlideEncoderRuntimeError):
+        _ = encoder.attention_weights()
+
+
+@pytest.mark.parametrize("n_heads", [1, 2])
+def test_forward_output_shape_and_finiteness(n_heads: int) -> None:
+    """Forward output must be [B, 1024] with finite values."""
+    features: torch.Tensor
+    patch_mask: torch.Tensor
+    features, patch_mask = _make_features_and_mask()
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=n_heads)
+
+    output: object = encoder.forward(features, patch_mask)
+    assert isinstance(output, torch.Tensor)
+    output_tensor: torch.Tensor = output
+
+    assert output_tensor.shape == (DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_DIM)
+    assert bool(torch.isfinite(output_tensor).all())
+
+
+def test_attention_shape_single_head() -> None:
+    """Single-head attention must have shape [B, N]."""
+    features: torch.Tensor
+    patch_mask: torch.Tensor
+    features, patch_mask = _make_features_and_mask()
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=1)
+
+    _ = encoder.forward(features, patch_mask)
+    attention: object = encoder.attention_weights()
+    assert isinstance(attention, torch.Tensor)
+    attention_tensor: torch.Tensor = attention
+
+    assert attention_tensor.shape == (DEFAULT_BATCH_SIZE, DEFAULT_NUM_PATCHES)
+    assert bool(torch.isfinite(attention_tensor).all())
+
+
+def test_attention_shape_multi_head() -> None:
+    """Two-head attention must have shape [B, H, N]."""
+    features: torch.Tensor
+    patch_mask: torch.Tensor
+    features, patch_mask = _make_features_and_mask()
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=DEFAULT_NUM_HEADS)
+
+    _ = encoder.forward(features, patch_mask)
+    attention: object = encoder.attention_weights()
+    assert isinstance(attention, torch.Tensor)
+    attention_tensor: torch.Tensor = attention
+
+    assert attention_tensor.shape == (DEFAULT_BATCH_SIZE, DEFAULT_NUM_HEADS, DEFAULT_NUM_PATCHES)
+    assert bool(torch.isfinite(attention_tensor).all())
+
+
+@pytest.mark.parametrize("n_heads", [1, 2])
+def test_masked_positions_zero_and_valid_positions_normalized(n_heads: int) -> None:
+    """Masked tokens must receive zero attention and valid tokens sum to one."""
+    valid_count_sample0: int = 40
+    valid_count_sample1: int = 17
+    features: torch.Tensor
+    patch_mask: torch.Tensor
+    features, patch_mask = _make_features_and_mask(num_patches=50)
+
+    patch_mask[0, valid_count_sample0:] = False
+    patch_mask[1, valid_count_sample1:] = False
+
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=n_heads)
+    _ = encoder.forward(features, patch_mask)
+
+    attention_object: object = encoder.attention_weights()
+    assert isinstance(attention_object, torch.Tensor)
+    attention: torch.Tensor = attention_object
+    if attention.ndim == 2:
+        attention = attention.unsqueeze(1)
+
+    # Masked region attention ~ 0.
+    assert torch.allclose(
+        attention[0, :, valid_count_sample0:],
+        torch.zeros_like(attention[0, :, valid_count_sample0:]),
+        atol=DEFAULT_ATOL,
+        rtol=DEFAULT_RTOL,
+    )
+    assert torch.allclose(
+        attention[1, :, valid_count_sample1:],
+        torch.zeros_like(attention[1, :, valid_count_sample1:]),
+        atol=DEFAULT_ATOL,
+        rtol=DEFAULT_RTOL,
+    )
+
+    # Valid region sums to 1 per sample/head.
+    sums: torch.Tensor = attention.sum(dim=-1)
+    ones: torch.Tensor = torch.ones_like(sums)
+    assert torch.allclose(sums, ones, atol=DEFAULT_ATOL, rtol=DEFAULT_RTOL)
+
+
+def test_variable_length_batch_with_padding_mask() -> None:
+    """Different per-sample valid patch counts should be handled in one batch."""
+    total_patches: int = 80
+    sample0_valid: int = 80
+    sample1_valid: int = 23
+    features: torch.Tensor
+    patch_mask: torch.Tensor
+    features, patch_mask = _make_features_and_mask(num_patches=total_patches)
+    patch_mask[0, :sample0_valid] = True
+    patch_mask[1, sample1_valid:] = False
+
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=DEFAULT_NUM_HEADS)
+    output: object = encoder.forward(features, patch_mask)
+    assert isinstance(output, torch.Tensor)
+    output_tensor: torch.Tensor = output
+
+    assert output_tensor.shape == (DEFAULT_BATCH_SIZE, DEFAULT_OUTPUT_DIM)
+    attention_object: object = encoder.attention_weights()
+    assert isinstance(attention_object, torch.Tensor)
+    attention: torch.Tensor = attention_object
+    assert attention.shape == (DEFAULT_BATCH_SIZE, DEFAULT_NUM_HEADS, total_patches)
+    assert torch.allclose(
+        attention[1, :, sample1_valid:],
+        torch.zeros_like(attention[1, :, sample1_valid:]),
+        atol=DEFAULT_ATOL,
+        rtol=DEFAULT_RTOL,
+    )
+
+
+def test_forward_rejects_mismatched_mask_length() -> None:
+    """Forward must reject patch masks that do not match [B, N]."""
+    features: torch.Tensor
+    patch_mask: torch.Tensor
+    features, patch_mask = _make_features_and_mask(num_patches=32)
+    bad_mask: torch.Tensor = patch_mask[:, :-1]
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=1)
+
+    with pytest.raises(SlideEncoderInputError):
+        _ = encoder.forward(features, bad_mask)
+
+
+def test_forward_rejects_wrong_feature_dim() -> None:
+    """Forward must reject features whose last dimension differs from in_dim."""
+    torch.manual_seed(DEFAULT_SEED)
+    wrong_dim: int = DEFAULT_OUTPUT_DIM
+    features: torch.Tensor = torch.randn(DEFAULT_BATCH_SIZE, DEFAULT_NUM_PATCHES, wrong_dim, dtype=torch.float32)
+    patch_mask: torch.Tensor = torch.ones(DEFAULT_BATCH_SIZE, DEFAULT_NUM_PATCHES, dtype=torch.bool)
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=1)
+
+    with pytest.raises(SlideEncoderInputError):
+        _ = encoder.forward(features, patch_mask)
+
+
+def test_forward_rejects_invalid_feature_rank() -> None:
+    """Forward must reject non-3D feature tensors."""
+    torch.manual_seed(DEFAULT_SEED)
+    features_2d: torch.Tensor = torch.randn(DEFAULT_NUM_PATCHES, DEFAULT_INPUT_DIM, dtype=torch.float32)
+    patch_mask: torch.Tensor = torch.ones(DEFAULT_BATCH_SIZE, DEFAULT_NUM_PATCHES, dtype=torch.bool)
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=1)
+
+    with pytest.raises(SlideEncoderInputError):
+        _ = encoder.forward(features_2d, patch_mask)
+
+
+def test_forward_rejects_invalid_mask_rank() -> None:
+    """Forward must reject non-2D mask tensors."""
+    features: torch.Tensor
+    patch_mask: torch.Tensor
+    features, patch_mask = _make_features_and_mask()
+    bad_mask_3d: torch.Tensor = patch_mask.unsqueeze(-1)
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=1)
+
+    with pytest.raises(SlideEncoderInputError):
+        _ = encoder.forward(features, bad_mask_3d)
+
+
+def test_forward_rejects_all_masked_sample() -> None:
+    """Each batch item must have at least one valid patch."""
+    features: torch.Tensor
+    patch_mask: torch.Tensor
+    features, patch_mask = _make_features_and_mask()
+    patch_mask[1, :] = False
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=1)
+
+    with pytest.raises(SlideEncoderInputError):
+        _ = encoder.forward(features, patch_mask)
+
+
+def test_attention_state_updates_each_forward() -> None:
+    """attention_weights should reflect the latest forward pass."""
+    encoder: ThreadsSlideEncoder = _build_encoder(n_heads=DEFAULT_NUM_HEADS)
+
+    first_features: torch.Tensor
+    first_mask: torch.Tensor
+    first_features, first_mask = _make_features_and_mask(num_patches=24)
+    _ = encoder.forward(first_features, first_mask)
+    first_attention_object: object = encoder.attention_weights()
+    assert isinstance(first_attention_object, torch.Tensor)
+    first_attention: torch.Tensor = first_attention_object
+    assert first_attention.shape == (DEFAULT_BATCH_SIZE, DEFAULT_NUM_HEADS, 24)
+
+    second_features: torch.Tensor
+    second_mask: torch.Tensor
+    second_features, second_mask = _make_features_and_mask(num_patches=31)
+    _ = encoder.forward(second_features, second_mask)
+    second_attention_object: object = encoder.attention_weights()
+    assert isinstance(second_attention_object, torch.Tensor)
+    second_attention: torch.Tensor = second_attention_object
+    assert second_attention.shape == (DEFAULT_BATCH_SIZE, DEFAULT_NUM_HEADS, 31)
+```
+
+`pytest` is not installed in this environment, so runtime test execution could not be completed (`python -m py_compile tests/test_slide_encoder_shapes.py` passes).

@@ -1,0 +1,14 @@
+Implemented `configs/data/downstream_public.yaml` with a full paper-aligned logic analysis for downstream evaluation.
+
+What it now contains:
+- Public-only reproduction scope and hard exclusions for private cohorts.
+- Split policy for `official_single_fold`, `cv5_80_20`, and `mc50`, including few-shot (`k=[1,2,4,8,16,32]`) and BRACS exception handling.
+- Patient grouping and aggregation rules aligned with THREADS (`union_of_patches_across_all_wsis` for patient-level).
+- Metric routing (`macro_auc`, `balanced_accuracy`, `quadratic_weighted_kappa`, `c_index`, `map_at_k`).
+- Linear probe and CoxNet fixed hyperparameters from `config.yaml`, including survival alpha overrides.
+- Task registry by family with public cohorts and per-task split strategies.
+- Transferability, retrieval, molecular prompting evaluation logic.
+- Confidence interval and significance testing policy (ANOVA/Tukey, mixed-effects, bootstrap CI, log-rank).
+
+File created:
+- `configs/data/downstream_public.yaml`

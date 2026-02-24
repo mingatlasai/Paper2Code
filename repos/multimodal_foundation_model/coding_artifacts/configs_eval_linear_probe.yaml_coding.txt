@@ -1,0 +1,133 @@
+## Code: configs/eval/linear_probe.yaml
+```yaml
+# Logic analysis for fixed linear probing evaluation used by src/eval/linear_probe.py.
+# Scope: classification linear probe only (survival handled by configs/eval/survival.yaml).
+# Source of truth: provided config.yaml + paper methods + fixed design interfaces.
+
+linear_probe_eval:
+  version: "1.0"
+  purpose: "Paper-aligned fixed-parameter linear probing on exported slide/patient embeddings"
+
+  provenance:
+    paper: "Molecular-driven Foundation Model for Oncologic Pathology"
+    config_source: "config.yaml"
+    required_interface_consistency:
+      - "SplitManager.load_official / make_cv / make_monte_carlo / make_fewshot"
+      - "LinearProbeEvaluator.fit / predict_proba / score_binary_auc / score_multiclass_bacc / score_qwk"
+      - "ManifestRecord schema keys and patient-level grouping policy"
+
+  fixed_model_settings:
+    estimator: "sklearn.linear_model.LogisticRegression"
+    c_value: 0.5
+    solver: "lbfgs"
+    max_iter: 10000
+    class_weight: "balanced"
+    hyperparameter_search: false
+    random_state_from_global_seed: true
+
+  data_contract:
+    embedding_dim: 1024
+    accepted_embedding_levels:
+      - "slide"
+      - "patient"
+    patient_level_rule: "union of patches across all WSIs for a patient (applied upstream during embedding export)"
+    required_embedding_columns:
+      - "sample_id"
+      - "patient_id"
+      - "task_name"
+      - "embedding"
+      - "label"
+      - "cohort"
+    required_split_schema:
+      - "task_name"
+      - "fold_id"
+      - "train_ids"
+      - "test_ids"
+    leakage_guardrails:
+      enforce_patient_disjoint_between_train_test: true
+      enforce_split_reuse_across_models: true
+      fail_on_missing_embedding_ids: true
+      fail_on_missing_labels: true
+
+  split_logic:
+    official_single_fold_datasets:
+      - "EBRAINS"
+      - "PANDA"
+      - "IMP"
+    non_official_policy:
+      allowed:
+        - "5-fold 80:20 cross-validation"
+        - "50-fold bootstrapping/Monte Carlo"
+      stratification: "label- and patient-stratified (except documented dataset-specific constraints)"
+    few_shot:
+      enabled: true
+      k_values: [1, 2, 4, 8, 16, 32]
+      derive_from_k_all_train_only: true
+      keep_test_set_fixed_per_task: true
+      omit_infeasible_k: true
+
+  task_to_metric_routing:
+    binary_classification: "macro_auc"
+    multiclass_subtyping: "balanced_accuracy"
+    grading: "quadratic_weighted_kappa"
+
+  fit_predict_logic:
+    training:
+      x_train: "embeddings selected by split.train_ids"
+      y_train: "task labels aligned to x_train"
+      class_imbalance_handling: "class_weight=balanced"
+      no_validation_tuning: true
+    inference:
+      x_test: "embeddings selected by split.test_ids"
+      y_test: "task labels aligned to x_test"
+      binary_output_for_auc: "predict_proba[:, positive_class_index]"
+      multiclass_output_for_bacc_qwk: "predict labels via estimator.predict"
+
+  aggregation_and_uncertainty:
+    multi_fold_reporting: "mean +/- standard error across folds"
+    single_fold_reporting: "95% CI via non-parametric bootstrap (100 replicates)"
+    bootstrap_replicates_single_fold: 100
+
+  output_contract:
+    per_fold_metrics_schema:
+      - "task"
+      - "cohort"
+      - "fold"
+      - "metric_name"
+      - "value"
+      - "model_name"
+      - "embedding_level"
+    aggregated_metrics_schema:
+      - "task"
+      - "metric_name"
+      - "mean"
+      - "se"
+      - "ci_low"
+      - "ci_high"
+      - "n_folds"
+      - "model_name"
+
+  handoff_to_stats_tests:
+    per_task:
+      omnibus_test: "two-way ANOVA"
+      post_hoc_if_significant: "two-sided Tukey HSD (p<0.05, multiple-comparison adjusted)"
+    across_tasks:
+      model: "mixed-effects"
+      fixed_effect: "model type"
+      random_effect: "dataset"
+
+  reproducibility:
+    global_seed_required: true
+    deterministic_split_generation_required: true
+    deterministic_bootstrap_seed_required: true
+    artifact_layout: "runs/{date}/eval/{run_id}"
+
+  hard_constraints:
+    - "Do not change C, solver, max_iter, or class_weight from fixed values."
+    - "Do not run hyperparameter search or per-task tuning."
+    - "Do not alter metric-task mapping."
+    - "Do not alter split strategy outside configured official/CV/MC/few-shot policies."
+
+  unresolved_items:
+    - "None for linear probe hyperparameters; values are fully specified in config.yaml and paper methods."
+```

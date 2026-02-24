@@ -1,0 +1,9 @@
+Implemented the requested logic analysis in `src/data/feature_store.py`.
+
+It now documents, in paper/config-aligned detail, the intended behavior for persistent patch feature storage, including:
+- exact design interface constraints,
+- schema and invariants (`sample_id`, `coords`, `features`, `encoder_name`, `precision`),
+- method-by-method logic (`write/read/exists/delete`),
+- reproducibility and integrity rules,
+- pipeline producer/consumer interactions,
+- error model and coding-phase validation checklist.

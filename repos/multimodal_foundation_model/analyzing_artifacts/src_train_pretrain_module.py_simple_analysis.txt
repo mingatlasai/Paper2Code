@@ -1,0 +1,12 @@
+Added the requested logic analysis to `src/train/pretrain_module.py`.
+
+The file now contains a structured, paper-aligned pretraining module analysis covering:
+- LightningModule responsibilities and exact interface from your design
+- AdamW + warmup/cosine scheduling logic tied to `config.yaml`
+- training/validation step flow and logging contracts
+- RankMe callback integration requirements
+- DDP/precision behavior and failure policies
+- strict handling of unresolved hyperparameters (`null`) without inventing values
+
+File updated:
+- `src/train/pretrain_module.py`

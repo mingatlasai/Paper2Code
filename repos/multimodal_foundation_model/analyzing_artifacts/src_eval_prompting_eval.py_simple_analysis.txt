@@ -1,0 +1,8 @@
+Implemented the logic analysis in `src/eval/prompting_eval.py`.
+
+It now documents, in analysis-only form, the full paper-faithful prompting logic for:
+- molecular class prototype construction,
+- nearest-prompt classification with L2 distance,
+- survival risk prompting using top/bottom 25% uncensored support groups,
+- strict interface compliance with `PromptingEvaluator`,
+- config-grounded constraints and guardrails for reproducibility/leakage.

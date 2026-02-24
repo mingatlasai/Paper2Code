@@ -1,0 +1,6 @@
+Implemented the requested logic analysis in `src/eval/retrieval_eval.py`.
+
+It is analysis-only (no executable code), and it is aligned to:
+- the paper retrieval protocol (L2 nearest-neighbor, mAP@1/5/10),
+- the provided `config.yaml` constraints (embedding semantics, CI policy),
+- and the fixed design interface for `RetrievalEvaluator` (`__init__`, `build_index`, `query`, `map_at_k`) without adding extra public methods.
