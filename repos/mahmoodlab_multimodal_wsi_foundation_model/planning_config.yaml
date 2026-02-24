@@ -1,0 +1,134 @@
+## config.yaml
+runtime:
+  python_version: "3.9.16"
+  pytorch_version: "2.0.1"
+  cuda_version: "11.8"
+
+hardware:
+  stage1:
+    gpus: 4
+    gpu_type: "NVIDIA A100 80GB"
+  stage2:
+    gpus: 8
+    gpu_type: "NVIDIA A100 80GB"
+  stage3:
+    gpus: 8
+    gpu_type: "NVIDIA A100 80GB"
+  downstream_eval:
+    gpus: 1
+    gpu_type: "NVIDIA 3090 24GB"
+
+data:
+  wsi_patch_size_px: 512
+  magnification: "20x"
+  patch_feature_dim: 768
+  roi_region_size_px: 8192
+  roi_region_grid_size: [16, 16]
+  stage3_wsi_crop_grid_size: [64, 64]
+  stage3_wsi_crop_size_px: 32768
+
+model:
+  slide_encoder:
+    architecture: "ViT in feature space"
+    num_layers: 6
+    num_attention_heads: 12
+    head_dim: 64
+    embedding_dim: 768
+    mlp_hidden_dim: 3072
+    positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+  multimodal:
+    framework: "CoCa"
+    reconstruction_queries: 128
+    text_encoder_source: "CONCHv1.5 pretrained text encoder"
+    text_decoder_source: "CONCHv1.5 pretrained multimodal decoder"
+    text_encoder_layers: 12
+    text_decoder_layers: 12
+    text_embedding_dim: 768
+    text_hidden_dim: 3072
+
+training:
+  stage1_titan_v:
+    objective: "iBOT (student-teacher distillation + masked image modeling) in feature space"
+    epochs: 270
+    iterations: 91260
+    local_batch_size_per_gpu: 256
+    effective_batch_size: 1024
+    view_sampling:
+      global_views: 2
+      global_view_grid_size: [14, 14]
+      local_views: 10
+      local_view_grid_size: [6, 6]
+    augmentations:
+      - "horizontal_flip"
+      - "vertical_flip"
+      - "feature_posterization"
+    optimizer:
+      learning_rate: null
+      weight_decay: null
+      betas: null
+      scheduler: null
+      warmup: null
+  stage2_roi_caption_alignment:
+    objective: "CoCa contrastive + generative alignment on ROI-caption pairs"
+    num_pairs: 423122
+    local_batch_size_per_gpu: 196
+    gradient_accumulation_steps: 2
+    effective_batch_size: 3136
+    optimizer:
+      learning_rate: null
+      weight_decay: null
+      betas: null
+      scheduler: null
+      warmup: null
+  stage3_wsi_report_alignment:
+    objective: "CoCa contrastive + generative alignment on WSI-report pairs"
+    num_pairs: 182862
+    local_batch_size_per_gpu: 16
+    gradient_accumulation_steps: 2
+    effective_batch_size: 256
+    notes:
+      - "Use smaller learning rate and weight decay for vision backbone"
+      - "Use slow warm-up for vision backbone"
+    optimizer:
+      learning_rate: null
+      weight_decay: null
+      betas: null
+      scheduler: null
+      warmup: null
+
+evaluation:
+  linear_probe:
+    method: "scikit-learn logistic regression (L-BFGS)"
+    l2_grid:
+      count: 45
+      min: 1e-6
+      max: 10
+      spacing: "log"
+    max_iter: 500
+    few_shot_or_no_val_defaults:
+      l2: 1
+      max_iter: 1000
+  knn_probe:
+    k: 20
+    distance: "euclidean"
+    preprocess:
+      - "center"
+      - "l2_normalize"
+  few_shot:
+    shots: [1, 2, 4, 8, 16, 32]
+    runs: 50
+  retrieval:
+    slide_retrieval_k: [1, 3, 5]
+    cross_modal_recall_k: [1, 3, 5, 10]
+  report_generation:
+    decoding: "beam_search"
+    num_beams: 5
+    num_beam_groups: 1
+  survival:
+    model: "linear Cox proportional hazards"
+    package: "scikit-survival"
+
+notes:
+  source_of_truth:
+    - "Hyperparameters not listed above are not provided in the supplied paper text and are intentionally left null."
+    - "Paper references supplementary tables for missing optimizer/scheduler specifics."

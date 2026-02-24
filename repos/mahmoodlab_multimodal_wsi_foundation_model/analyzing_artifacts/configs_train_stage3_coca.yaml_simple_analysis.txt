@@ -1,0 +1,5 @@
+Completed. I created the requested logic analysis in:
+
+- [configs/train/stage3_coca.yaml](/Users/mingatlas/Projects/Paper2Code/configs/train/stage3_coca.yaml)
+
+It is aligned to the paper + provided design/task/config, keeps missing hyperparameters unresolved (`null`/config-driven), and enforces the specified stage-3 interfaces and invariants without introducing new API methods.

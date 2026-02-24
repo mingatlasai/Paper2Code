@@ -1,0 +1,156 @@
+"""iBOT projection head for TITAN stage-1 feature-space pretraining.
+
+This module implements the design-locked interface:
+- IBOTHead.__init__(embed_dim: int, out_dim: int) -> None
+- IBOTHead.forward(tokens: torch.Tensor) -> torch.Tensor
+
+The head is intentionally simple and robust because several iBOT-specific
+supplementary hyperparameters are unavailable in the provided paper text.
+"""
+
+from __future__ import annotations
+
+from typing import Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml and task contract.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE1_GLOBAL_VIEWS: int = 2
+_STAGE1_GLOBAL_GRID: Tuple[int, int] = (14, 14)
+_STAGE1_LOCAL_VIEWS: int = 10
+_STAGE1_LOCAL_GRID: Tuple[int, int] = (6, 6)
+
+_DEFAULT_HIDDEN_FACTOR: int = 2
+_DEFAULT_DROPOUT: float = 0.0
+_DEFAULT_LAYER_NORM_EPS: float = 1.0e-6
+
+
+class IBOTHeadError(RuntimeError):
+    """Base exception for iBOT head failures."""
+
+
+class IBOTHeadConfigError(IBOTHeadError):
+    """Raised when IBOTHead configuration is invalid."""
+
+
+class IBOTHead(nn.Module):
+    """Token-level projection head used by student/teacher iBOT branches.
+
+    The head preserves all leading dimensions and only changes the final
+    embedding dimension from `embed_dim` to `out_dim`.
+    """
+
+    def __init__(self, embed_dim: int, out_dim: int) -> None:
+        """Initialize iBOT head.
+
+        Args:
+            embed_dim: Input token feature dimension. Expected 768 for TITAN.
+            out_dim: Projection output dimension used by iBOT loss.
+        """
+        super().__init__()
+
+        if isinstance(embed_dim, bool) or not isinstance(embed_dim, int):
+            raise IBOTHeadConfigError("embed_dim must be an integer.")
+        if isinstance(out_dim, bool) or not isinstance(out_dim, int):
+            raise IBOTHeadConfigError("out_dim must be an integer.")
+
+        embed_dim_int: int = int(embed_dim)
+        out_dim_int: int = int(out_dim)
+
+        if embed_dim_int <= 0:
+            raise IBOTHeadConfigError(f"embed_dim must be > 0, got {embed_dim_int}.")
+        if out_dim_int <= 0:
+            raise IBOTHeadConfigError(f"out_dim must be > 0, got {out_dim_int}.")
+
+        # Config-anchored contract: TITAN stage-1 encoder outputs 768-d tokens.
+        if embed_dim_int != _FEATURE_DIM:
+            raise IBOTHeadConfigError(
+                f"embed_dim must be {_FEATURE_DIM} per config.yaml, got {embed_dim_int}."
+            )
+
+        hidden_dim: int = embed_dim_int * _DEFAULT_HIDDEN_FACTOR
+
+        self.embed_dim: int = embed_dim_int
+        self.out_dim: int = out_dim_int
+        self.hidden_dim: int = hidden_dim
+        self.dropout_p: float = _DEFAULT_DROPOUT
+
+        # Provenance constants used in logs/checkpoints by higher-level modules.
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.stage1_region_grid: Tuple[int, int] = _STAGE1_REGION_GRID
+        self.stage1_global_views: int = _STAGE1_GLOBAL_VIEWS
+        self.stage1_global_grid: Tuple[int, int] = _STAGE1_GLOBAL_GRID
+        self.stage1_local_views: int = _STAGE1_LOCAL_VIEWS
+        self.stage1_local_grid: Tuple[int, int] = _STAGE1_LOCAL_GRID
+
+        self.pre_norm: nn.LayerNorm = nn.LayerNorm(
+            self.embed_dim,
+            eps=_DEFAULT_LAYER_NORM_EPS,
+        )
+        self.fc1: nn.Linear = nn.Linear(self.embed_dim, self.hidden_dim)
+        self.act: nn.GELU = nn.GELU()
+        self.drop: nn.Dropout = nn.Dropout(self.dropout_p)
+        self.fc2: nn.Linear = nn.Linear(self.hidden_dim, self.out_dim)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Project token features for iBOT distillation/masked objectives.
+
+        Supported input shapes:
+        - [N, D]
+        - [B, T, D]
+        - [B, H, W, D]
+
+        Returns:
+            Tensor with same leading dimensions and final dimension `out_dim`.
+        """
+        if not isinstance(tokens, torch.Tensor):
+            raise TypeError(f"tokens must be torch.Tensor, got {type(tokens).__name__}.")
+
+        if tokens.ndim < 2:
+            raise IBOTHeadError(
+                f"tokens rank must be >= 2, got rank={tokens.ndim} shape={tuple(tokens.shape)}."
+            )
+
+        last_dim: int = int(tokens.shape[-1])
+        if last_dim != self.embed_dim:
+            raise IBOTHeadError(
+                f"tokens last dimension must be {self.embed_dim}, got {last_dim}."
+            )
+
+        original_shape: Tuple[int, ...] = tuple(tokens.shape[:-1])
+        flat_tokens: torch.Tensor = tokens.reshape(-1, self.embed_dim)
+
+        flat_tokens = flat_tokens.to(dtype=torch.float32)
+        projected: torch.Tensor = self.pre_norm(flat_tokens)
+        projected = self.fc1(projected)
+        projected = self.act(projected)
+        projected = self.drop(projected)
+        projected = self.fc2(projected)
+
+        # L2-normalized outputs are stable for cosine/softmax distillation.
+        projected = F.normalize(projected, p=2.0, dim=-1, eps=1.0e-12)
+
+        output: torch.Tensor = projected.reshape(*original_shape, self.out_dim)
+        if not torch.isfinite(output).all():
+            raise IBOTHeadError("IBOTHead produced non-finite values.")
+
+        return output
+
+
+__all__ = [
+    "IBOTHeadError",
+    "IBOTHeadConfigError",
+    "IBOTHead",
+]
+

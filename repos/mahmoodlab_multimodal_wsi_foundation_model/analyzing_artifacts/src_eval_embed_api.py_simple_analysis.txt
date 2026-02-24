@@ -1,0 +1,8 @@
+Implemented the requested logic analysis in [src/eval/embed_api.py](/Users/mingatlas/Projects/Paper2Code/src/eval/embed_api.py).
+
+It now contains a structured, paper-aligned specification for the `EmbeddingService` interface, including:
+- exact design-bound API contract
+- config.yaml-bound constants and invariants
+- centering + L2 normalization rules shared across eval tasks
+- task-by-task integration expectations (linear/few-shot/zero-shot/retrieval/survival)
+- error handling, reproducibility constraints, and guardrails against inventing missing hyperparameters.

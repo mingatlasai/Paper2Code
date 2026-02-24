@@ -1,0 +1,3 @@
+Implemented the requested logic analysis in [src/baselines/mean_pooling.py](/Users/mingatlas/Projects/Paper2Code/src/baselines/mean_pooling.py).
+
+It is aligned to the paper/design/config constraints for the mean-pooling baseline: fixed 512px@20x patch-feature inputs, 768-d output embeddings, unsupervised/no-training behavior, integration with probe/retrieval/survival pipelines, shared normalization expectations, and explicit failure/reproducibility guardrails.

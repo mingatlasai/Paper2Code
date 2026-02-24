@@ -1,0 +1,792 @@
+"""Stage-1 trainer for TITAN-V iBOT pretraining in feature space.
+
+This module implements the design-locked public interface:
+- Stage1Trainer.__init__(model: TITANEncoder, ibot_head: IBOTHead, loss_fn: IBOTLoss, cfg: TrainConfig)
+- Stage1Trainer.train_step(batch: dict) -> dict
+
+It builds on BaseTrainer for loop orchestration, AMP/grad-accum handling,
+checkpointing, and logging.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+import torch
+from torch.optim import AdamW
+
+from src.core.config_schema import TrainConfig
+from src.models.ibot_heads import IBOTHead
+from src.models.losses import IBOTLoss
+from src.models.titan_encoder import TITANEncoder
+from src.train.base_trainer import BaseTrainer, TrainerConfigError
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml and task contract.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE1_GLOBAL_VIEWS: int = 2
+_STAGE1_GLOBAL_GRID: Tuple[int, int] = (14, 14)
+_STAGE1_LOCAL_VIEWS: int = 10
+_STAGE1_LOCAL_GRID: Tuple[int, int] = (6, 6)
+
+_STAGE1_EPOCHS: int = 270
+_STAGE1_ITERATIONS: int = 91260
+_STAGE1_BATCH_SIZE_PER_GPU: int = 256
+_STAGE1_EFFECTIVE_BATCH_SIZE: int = 1024
+
+# Explicit defaults for unresolved supplementary hyperparameters.
+_DEFAULT_LR: float = 1.0e-4
+_DEFAULT_WEIGHT_DECAY: float = 0.05
+_DEFAULT_BETA1: float = 0.9
+_DEFAULT_BETA2: float = 0.95
+_DEFAULT_EMA_MOMENTUM: float = 0.996
+_DEFAULT_MASK_RATIO: float = 0.30
+_DEFAULT_POSTERIZATION_LEVELS: int = 16
+_DEFAULT_MIN_MASKED_TOKENS: int = 1
+
+_DEFAULT_RNG_SEED: int = 42
+
+
+class Stage1TrainerError(RuntimeError):
+    """Base exception for Stage1Trainer failures."""
+
+
+@dataclass(frozen=True)
+class _Stage1ViewBatch:
+    """Normalized stage-1 multi-view batch tensors."""
+
+    global_features: torch.Tensor
+    global_coords_xy: torch.Tensor
+    global_valid_masks: torch.Tensor
+    local_features: torch.Tensor
+    local_coords_xy: torch.Tensor
+    local_valid_masks: torch.Tensor
+    slide_ids: Tuple[str, ...]
+
+
+class Stage1Trainer(BaseTrainer):
+    """Stage-1 TITAN-V trainer using iBOT in feature space."""
+
+    def __init__(self, model: TITANEncoder, ibot_head: IBOTHead, loss_fn: IBOTLoss, cfg: TrainConfig) -> None:
+        """Initialize Stage1Trainer.
+
+        Args:
+            model: TITAN vision encoder.
+            ibot_head: iBOT projection head.
+            loss_fn: iBOT loss module.
+            cfg: Stage1 training config.
+        """
+        if not isinstance(model, TITANEncoder):
+            raise TrainerConfigError(f"model must be TITANEncoder, got {type(model).__name__}.")
+        if not isinstance(ibot_head, IBOTHead):
+            raise TrainerConfigError(f"ibot_head must be IBOTHead, got {type(ibot_head).__name__}.")
+        if not isinstance(loss_fn, IBOTLoss):
+            raise TrainerConfigError(f"loss_fn must be IBOTLoss, got {type(loss_fn).__name__}.")
+        if not isinstance(cfg, TrainConfig):
+            raise TrainerConfigError(f"cfg must be TrainConfig, got {type(cfg).__name__}.")
+
+        super().__init__(model=model, cfg=cfg)
+
+        if str(self.stage) != "stage1_titan_v":
+            raise TrainerConfigError(
+                f"Stage1Trainer requires cfg.stage='stage1_titan_v', got {self.stage!r}."
+            )
+
+        self.ibot_head: IBOTHead = ibot_head.to(self.device)
+        self.loss_fn: IBOTLoss = loss_fn.to(self.device)
+
+        # Provenance constants.
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.feature_dim: int = _FEATURE_DIM
+        self.stage1_region_grid: Tuple[int, int] = _STAGE1_REGION_GRID
+        self.stage1_global_views: int = _STAGE1_GLOBAL_VIEWS
+        self.stage1_global_grid: Tuple[int, int] = _STAGE1_GLOBAL_GRID
+        self.stage1_local_views: int = _STAGE1_LOCAL_VIEWS
+        self.stage1_local_grid: Tuple[int, int] = _STAGE1_LOCAL_GRID
+
+        self.mask_ratio: float = self._resolve_mask_ratio(cfg)
+        self.posterization_levels: int = self._resolve_posterization_levels(cfg)
+        self.ema_momentum: float = self._resolve_ema_momentum(cfg)
+
+        self._rng: torch.Generator = torch.Generator(device="cpu")
+        self._rng.manual_seed(self._resolve_seed_value(cfg))
+
+        # EMA teacher branches.
+        self.ema_teacher: TITANEncoder = self._clone_encoder_for_ema(model)
+        self.ema_ibot_head: IBOTHead = self._clone_head_for_ema(ibot_head)
+
+        # Stage1 optimizer (student branches only).
+        optimizer_lr: float = self._resolve_optimizer_lr(cfg)
+        optimizer_weight_decay: float = self._resolve_optimizer_weight_decay(cfg)
+        optimizer_betas: Tuple[float, float] = self._resolve_optimizer_betas(cfg)
+
+        self.optimizer = AdamW(
+            params=list(self.model.parameters()) + list(self.ibot_head.parameters()),
+            lr=optimizer_lr,
+            betas=optimizer_betas,
+            weight_decay=optimizer_weight_decay,
+        )
+        self.scheduler = None
+
+        self._validate_stage1_invariants(cfg)
+
+        self.logger.info(
+            "Initialized Stage1Trainer.",
+            context={
+                "stage": self.stage,
+                "epochs": self.epochs,
+                "batch_size": self.batch_size,
+                "effective_batch_size": self.effective_batch_size,
+                "mask_ratio": self.mask_ratio,
+                "ema_momentum": self.ema_momentum,
+                "optimizer": "AdamW",
+                "optimizer_lr": optimizer_lr,
+                "optimizer_weight_decay": optimizer_weight_decay,
+                "optimizer_betas": optimizer_betas,
+            },
+        )
+
+    def train_step(self, batch: dict) -> dict:
+        """Run one stage-1 iBOT training step.
+
+        Args:
+            batch: Stage-1 collated batch dictionary.
+
+        Returns:
+            Metric mapping including required `loss` key.
+        """
+        normalized: _Stage1ViewBatch = self._normalize_stage1_batch(batch=batch)
+
+        student_global: torch.Tensor = self._encode_views(
+            encoder=self.model,
+            head=self.ibot_head,
+            view_features=normalized.global_features,
+            view_coords=normalized.global_coords_xy,
+            view_valid_masks=normalized.global_valid_masks,
+        )
+        student_local: torch.Tensor = self._encode_views(
+            encoder=self.model,
+            head=self.ibot_head,
+            view_features=normalized.local_features,
+            view_coords=normalized.local_coords_xy,
+            view_valid_masks=normalized.local_valid_masks,
+        )
+
+        with torch.no_grad():
+            teacher_global: torch.Tensor = self._encode_views(
+                encoder=self.ema_teacher,
+                head=self.ema_ibot_head,
+                view_features=normalized.global_features,
+                view_coords=normalized.global_coords_xy,
+                view_valid_masks=normalized.global_valid_masks,
+            )
+            teacher_local: torch.Tensor = self._encode_views(
+                encoder=self.ema_teacher,
+                head=self.ema_ibot_head,
+                view_features=normalized.local_features,
+                view_coords=normalized.local_coords_xy,
+                view_valid_masks=normalized.local_valid_masks,
+            )
+
+        global_loss, global_masked_tokens = self._compute_viewset_loss(
+            student_views=student_global,
+            teacher_views=teacher_global,
+            valid_masks=normalized.global_valid_masks,
+            group_name="global",
+        )
+        local_loss, local_masked_tokens = self._compute_viewset_loss(
+            student_views=student_local,
+            teacher_views=teacher_local,
+            valid_masks=normalized.local_valid_masks,
+            group_name="local",
+        )
+
+        loss: torch.Tensor = 0.5 * (global_loss + local_loss)
+
+        # Surface detailed stats from IBOTLoss when available.
+        distill_component: float = float(self.loss_fn.last_stats.get("loss_distill", 0.0))
+        masked_component: float = float(self.loss_fn.last_stats.get("loss_masked", 0.0))
+
+        metrics: Dict[str, Any] = {
+            "loss": loss,
+            "loss_global": global_loss.detach(),
+            "loss_local": local_loss.detach(),
+            "ibot_loss_distill": torch.tensor(distill_component, device=loss.device, dtype=loss.dtype),
+            "ibot_loss_masked": torch.tensor(masked_component, device=loss.device, dtype=loss.dtype),
+            "masked_tokens_global": torch.tensor(float(global_masked_tokens), device=loss.device, dtype=loss.dtype),
+            "masked_tokens_local": torch.tensor(float(local_masked_tokens), device=loss.device, dtype=loss.dtype),
+            "ema_momentum": torch.tensor(float(self.ema_momentum), device=loss.device, dtype=loss.dtype),
+        }
+        return metrics
+
+    def validate_step(self, batch: dict) -> dict:
+        """Validation step for stage-1.
+
+        Validation uses the same objective but does not update EMA state.
+        """
+        normalized: _Stage1ViewBatch = self._normalize_stage1_batch(batch=batch)
+
+        student_global: torch.Tensor = self._encode_views(
+            encoder=self.model,
+            head=self.ibot_head,
+            view_features=normalized.global_features,
+            view_coords=normalized.global_coords_xy,
+            view_valid_masks=normalized.global_valid_masks,
+        )
+        student_local: torch.Tensor = self._encode_views(
+            encoder=self.model,
+            head=self.ibot_head,
+            view_features=normalized.local_features,
+            view_coords=normalized.local_coords_xy,
+            view_valid_masks=normalized.local_valid_masks,
+        )
+
+        with torch.no_grad():
+            teacher_global: torch.Tensor = self._encode_views(
+                encoder=self.ema_teacher,
+                head=self.ema_ibot_head,
+                view_features=normalized.global_features,
+                view_coords=normalized.global_coords_xy,
+                view_valid_masks=normalized.global_valid_masks,
+            )
+            teacher_local: torch.Tensor = self._encode_views(
+                encoder=self.ema_teacher,
+                head=self.ema_ibot_head,
+                view_features=normalized.local_features,
+                view_coords=normalized.local_coords_xy,
+                view_valid_masks=normalized.local_valid_masks,
+            )
+
+            global_loss, global_masked_tokens = self._compute_viewset_loss(
+                student_views=student_global,
+                teacher_views=teacher_global,
+                valid_masks=normalized.global_valid_masks,
+                group_name="val_global",
+            )
+            local_loss, local_masked_tokens = self._compute_viewset_loss(
+                student_views=student_local,
+                teacher_views=teacher_local,
+                valid_masks=normalized.local_valid_masks,
+                group_name="val_local",
+            )
+
+            loss: torch.Tensor = 0.5 * (global_loss + local_loss)
+
+        metrics: Dict[str, Any] = {
+            "loss": loss,
+            "loss_global": global_loss,
+            "loss_local": local_loss,
+            "masked_tokens_global": torch.tensor(float(global_masked_tokens), device=loss.device, dtype=loss.dtype),
+            "masked_tokens_local": torch.tensor(float(local_masked_tokens), device=loss.device, dtype=loss.dtype),
+        }
+        return metrics
+
+    # ------------------------------------------------------------------
+    # BaseTrainer hooks
+    # ------------------------------------------------------------------
+    def _on_optimizer_step(self) -> None:
+        """Update EMA teacher model/head after each optimizer step."""
+        self._ema_update_module(self.ema_teacher, self.model, self.ema_momentum)
+        self._ema_update_module(self.ema_ibot_head, self.ibot_head, self.ema_momentum)
+
+    def _export_optional_ema_state(self) -> Optional[Mapping[str, Any]]:
+        """Export stage-1 EMA and iBOT center state into checkpoint."""
+        payload: Dict[str, Any] = {
+            "ema_teacher": self.ema_teacher.state_dict(),
+            "ema_ibot_head": self.ema_ibot_head.state_dict(),
+            "ibot_center": self.loss_fn.center.detach().cpu(),
+            "ibot_center_initialized": bool(getattr(self.loss_fn, "_center_initialized", False)),
+            "ema_momentum": float(self.ema_momentum),
+        }
+        return payload
+
+    def _load_optional_ema_state(self, checkpoint: Mapping[str, Any]) -> None:
+        """Restore stage-1 EMA and iBOT center state from checkpoint."""
+        raw_ema_state: Any = checkpoint.get("ema_teacher_state_dict")
+        if not isinstance(raw_ema_state, Mapping):
+            return
+
+        teacher_state: Any = raw_ema_state.get("ema_teacher")
+        if isinstance(teacher_state, Mapping):
+            self.ema_teacher.load_state_dict(teacher_state, strict=False)
+
+        head_state: Any = raw_ema_state.get("ema_ibot_head")
+        if isinstance(head_state, Mapping):
+            self.ema_ibot_head.load_state_dict(head_state, strict=False)
+
+        center_obj: Any = raw_ema_state.get("ibot_center")
+        if isinstance(center_obj, torch.Tensor):
+            self.loss_fn.center = center_obj.to(device=self.device, dtype=torch.float32)
+            self.loss_fn._center_initialized = bool(raw_ema_state.get("ibot_center_initialized", True))
+
+        if "ema_momentum" in raw_ema_state:
+            momentum_value: float = float(raw_ema_state["ema_momentum"])
+            if 0.0 <= momentum_value < 1.0:
+                self.ema_momentum = momentum_value
+
+    # ------------------------------------------------------------------
+    # Internal stage-1 logic
+    # ------------------------------------------------------------------
+    def _normalize_stage1_batch(self, batch: Any) -> _Stage1ViewBatch:
+        if not isinstance(batch, Mapping):
+            raise Stage1TrainerError(f"Stage1 batch must be mapping, got {type(batch).__name__}.")
+
+        global_features: torch.Tensor = self._require_tensor(batch, "global_features", torch.float32)
+        global_coords_xy: torch.Tensor = self._require_tensor(batch, "global_coords_xy", torch.float32)
+        global_valid_masks: torch.Tensor = self._require_tensor(batch, "global_valid_masks", torch.bool)
+
+        local_features: torch.Tensor = self._require_tensor(batch, "local_features", torch.float32)
+        local_coords_xy: torch.Tensor = self._require_tensor(batch, "local_coords_xy", torch.float32)
+        local_valid_masks: torch.Tensor = self._require_tensor(batch, "local_valid_masks", torch.bool)
+
+        self._validate_view_tensor_shapes(
+            global_features=global_features,
+            global_coords_xy=global_coords_xy,
+            global_valid_masks=global_valid_masks,
+            local_features=local_features,
+            local_coords_xy=local_coords_xy,
+            local_valid_masks=local_valid_masks,
+        )
+
+        raw_slide_ids: Any = batch.get("slide_ids", None)
+        if isinstance(raw_slide_ids, (list, tuple)):
+            slide_ids: Tuple[str, ...] = tuple(str(item) for item in raw_slide_ids)
+        else:
+            batch_size: int = int(global_features.shape[0])
+            slide_ids = tuple(f"sample_{idx}" for idx in range(batch_size))
+
+        return _Stage1ViewBatch(
+            global_features=global_features,
+            global_coords_xy=global_coords_xy,
+            global_valid_masks=global_valid_masks,
+            local_features=local_features,
+            local_coords_xy=local_coords_xy,
+            local_valid_masks=local_valid_masks,
+            slide_ids=slide_ids,
+        )
+
+    def _encode_views(
+        self,
+        encoder: TITANEncoder,
+        head: IBOTHead,
+        view_features: torch.Tensor,
+        view_coords: torch.Tensor,
+        view_valid_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode per-view tensors into projected token embeddings.
+
+        Args:
+            encoder: Vision encoder (student or EMA teacher).
+            head: Projection head (student or EMA teacher).
+            view_features: [B,V,H,W,D]
+            view_coords: [B,V,H,W,2]
+            view_valid_masks: [B,V,H,W]
+
+        Returns:
+            Projected tokens [B,V,T,D_out].
+        """
+        if view_features.ndim != 5:
+            raise Stage1TrainerError(f"view_features must be [B,V,H,W,D], got {tuple(view_features.shape)}.")
+        if view_coords.ndim != 5:
+            raise Stage1TrainerError(f"view_coords must be [B,V,H,W,2], got {tuple(view_coords.shape)}.")
+        if view_valid_masks.ndim != 4:
+            raise Stage1TrainerError(
+                f"view_valid_masks must be [B,V,H,W], got {tuple(view_valid_masks.shape)}."
+            )
+
+        batch_size: int = int(view_features.shape[0])
+        num_views: int = int(view_features.shape[1])
+
+        projected_list: list[torch.Tensor] = []
+        for view_index in range(num_views):
+            features_bhwd: torch.Tensor = view_features[:, view_index, :, :, :]
+            coords_bhw2: torch.Tensor = view_coords[:, view_index, :, :, :]
+            valid_bhw: torch.Tensor = view_valid_masks[:, view_index, :, :]
+
+            encoded_btd: torch.Tensor = encoder(
+                grid_tokens=features_bhwd,
+                pos_xy=coords_bhw2,
+                attn_mask=valid_bhw,
+            )
+            if encoded_btd.ndim != 3:
+                raise Stage1TrainerError(
+                    "TITANEncoder must return [B,T,D] for 4D input. "
+                    f"Got {tuple(encoded_btd.shape)}."
+                )
+
+            projected_btd: torch.Tensor = head(encoded_btd)
+            if projected_btd.ndim != 3:
+                raise Stage1TrainerError(
+                    f"IBOTHead output must be [B,T,D], got {tuple(projected_btd.shape)}."
+                )
+
+            projected_list.append(projected_btd)
+
+        output: torch.Tensor = torch.stack(projected_list, dim=1)
+        if int(output.shape[0]) != batch_size or int(output.shape[1]) != num_views:
+            raise Stage1TrainerError(
+                "Projected view stack shape mismatch. "
+                f"Expected [B={batch_size},V={num_views},T,D], got {tuple(output.shape)}."
+            )
+        return output
+
+    def _compute_viewset_loss(
+        self,
+        student_views: torch.Tensor,
+        teacher_views: torch.Tensor,
+        valid_masks: torch.Tensor,
+        group_name: str,
+    ) -> Tuple[torch.Tensor, int]:
+        """Compute mean iBOT loss across all views in a group."""
+        if student_views.ndim != 4 or teacher_views.ndim != 4:
+            raise Stage1TrainerError(
+                f"student/teacher views must be [B,V,T,D], got {tuple(student_views.shape)} and {tuple(teacher_views.shape)}."
+            )
+
+        if tuple(student_views.shape) != tuple(teacher_views.shape):
+            raise Stage1TrainerError(
+                f"{group_name}: student and teacher view tensors must match shape. "
+                f"Got {tuple(student_views.shape)} vs {tuple(teacher_views.shape)}."
+            )
+
+        batch_size: int = int(student_views.shape[0])
+        num_views: int = int(student_views.shape[1])
+        num_tokens: int = int(student_views.shape[2])
+
+        mask_bt_view: torch.Tensor = valid_masks.reshape(batch_size, num_views, num_tokens).to(dtype=torch.bool)
+
+        per_view_losses: list[torch.Tensor] = []
+        total_masked_tokens: int = 0
+
+        for view_index in range(num_views):
+            student_btd: torch.Tensor = student_views[:, view_index, :, :]
+            teacher_btd: torch.Tensor = teacher_views[:, view_index, :, :].detach()
+
+            valid_bt: torch.Tensor = mask_bt_view[:, view_index, :]
+            token_mask_bt: torch.Tensor = self._sample_mask(valid_bt)
+
+            masked_count: int = int(token_mask_bt.to(dtype=torch.int64).sum().item())
+            total_masked_tokens += masked_count
+
+            loss_view: torch.Tensor = self.loss_fn.compute(
+                student_out=student_btd,
+                teacher_out=teacher_btd,
+                mask=token_mask_bt,
+            )
+            per_view_losses.append(loss_view)
+
+        if len(per_view_losses) == 0:
+            raise Stage1TrainerError(f"{group_name}: no view losses computed.")
+
+        stacked_losses: torch.Tensor = torch.stack(per_view_losses, dim=0)
+        group_loss: torch.Tensor = stacked_losses.mean()
+        return group_loss, total_masked_tokens
+
+    def _sample_mask(self, valid_mask_bt: torch.Tensor) -> torch.Tensor:
+        """Sample masked-token boolean mask constrained to valid tokens."""
+        if valid_mask_bt.ndim != 2:
+            raise Stage1TrainerError(
+                f"valid_mask_bt must be [B,T], got {tuple(valid_mask_bt.shape)}."
+            )
+
+        batch_size: int = int(valid_mask_bt.shape[0])
+        num_tokens: int = int(valid_mask_bt.shape[1])
+
+        random_uniform: torch.Tensor = torch.rand(
+            (batch_size, num_tokens),
+            generator=self._rng,
+            device=valid_mask_bt.device,
+            dtype=torch.float32,
+        )
+        sampled_mask: torch.Tensor = random_uniform < float(self.mask_ratio)
+        sampled_mask = sampled_mask & valid_mask_bt
+
+        # Ensure at least one masked token per sample when possible.
+        if _DEFAULT_MIN_MASKED_TOKENS > 0:
+            valid_counts: torch.Tensor = valid_mask_bt.sum(dim=1)
+            sampled_counts: torch.Tensor = sampled_mask.sum(dim=1)
+            for batch_index in range(batch_size):
+                if int(valid_counts[batch_index].item()) <= 0:
+                    continue
+                if int(sampled_counts[batch_index].item()) >= _DEFAULT_MIN_MASKED_TOKENS:
+                    continue
+
+                valid_indices: torch.Tensor = torch.nonzero(valid_mask_bt[batch_index], as_tuple=False).flatten()
+                if int(valid_indices.numel()) <= 0:
+                    continue
+                pick: int = int(
+                    torch.randint(
+                        low=0,
+                        high=int(valid_indices.numel()),
+                        size=(1,),
+                        generator=self._rng,
+                        device=valid_mask_bt.device,
+                    ).item()
+                )
+                token_idx: int = int(valid_indices[pick].item())
+                sampled_mask[batch_index, token_idx] = True
+
+        return sampled_mask
+
+    @staticmethod
+    def _ema_update_module(target: torch.nn.Module, source: torch.nn.Module, momentum: float) -> None:
+        if not (0.0 <= float(momentum) < 1.0):
+            raise Stage1TrainerError(f"EMA momentum must be in [0,1), got {momentum}.")
+
+        with torch.no_grad():
+            target_params = dict(target.named_parameters())
+            source_params = dict(source.named_parameters())
+            if target_params.keys() != source_params.keys():
+                raise Stage1TrainerError("EMA parameter key mismatch between target and source modules.")
+
+            for name, target_param in target_params.items():
+                source_param: torch.nn.Parameter = source_params[name]
+                target_param.data.mul_(float(momentum)).add_(source_param.data, alpha=1.0 - float(momentum))
+
+            target_buffers = dict(target.named_buffers())
+            source_buffers = dict(source.named_buffers())
+            for name, target_buffer in target_buffers.items():
+                if name in source_buffers:
+                    target_buffer.copy_(source_buffers[name])
+
+    @staticmethod
+    def _clone_encoder_for_ema(model: TITANEncoder) -> TITANEncoder:
+        ema_model: TITANEncoder = TITANEncoder(cfg=model.cfg)
+        ema_model.load_state_dict(model.state_dict(), strict=True)
+        ema_model.eval()
+        for parameter in ema_model.parameters():
+            parameter.requires_grad = False
+        return ema_model
+
+    @staticmethod
+    def _clone_head_for_ema(head: IBOTHead) -> IBOTHead:
+        ema_head: IBOTHead = IBOTHead(embed_dim=int(head.embed_dim), out_dim=int(head.out_dim))
+        ema_head.load_state_dict(head.state_dict(), strict=True)
+        ema_head.eval()
+        for parameter in ema_head.parameters():
+            parameter.requires_grad = False
+        return ema_head
+
+    def _validate_stage1_invariants(self, cfg: TrainConfig) -> None:
+        if int(self.batch_size) != _STAGE1_BATCH_SIZE_PER_GPU:
+            raise TrainerConfigError(
+                f"Stage1 batch_size must be {_STAGE1_BATCH_SIZE_PER_GPU}, got {self.batch_size}."
+            )
+        if int(self.effective_batch_size) != _STAGE1_EFFECTIVE_BATCH_SIZE:
+            raise TrainerConfigError(
+                f"Stage1 effective_batch_size must be {_STAGE1_EFFECTIVE_BATCH_SIZE}, got {self.effective_batch_size}."
+            )
+        if int(self.epochs) != _STAGE1_EPOCHS:
+            raise TrainerConfigError(f"Stage1 epochs must be {_STAGE1_EPOCHS}, got {self.epochs}.")
+
+        iterations_value: Optional[int] = None
+        if hasattr(cfg, "iterations"):
+            raw_iter: Any = getattr(cfg, "iterations")
+            if raw_iter is not None:
+                iterations_value = int(raw_iter)
+        if iterations_value is not None and iterations_value != _STAGE1_ITERATIONS:
+            raise TrainerConfigError(
+                f"Stage1 iterations must be {_STAGE1_ITERATIONS}, got {iterations_value}."
+            )
+
+        if int(self.model.embed_dim) != _FEATURE_DIM:
+            raise TrainerConfigError(
+                f"TITANEncoder embed_dim must be {_FEATURE_DIM}, got {self.model.embed_dim}."
+            )
+
+    @staticmethod
+    def _require_tensor(batch: Mapping[str, Any], key: str, dtype: torch.dtype) -> torch.Tensor:
+        value: Any = batch.get(key)
+        if not isinstance(value, torch.Tensor):
+            raise Stage1TrainerError(
+                f"Batch key '{key}' must be torch.Tensor, got {type(value).__name__}."
+            )
+        return value.to(dtype=dtype)
+
+    def _validate_view_tensor_shapes(
+        self,
+        global_features: torch.Tensor,
+        global_coords_xy: torch.Tensor,
+        global_valid_masks: torch.Tensor,
+        local_features: torch.Tensor,
+        local_coords_xy: torch.Tensor,
+        local_valid_masks: torch.Tensor,
+    ) -> None:
+        if global_features.ndim != 5:
+            raise Stage1TrainerError(
+                f"global_features must be [B,V,H,W,D], got {tuple(global_features.shape)}."
+            )
+        if local_features.ndim != 5:
+            raise Stage1TrainerError(
+                f"local_features must be [B,V,H,W,D], got {tuple(local_features.shape)}."
+            )
+
+        g_b, g_v, g_h, g_w, g_d = [int(x) for x in global_features.shape]
+        l_b, l_v, l_h, l_w, l_d = [int(x) for x in local_features.shape]
+
+        if g_b <= 0 or l_b <= 0:
+            raise Stage1TrainerError("Batch size must be > 0 for stage1 views.")
+        if g_b != l_b:
+            raise Stage1TrainerError(
+                f"Global/local batch size mismatch: {g_b} vs {l_b}."
+            )
+
+        if g_v != _STAGE1_GLOBAL_VIEWS:
+            raise Stage1TrainerError(
+                f"Expected {_STAGE1_GLOBAL_VIEWS} global views, got {g_v}."
+            )
+        if l_v != _STAGE1_LOCAL_VIEWS:
+            raise Stage1TrainerError(
+                f"Expected {_STAGE1_LOCAL_VIEWS} local views, got {l_v}."
+            )
+
+        if (g_h, g_w) != _STAGE1_GLOBAL_GRID:
+            raise Stage1TrainerError(
+                f"Global view grid must be {_STAGE1_GLOBAL_GRID}, got {(g_h, g_w)}."
+            )
+        if (l_h, l_w) != _STAGE1_LOCAL_GRID:
+            raise Stage1TrainerError(
+                f"Local view grid must be {_STAGE1_LOCAL_GRID}, got {(l_h, l_w)}."
+            )
+
+        if g_d != _FEATURE_DIM or l_d != _FEATURE_DIM:
+            raise Stage1TrainerError(
+                f"View feature dim must be {_FEATURE_DIM}, got global={g_d}, local={l_d}."
+            )
+
+        expected_global_coords: Tuple[int, int, int, int, int] = (g_b, g_v, g_h, g_w, 2)
+        expected_local_coords: Tuple[int, int, int, int, int] = (l_b, l_v, l_h, l_w, 2)
+
+        if tuple(global_coords_xy.shape) != expected_global_coords:
+            raise Stage1TrainerError(
+                "global_coords_xy shape mismatch. "
+                f"Expected {expected_global_coords}, got {tuple(global_coords_xy.shape)}."
+            )
+        if tuple(local_coords_xy.shape) != expected_local_coords:
+            raise Stage1TrainerError(
+                "local_coords_xy shape mismatch. "
+                f"Expected {expected_local_coords}, got {tuple(local_coords_xy.shape)}."
+            )
+
+        expected_global_masks: Tuple[int, int, int, int] = (g_b, g_v, g_h, g_w)
+        expected_local_masks: Tuple[int, int, int, int] = (l_b, l_v, l_h, l_w)
+
+        if tuple(global_valid_masks.shape) != expected_global_masks:
+            raise Stage1TrainerError(
+                "global_valid_masks shape mismatch. "
+                f"Expected {expected_global_masks}, got {tuple(global_valid_masks.shape)}."
+            )
+        if tuple(local_valid_masks.shape) != expected_local_masks:
+            raise Stage1TrainerError(
+                "local_valid_masks shape mismatch. "
+                f"Expected {expected_local_masks}, got {tuple(local_valid_masks.shape)}."
+            )
+
+    @staticmethod
+    def _resolve_seed_value(cfg: TrainConfig) -> int:
+        raw_seed: Any = getattr(cfg, "seed", _DEFAULT_RNG_SEED)
+        seed_value: int = int(raw_seed)
+        if seed_value < 0:
+            raise TrainerConfigError(f"seed must be >= 0, got {seed_value}.")
+        return seed_value
+
+    @staticmethod
+    def _resolve_optimizer_lr(cfg: TrainConfig) -> float:
+        lr_value: Optional[float] = None
+        if getattr(cfg, "lr", None) is not None:
+            lr_value = float(getattr(cfg, "lr"))
+        else:
+            optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+            if optimizer_cfg is not None and getattr(optimizer_cfg, "learning_rate", None) is not None:
+                lr_value = float(getattr(optimizer_cfg, "learning_rate"))
+
+        if lr_value is None:
+            lr_value = _DEFAULT_LR
+        if lr_value <= 0.0:
+            raise TrainerConfigError(f"learning rate must be > 0, got {lr_value}.")
+        return float(lr_value)
+
+    @staticmethod
+    def _resolve_optimizer_weight_decay(cfg: TrainConfig) -> float:
+        wd_value: Optional[float] = None
+        if getattr(cfg, "weight_decay", None) is not None:
+            wd_value = float(getattr(cfg, "weight_decay"))
+        else:
+            optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+            if optimizer_cfg is not None and getattr(optimizer_cfg, "weight_decay", None) is not None:
+                wd_value = float(getattr(optimizer_cfg, "weight_decay"))
+
+        if wd_value is None:
+            wd_value = _DEFAULT_WEIGHT_DECAY
+        if wd_value < 0.0:
+            raise TrainerConfigError(f"weight decay must be >= 0, got {wd_value}.")
+        return float(wd_value)
+
+    @staticmethod
+    def _resolve_optimizer_betas(cfg: TrainConfig) -> Tuple[float, float]:
+        beta1: float = _DEFAULT_BETA1
+        beta2: float = _DEFAULT_BETA2
+
+        optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+        betas_obj: Any = None
+        if optimizer_cfg is not None:
+            betas_obj = getattr(optimizer_cfg, "betas", None)
+
+        if isinstance(betas_obj, (list, tuple)) and len(betas_obj) == 2:
+            beta1 = float(betas_obj[0])
+            beta2 = float(betas_obj[1])
+
+        if not (0.0 <= beta1 < 1.0 and 0.0 <= beta2 < 1.0):
+            raise TrainerConfigError(f"optimizer betas must be in [0,1), got ({beta1}, {beta2}).")
+        return float(beta1), float(beta2)
+
+    @staticmethod
+    def _resolve_mask_ratio(cfg: TrainConfig) -> float:
+        ratio_value: Optional[float] = None
+        ibot_cfg: Any = getattr(cfg, "ibot", None)
+        if ibot_cfg is not None and getattr(ibot_cfg, "mask_ratio", None) is not None:
+            ratio_value = float(getattr(ibot_cfg, "mask_ratio"))
+
+        if ratio_value is None:
+            ratio_value = _DEFAULT_MASK_RATIO
+
+        if ratio_value < 0.0 or ratio_value > 1.0:
+            raise TrainerConfigError(f"mask_ratio must be in [0,1], got {ratio_value}.")
+        return float(ratio_value)
+
+    @staticmethod
+    def _resolve_ema_momentum(cfg: TrainConfig) -> float:
+        momentum_value: Optional[float] = None
+        ibot_cfg: Any = getattr(cfg, "ibot", None)
+        if ibot_cfg is not None and getattr(ibot_cfg, "ema_momentum", None) is not None:
+            momentum_value = float(getattr(ibot_cfg, "ema_momentum"))
+
+        if momentum_value is None:
+            momentum_value = _DEFAULT_EMA_MOMENTUM
+
+        if momentum_value < 0.0 or momentum_value >= 1.0:
+            raise TrainerConfigError(f"ema_momentum must be in [0,1), got {momentum_value}.")
+        return float(momentum_value)
+
+    @staticmethod
+    def _resolve_posterization_levels(cfg: TrainConfig) -> int:
+        levels_value: int = _DEFAULT_POSTERIZATION_LEVELS
+        # Kept for provenance; stage-1 dataset currently applies posterization.
+        _ = cfg
+        if levels_value <= 1:
+            raise TrainerConfigError(f"posterization levels must be > 1, got {levels_value}.")
+        return int(levels_value)
+
+
+__all__ = [
+    "Stage1TrainerError",
+    "Stage1Trainer",
+]

@@ -1,0 +1,9 @@
+Implemented the logic analysis in [src/models/losses.py](/Users/mingatlas/Projects/Paper2Code/src/models/losses.py).
+
+It now provides a structured, paper-aligned spec for:
+- `IBOTLoss` (design-locked API),
+- stage-2/3 contrastive InfoNCE loss,
+- stage-2/3 caption cross-entropy,
+- combined weighted objectives with config-driven/fallback handling for missing supplementary hyperparameters.
+
+No executable loss code was added yet, per your instruction.

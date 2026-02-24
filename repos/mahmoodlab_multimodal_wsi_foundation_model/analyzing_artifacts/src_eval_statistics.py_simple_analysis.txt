@@ -1,0 +1,9 @@
+Implemented the requested logic analysis in [src/eval/statistics.py](/Users/mingatlas/Projects/Paper2Code/src/eval/statistics.py).
+
+It now defines a paper- and config-aligned analysis for:
+- `bootstrap_metrics(...)` with default `n_boot=1000`
+- `fold_mean_std(...)` for fold-based reporting
+- optional `fit_glmm(...)` with beta-family mixed-effects framing
+- optional `pairwise_tests_glmm(..., method="tukey")`
+
+It also explicitly documents constraints, unresolved supplementary gaps, failure modes, and interoperability expectations with the other eval modules.

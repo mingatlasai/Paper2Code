@@ -1,0 +1,8 @@
+Implemented the requested logic analysis in:
+
+- [src/core/logging_utils.py](/Users/mingatlas/Projects/Paper2Code/src/core/logging_utils.py)
+
+It is analysis-only (no executable code), and it is aligned to:
+- the paper methodology,
+- your design interfaces (without adding/changing public APIs),
+- and the provided `config.yaml` values only (including explicit handling of `null` hyperparameters).

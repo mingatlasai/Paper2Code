@@ -1,0 +1,707 @@
+"""Linear probe evaluation for TITAN slide embeddings.
+
+This module provides a complete, config-aligned implementation for linear probing
+with scikit-learn LogisticRegression (L-BFGS), matching the provided protocol:
+- L2 grid search over 45 log-spaced values in [1e-6, 10] when validation exists.
+- No-validation fallback: L2=1, max_iter=1000.
+- Binary metrics: balanced accuracy + AUROC.
+- Multiclass metrics: balanced accuracy + weighted F1.
+
+Design compatibility:
+- Expected consumer interface: ``Evaluator.run_linear_probe(features, y, split)``.
+- This file therefore exposes ``LinearProbeEvaluator.run_linear_probe`` with that
+  exact method signature.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import balanced_accuracy_score, f1_score, roc_auc_score
+from sklearn.preprocessing import LabelEncoder
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+_LINEAR_SOLVER: str = "lbfgs"
+_LINEAR_L2_GRID_COUNT: int = 45
+_LINEAR_L2_GRID_MIN: float = 1.0e-6
+_LINEAR_L2_GRID_MAX: float = 10.0
+_LINEAR_MAX_ITER_WITH_VAL: int = 500
+_LINEAR_NO_VAL_L2: float = 1.0
+_LINEAR_NO_VAL_MAX_ITER: int = 1000
+
+_DEFAULT_APPLY_CENTER_L2: bool = False
+_DEFAULT_RANDOM_STATE: int = 42
+_DEFAULT_EPS: float = 1.0e-12
+
+
+class LinearProbeError(RuntimeError):
+    """Base exception for linear probe evaluation failures."""
+
+
+class LinearProbeSchemaError(LinearProbeError):
+    """Raised when input schema/shape contracts are violated."""
+
+
+@dataclass(frozen=True)
+class _FoldSpec:
+    """Single split/fold index specification."""
+
+    train_idx: np.ndarray
+    val_idx: Optional[np.ndarray]
+    test_idx: np.ndarray
+    fold_id: str
+
+
+@dataclass(frozen=True)
+class _FitResult:
+    """Result bundle for one train/(val)/test run."""
+
+    fold_id: str
+    l2_selected: float
+    c_selected: float
+    max_iter: int
+    has_validation: bool
+    train_size: int
+    val_size: int
+    test_size: int
+    metrics_train: Dict[str, float]
+    metrics_val: Dict[str, float]
+    metrics_test: Dict[str, float]
+
+
+class LinearProbeEvaluator:
+    """Linear probe evaluator with validation-aware L2 selection."""
+
+    def __init__(
+        self,
+        l2_grid_count: int = _LINEAR_L2_GRID_COUNT,
+        l2_grid_min: float = _LINEAR_L2_GRID_MIN,
+        l2_grid_max: float = _LINEAR_L2_GRID_MAX,
+        max_iter_with_val: int = _LINEAR_MAX_ITER_WITH_VAL,
+        no_val_l2: float = _LINEAR_NO_VAL_L2,
+        no_val_max_iter: int = _LINEAR_NO_VAL_MAX_ITER,
+        solver: str = _LINEAR_SOLVER,
+        apply_center_l2: bool = _DEFAULT_APPLY_CENTER_L2,
+        random_state: int = _DEFAULT_RANDOM_STATE,
+    ) -> None:
+        """Initialize a linear probe evaluator.
+
+        Args:
+            l2_grid_count: Number of L2 values in search grid.
+            l2_grid_min: Minimum L2 value in log grid.
+            l2_grid_max: Maximum L2 value in log grid.
+            max_iter_with_val: Max L-BFGS iterations when validation exists.
+            no_val_l2: Fixed L2 when validation does not exist.
+            no_val_max_iter: Max iterations when no validation exists.
+            solver: LogisticRegression solver. Must be ``lbfgs``.
+            apply_center_l2: Whether to center and L2-normalize features using
+                train-only statistics before fitting.
+            random_state: Deterministic random seed for solver.
+        """
+        if isinstance(l2_grid_count, bool) or not isinstance(l2_grid_count, int):
+            raise TypeError("l2_grid_count must be an integer.")
+        if l2_grid_count <= 0:
+            raise ValueError("l2_grid_count must be > 0.")
+        if not isinstance(l2_grid_min, (int, float)):
+            raise TypeError("l2_grid_min must be numeric.")
+        if not isinstance(l2_grid_max, (int, float)):
+            raise TypeError("l2_grid_max must be numeric.")
+        if float(l2_grid_min) <= 0.0 or float(l2_grid_max) <= 0.0:
+            raise ValueError("l2_grid_min and l2_grid_max must be > 0.")
+        if float(l2_grid_min) > float(l2_grid_max):
+            raise ValueError("l2_grid_min must be <= l2_grid_max.")
+
+        if isinstance(max_iter_with_val, bool) or not isinstance(max_iter_with_val, int):
+            raise TypeError("max_iter_with_val must be an integer.")
+        if isinstance(no_val_max_iter, bool) or not isinstance(no_val_max_iter, int):
+            raise TypeError("no_val_max_iter must be an integer.")
+        if max_iter_with_val <= 0 or no_val_max_iter <= 0:
+            raise ValueError("Iteration limits must be > 0.")
+
+        if not isinstance(no_val_l2, (int, float)):
+            raise TypeError("no_val_l2 must be numeric.")
+        if float(no_val_l2) <= 0.0:
+            raise ValueError("no_val_l2 must be > 0.")
+
+        solver_value: str = str(solver).strip().lower()
+        if solver_value != _LINEAR_SOLVER:
+            raise ValueError(
+                f"solver must be '{_LINEAR_SOLVER}' per config protocol, got '{solver}'."
+            )
+
+        if isinstance(random_state, bool) or not isinstance(random_state, int):
+            raise TypeError("random_state must be an integer.")
+
+        self.l2_grid_count: int = int(l2_grid_count)
+        self.l2_grid_min: float = float(l2_grid_min)
+        self.l2_grid_max: float = float(l2_grid_max)
+        self.max_iter_with_val: int = int(max_iter_with_val)
+        self.no_val_l2: float = float(no_val_l2)
+        self.no_val_max_iter: int = int(no_val_max_iter)
+        self.solver: str = solver_value
+        self.apply_center_l2: bool = bool(apply_center_l2)
+        self.random_state: int = int(random_state)
+
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.feature_dim: int = _FEATURE_DIM
+        self.stage1_region_grid: Tuple[int, int] = _STAGE1_REGION_GRID
+        self.stage3_crop_grid: Tuple[int, int] = _STAGE3_CROP_GRID
+
+        # Strict config binding checks.
+        if self.l2_grid_count != _LINEAR_L2_GRID_COUNT:
+            raise ValueError(
+                f"l2_grid_count must be {_LINEAR_L2_GRID_COUNT}, got {self.l2_grid_count}."
+            )
+        if abs(self.l2_grid_min - _LINEAR_L2_GRID_MIN) > 1e-18:
+            raise ValueError(
+                f"l2_grid_min must be {_LINEAR_L2_GRID_MIN}, got {self.l2_grid_min}."
+            )
+        if abs(self.l2_grid_max - _LINEAR_L2_GRID_MAX) > 1e-18:
+            raise ValueError(
+                f"l2_grid_max must be {_LINEAR_L2_GRID_MAX}, got {self.l2_grid_max}."
+            )
+        if self.max_iter_with_val != _LINEAR_MAX_ITER_WITH_VAL:
+            raise ValueError(
+                "max_iter_with_val must be "
+                f"{_LINEAR_MAX_ITER_WITH_VAL}, got {self.max_iter_with_val}."
+            )
+        if abs(self.no_val_l2 - _LINEAR_NO_VAL_L2) > 1e-18:
+            raise ValueError(f"no_val_l2 must be {_LINEAR_NO_VAL_L2}, got {self.no_val_l2}.")
+        if self.no_val_max_iter != _LINEAR_NO_VAL_MAX_ITER:
+            raise ValueError(
+                f"no_val_max_iter must be {_LINEAR_NO_VAL_MAX_ITER}, got {self.no_val_max_iter}."
+            )
+
+        self._l2_grid: np.ndarray = np.logspace(
+            np.log10(self.l2_grid_min),
+            np.log10(self.l2_grid_max),
+            num=self.l2_grid_count,
+            endpoint=True,
+            dtype=np.float64,
+        )
+
+    def run_linear_probe(self, features: np.ndarray, y: np.ndarray, split: dict) -> dict:
+        """Run linear probing on one split or multiple folds.
+
+        Args:
+            features: Embedding matrix with shape [N, 768].
+            y: Label vector with shape [N].
+            split: Split spec as mapping. Supported formats:
+                - Single split with keys: ``train`` and ``test``, optional ``val``.
+                - Folded split with key ``folds`` as list of split dicts.
+              Each index spec may be integer indices or boolean masks.
+
+        Returns:
+            Structured dictionary with fold results and aggregated metrics.
+        """
+        x: np.ndarray = self._validate_features(features)
+        labels_raw: np.ndarray = self._validate_labels(y=y, expected_n=int(x.shape[0]))
+
+        label_encoder: LabelEncoder = LabelEncoder()
+        labels: np.ndarray = label_encoder.fit_transform(labels_raw)
+        class_names: List[str] = [str(item) for item in label_encoder.classes_.tolist()]
+
+        fold_specs: List[_FoldSpec] = self._parse_split(split=split, n_samples=int(x.shape[0]))
+
+        fold_results: List[_FitResult] = []
+        for fold_spec in fold_specs:
+            result: _FitResult = self._run_single_fold(
+                x=x,
+                y=labels,
+                fold_spec=fold_spec,
+            )
+            fold_results.append(result)
+
+        aggregate_test: Dict[str, float] = _aggregate_metric_dicts(
+            [item.metrics_test for item in fold_results]
+        )
+
+        fold_dicts: List[Dict[str, Any]] = [
+            {
+                "fold_id": result.fold_id,
+                "l2_selected": float(result.l2_selected),
+                "c_selected": float(result.c_selected),
+                "max_iter": int(result.max_iter),
+                "has_validation": bool(result.has_validation),
+                "train_size": int(result.train_size),
+                "val_size": int(result.val_size),
+                "test_size": int(result.test_size),
+                "metrics_train": dict(result.metrics_train),
+                "metrics_val": dict(result.metrics_val),
+                "metrics_test": dict(result.metrics_test),
+            }
+            for result in fold_results
+        ]
+
+        output: Dict[str, Any] = {
+            "task": "linear_probe",
+            "protocol": {
+                "solver": self.solver,
+                "l2_grid_count": self.l2_grid_count,
+                "l2_grid_min": self.l2_grid_min,
+                "l2_grid_max": self.l2_grid_max,
+                "max_iter_with_val": self.max_iter_with_val,
+                "no_val_l2": self.no_val_l2,
+                "no_val_max_iter": self.no_val_max_iter,
+                "apply_center_l2": self.apply_center_l2,
+            },
+            "input": {
+                "n_samples": int(x.shape[0]),
+                "n_features": int(x.shape[1]),
+                "n_classes": int(len(class_names)),
+                "classes": class_names,
+                "num_folds": int(len(fold_results)),
+            },
+            "folds": fold_dicts,
+            "aggregate_test": aggregate_test,
+        }
+        return output
+
+    def _run_single_fold(self, x: np.ndarray, y: np.ndarray, fold_spec: _FoldSpec) -> _FitResult:
+        train_idx: np.ndarray = fold_spec.train_idx
+        test_idx: np.ndarray = fold_spec.test_idx
+        val_idx: Optional[np.ndarray] = fold_spec.val_idx
+
+        x_train: np.ndarray = x[train_idx]
+        y_train: np.ndarray = y[train_idx]
+        x_test: np.ndarray = x[test_idx]
+        y_test: np.ndarray = y[test_idx]
+
+        x_val: Optional[np.ndarray] = None
+        y_val: Optional[np.ndarray] = None
+        has_validation: bool = val_idx is not None and int(val_idx.shape[0]) > 0
+        if has_validation:
+            x_val = x[val_idx]  # type: ignore[index]
+            y_val = y[val_idx]  # type: ignore[index]
+
+        if self.apply_center_l2:
+            x_train_proc, mean_vec = self._center_and_l2(x_train, mean_vec=None)
+            x_test_proc, _ = self._center_and_l2(x_test, mean_vec=mean_vec)
+            if has_validation and x_val is not None:
+                x_val_proc, _ = self._center_and_l2(x_val, mean_vec=mean_vec)
+            else:
+                x_val_proc = None
+        else:
+            x_train_proc = x_train
+            x_test_proc = x_test
+            x_val_proc = x_val
+
+        if has_validation and x_val_proc is not None and y_val is not None:
+            l2_selected: float = self._select_l2_with_validation(
+                x_train=x_train_proc,
+                y_train=y_train,
+                x_val=x_val_proc,
+                y_val=y_val,
+            )
+            max_iter: int = self.max_iter_with_val
+        else:
+            l2_selected = self.no_val_l2
+            max_iter = self.no_val_max_iter
+
+        c_selected: float = self._l2_to_c(l2_selected)
+        model: LogisticRegression = self._fit_logreg(
+            x_train=x_train_proc,
+            y_train=y_train,
+            c_value=c_selected,
+            max_iter=max_iter,
+        )
+
+        y_pred_train: np.ndarray = model.predict(x_train_proc)
+        y_prob_train: np.ndarray = model.predict_proba(x_train_proc)
+        metrics_train: Dict[str, float] = self._compute_metrics(
+            y_true=y_train,
+            y_pred=y_pred_train,
+            y_prob=y_prob_train,
+            classes=model.classes_,
+        )
+
+        if has_validation and x_val_proc is not None and y_val is not None:
+            y_pred_val: np.ndarray = model.predict(x_val_proc)
+            y_prob_val: np.ndarray = model.predict_proba(x_val_proc)
+            metrics_val: Dict[str, float] = self._compute_metrics(
+                y_true=y_val,
+                y_pred=y_pred_val,
+                y_prob=y_prob_val,
+                classes=model.classes_,
+            )
+        else:
+            metrics_val = {}
+
+        y_pred_test: np.ndarray = model.predict(x_test_proc)
+        y_prob_test: np.ndarray = model.predict_proba(x_test_proc)
+        metrics_test: Dict[str, float] = self._compute_metrics(
+            y_true=y_test,
+            y_pred=y_pred_test,
+            y_prob=y_prob_test,
+            classes=model.classes_,
+        )
+
+        return _FitResult(
+            fold_id=fold_spec.fold_id,
+            l2_selected=float(l2_selected),
+            c_selected=float(c_selected),
+            max_iter=int(max_iter),
+            has_validation=bool(has_validation),
+            train_size=int(train_idx.shape[0]),
+            val_size=int(0 if val_idx is None else val_idx.shape[0]),
+            test_size=int(test_idx.shape[0]),
+            metrics_train=metrics_train,
+            metrics_val=metrics_val,
+            metrics_test=metrics_test,
+        )
+
+    def _select_l2_with_validation(
+        self,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        x_val: np.ndarray,
+        y_val: np.ndarray,
+    ) -> float:
+        best_l2: float = float(self._l2_grid[0])
+        best_score: float = -np.inf
+
+        for l2_value in self._l2_grid.tolist():
+            c_value: float = self._l2_to_c(float(l2_value))
+            model: LogisticRegression = self._fit_logreg(
+                x_train=x_train,
+                y_train=y_train,
+                c_value=c_value,
+                max_iter=self.max_iter_with_val,
+            )
+
+            y_pred_val: np.ndarray = model.predict(x_val)
+            y_prob_val: np.ndarray = model.predict_proba(x_val)
+            metrics_val: Dict[str, float] = self._compute_metrics(
+                y_true=y_val,
+                y_pred=y_pred_val,
+                y_prob=y_prob_val,
+                classes=model.classes_,
+            )
+
+            # Primary selection metric: balanced accuracy (paper-aligned across tasks).
+            score: float = float(metrics_val.get("balanced_accuracy", -np.inf))
+
+            # Deterministic tie-break: prefer smaller L2 (stronger regularization).
+            if score > best_score or (np.isclose(score, best_score) and float(l2_value) < best_l2):
+                best_score = score
+                best_l2 = float(l2_value)
+
+        return best_l2
+
+    def _fit_logreg(
+        self,
+        x_train: np.ndarray,
+        y_train: np.ndarray,
+        c_value: float,
+        max_iter: int,
+    ) -> LogisticRegression:
+        if not np.isfinite(x_train).all():
+            raise LinearProbeSchemaError("x_train contains NaN/Inf values.")
+
+        unique_classes: np.ndarray = np.unique(y_train)
+        if int(unique_classes.shape[0]) < 2:
+            raise LinearProbeSchemaError(
+                "Training split must contain at least two classes for logistic regression."
+            )
+
+        model: LogisticRegression = LogisticRegression(
+            penalty="l2",
+            C=float(c_value),
+            solver=self.solver,
+            max_iter=int(max_iter),
+            multi_class="auto",
+            random_state=self.random_state,
+        )
+        model.fit(x_train, y_train)
+        return model
+
+    @staticmethod
+    def _l2_to_c(l2_value: float) -> float:
+        if l2_value <= 0.0:
+            raise ValueError(f"l2_value must be > 0, got {l2_value}.")
+        return 1.0 / float(l2_value)
+
+    def _compute_metrics(
+        self,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_prob: np.ndarray,
+        classes: np.ndarray,
+    ) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+
+        metrics["balanced_accuracy"] = float(balanced_accuracy_score(y_true, y_pred))
+
+        n_classes: int = int(np.unique(y_true).shape[0])
+        if n_classes <= 1:
+            raise LinearProbeSchemaError("y_true must contain at least 2 classes for evaluation.")
+
+        if n_classes == 2:
+            # Binary task: AUROC + balanced accuracy.
+            positive_column: int = 1
+            if y_prob.ndim != 2 or int(y_prob.shape[1]) < 2:
+                raise LinearProbeSchemaError(
+                    f"Binary probabilities must have shape [N,2], got {tuple(y_prob.shape)}."
+                )
+            y_score: np.ndarray = y_prob[:, positive_column]
+            metrics["auroc"] = float(roc_auc_score(y_true, y_score))
+        else:
+            # Multiclass task: weighted F1 + balanced accuracy.
+            metrics["weighted_f1"] = float(f1_score(y_true, y_pred, average="weighted"))
+
+        return metrics
+
+    @staticmethod
+    def _validate_features(features: Any) -> np.ndarray:
+        if not isinstance(features, np.ndarray):
+            features = np.asarray(features)
+        x: np.ndarray = np.asarray(features, dtype=np.float64)
+
+        if x.ndim != 2:
+            raise LinearProbeSchemaError(f"features must be rank-2 [N,D], got {tuple(x.shape)}.")
+        if int(x.shape[0]) <= 0:
+            raise LinearProbeSchemaError("features must contain at least one sample.")
+        if int(x.shape[1]) != _FEATURE_DIM:
+            raise LinearProbeSchemaError(
+                f"features second dimension must be {_FEATURE_DIM}, got {int(x.shape[1])}."
+            )
+        if not np.isfinite(x).all():
+            raise LinearProbeSchemaError("features contain NaN/Inf values.")
+        return x
+
+    @staticmethod
+    def _validate_labels(y: Any, expected_n: int) -> np.ndarray:
+        if not isinstance(y, np.ndarray):
+            y = np.asarray(y)
+        labels: np.ndarray = np.asarray(y)
+
+        if labels.ndim != 1:
+            raise LinearProbeSchemaError(f"y must be rank-1 [N], got {tuple(labels.shape)}.")
+        if int(labels.shape[0]) != int(expected_n):
+            raise LinearProbeSchemaError(
+                f"y length must match number of samples ({expected_n}), got {int(labels.shape[0])}."
+            )
+        if int(labels.shape[0]) <= 1:
+            raise LinearProbeSchemaError("y must contain at least two samples.")
+        return labels
+
+    def _parse_split(self, split: Any, n_samples: int) -> List[_FoldSpec]:
+        if not isinstance(split, Mapping):
+            raise LinearProbeSchemaError(
+                f"split must be a mapping, got {type(split).__name__}."
+            )
+
+        if "folds" in split:
+            folds_obj: Any = split.get("folds")
+            if not isinstance(folds_obj, Sequence) or isinstance(folds_obj, (str, bytes)):
+                raise LinearProbeSchemaError("split['folds'] must be a sequence of fold mappings.")
+            fold_specs: List[_FoldSpec] = []
+            for fold_idx, fold_item in enumerate(folds_obj):
+                if not isinstance(fold_item, Mapping):
+                    raise LinearProbeSchemaError(
+                        f"Each fold must be a mapping, got {type(fold_item).__name__} at index {fold_idx}."
+                    )
+                fold_id: str = str(fold_item.get("fold_id", f"fold_{fold_idx}"))
+                fold_specs.append(self._parse_single_fold(fold_item, n_samples=n_samples, fold_id=fold_id))
+            if len(fold_specs) == 0:
+                raise LinearProbeSchemaError("split['folds'] is empty.")
+            return fold_specs
+
+        return [self._parse_single_fold(split, n_samples=n_samples, fold_id="fold_0")]
+
+    def _parse_single_fold(self, split: Mapping[str, Any], n_samples: int, fold_id: str) -> _FoldSpec:
+        if "train" not in split or "test" not in split:
+            raise LinearProbeSchemaError(
+                "Each split must contain at least 'train' and 'test' index specs."
+            )
+
+        train_idx: np.ndarray = self._to_indices(split["train"], n_samples=n_samples, name=f"{fold_id}.train")
+        test_idx: np.ndarray = self._to_indices(split["test"], n_samples=n_samples, name=f"{fold_id}.test")
+
+        val_idx: Optional[np.ndarray]
+        if "val" in split and split.get("val") is not None:
+            val_idx = self._to_indices(split["val"], n_samples=n_samples, name=f"{fold_id}.val")
+            if int(val_idx.shape[0]) == 0:
+                val_idx = None
+        else:
+            val_idx = None
+
+        self._validate_disjoint_indices(
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            fold_id=fold_id,
+        )
+
+        if int(train_idx.shape[0]) <= 0:
+            raise LinearProbeSchemaError(f"{fold_id}: train split is empty.")
+        if int(test_idx.shape[0]) <= 0:
+            raise LinearProbeSchemaError(f"{fold_id}: test split is empty.")
+
+        return _FoldSpec(
+            train_idx=train_idx,
+            val_idx=val_idx,
+            test_idx=test_idx,
+            fold_id=str(fold_id),
+        )
+
+    @staticmethod
+    def _to_indices(spec: Any, n_samples: int, name: str) -> np.ndarray:
+        if isinstance(spec, np.ndarray):
+            arr: np.ndarray = spec
+        elif isinstance(spec, (list, tuple)):
+            arr = np.asarray(spec)
+        else:
+            raise LinearProbeSchemaError(
+                f"{name}: index spec must be list/tuple/np.ndarray, got {type(spec).__name__}."
+            )
+
+        if arr.ndim != 1:
+            raise LinearProbeSchemaError(f"{name}: index spec must be rank-1, got {tuple(arr.shape)}.")
+
+        if arr.dtype == np.bool_:
+            if int(arr.shape[0]) != int(n_samples):
+                raise LinearProbeSchemaError(
+                    f"{name}: boolean mask length must be {n_samples}, got {int(arr.shape[0])}."
+                )
+            indices: np.ndarray = np.nonzero(arr)[0].astype(np.int64, copy=False)
+        else:
+            if not np.issubdtype(arr.dtype, np.integer):
+                if np.issubdtype(arr.dtype, np.floating):
+                    if not np.all(np.equal(arr, np.floor(arr))):
+                        raise LinearProbeSchemaError(f"{name}: floating indices must be integer-valued.")
+                    arr = arr.astype(np.int64)
+                else:
+                    raise LinearProbeSchemaError(
+                        f"{name}: indices must be integer or bool mask, got dtype={arr.dtype}."
+                    )
+            indices = np.asarray(arr, dtype=np.int64)
+
+        if indices.size == 0:
+            return indices
+
+        if np.any(indices < 0) or np.any(indices >= int(n_samples)):
+            raise LinearProbeSchemaError(
+                f"{name}: indices out of range [0,{n_samples - 1}]."
+            )
+
+        unique_indices: np.ndarray = np.unique(indices)
+        if int(unique_indices.shape[0]) != int(indices.shape[0]):
+            raise LinearProbeSchemaError(f"{name}: duplicate indices are not allowed.")
+
+        return unique_indices
+
+    @staticmethod
+    def _validate_disjoint_indices(
+        train_idx: np.ndarray,
+        val_idx: Optional[np.ndarray],
+        test_idx: np.ndarray,
+        fold_id: str,
+    ) -> None:
+        train_set: set[int] = set(int(v) for v in train_idx.tolist())
+        test_set: set[int] = set(int(v) for v in test_idx.tolist())
+        if len(train_set.intersection(test_set)) > 0:
+            raise LinearProbeSchemaError(f"{fold_id}: train/test splits overlap.")
+
+        if val_idx is not None:
+            val_set: set[int] = set(int(v) for v in val_idx.tolist())
+            if len(train_set.intersection(val_set)) > 0:
+                raise LinearProbeSchemaError(f"{fold_id}: train/val splits overlap.")
+            if len(test_set.intersection(val_set)) > 0:
+                raise LinearProbeSchemaError(f"{fold_id}: test/val splits overlap.")
+
+    @staticmethod
+    def _center_and_l2(x: np.ndarray, mean_vec: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+        if not isinstance(x, np.ndarray):
+            x = np.asarray(x)
+        matrix: np.ndarray = np.asarray(x, dtype=np.float32)
+
+        if matrix.ndim != 2:
+            raise LinearProbeSchemaError(
+                f"center/l2 expects rank-2 array [N,D], got {tuple(matrix.shape)}."
+            )
+        if matrix.shape[0] <= 0:
+            raise LinearProbeSchemaError("center/l2 received empty matrix.")
+        if not np.isfinite(matrix).all():
+            raise LinearProbeSchemaError("center/l2 input contains NaN/Inf values.")
+
+        used_mean: np.ndarray
+        if mean_vec is None:
+            used_mean = matrix.mean(axis=0, dtype=np.float64).astype(np.float32, copy=False)
+        else:
+            if not isinstance(mean_vec, np.ndarray):
+                mean_vec = np.asarray(mean_vec)
+            used_mean = np.asarray(mean_vec, dtype=np.float32)
+            if used_mean.ndim != 1 or int(used_mean.shape[0]) != int(matrix.shape[1]):
+                raise LinearProbeSchemaError(
+                    "mean_vec must have shape [D]. "
+                    f"Expected ({matrix.shape[1]},), got {tuple(used_mean.shape)}."
+                )
+
+        centered: np.ndarray = matrix - used_mean.reshape(1, -1)
+        norms: np.ndarray = np.linalg.norm(centered, ord=2, axis=1, keepdims=True)
+        norms = np.maximum(norms, float(_DEFAULT_EPS)).astype(np.float32, copy=False)
+        normalized: np.ndarray = centered / norms
+
+        if not np.isfinite(normalized).all():
+            raise LinearProbeSchemaError("center/l2 produced NaN/Inf values.")
+
+        return normalized.astype(np.float32, copy=False), used_mean.astype(np.float32, copy=False)
+
+
+def _aggregate_metric_dicts(metric_dicts: Sequence[Mapping[str, float]]) -> Dict[str, float]:
+    """Aggregate fold metric dictionaries into mean/std fields."""
+    if len(metric_dicts) == 0:
+        raise LinearProbeSchemaError("Cannot aggregate empty metric dictionaries.")
+
+    keys: List[str] = sorted({str(k) for metric in metric_dicts for k in metric.keys()})
+    output: Dict[str, float] = {}
+
+    for key in keys:
+        values: List[float] = []
+        for metric in metric_dicts:
+            if key in metric:
+                value: float = float(metric[key])
+                if np.isfinite(value):
+                    values.append(value)
+        if len(values) == 0:
+            continue
+
+        value_array: np.ndarray = np.asarray(values, dtype=np.float64)
+        output[f"{key}_mean"] = float(np.mean(value_array))
+        if value_array.shape[0] > 1:
+            output[f"{key}_std"] = float(np.std(value_array, ddof=1))
+        else:
+            output[f"{key}_std"] = 0.0
+
+    output["num_folds"] = float(len(metric_dicts))
+    return output
+
+
+# Convenience functional API.
+def run_linear_probe(features: np.ndarray, y: np.ndarray, split: dict) -> dict:
+    """Run linear probing with default config-aligned evaluator settings."""
+    evaluator: LinearProbeEvaluator = LinearProbeEvaluator()
+    return evaluator.run_linear_probe(features=features, y=y, split=split)
+
+
+__all__ = [
+    "LinearProbeError",
+    "LinearProbeSchemaError",
+    "LinearProbeEvaluator",
+    "run_linear_probe",
+]

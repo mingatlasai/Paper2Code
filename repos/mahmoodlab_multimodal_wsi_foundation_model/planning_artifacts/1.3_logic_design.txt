@@ -1,0 +1,152 @@
+----------------------------------------
+[Required packages]
+- torch==2.0.1
+- torchvision==0.15.2
+- timm==0.9.16
+- open-clip-torch==2.24.0
+- numpy==1.24.4
+- pandas==2.0.3
+- scikit-learn==1.2.2
+- scikit-survival==0.23.1
+- scipy==1.10.1
+- faiss-cpu==1.7.4
+- openslide-python==1.2.0
+- h5py==3.10.0
+- opencv-python==4.9.0.80
+- Pillow==10.2.0
+- hydra-core==1.3.2
+- omegaconf==2.3.0
+- pydantic==2.6.1
+- pyyaml==6.0.1
+- tqdm==4.66.2
+- matplotlib==3.8.4
+- seaborn==0.13.2
+- nltk==3.8.1
+- rouge-score==0.1.2
+- sacrebleu==2.4.0
+- statsmodels==0.14.1
+
+----------------------------------------
+[Required Other language third-party packages]
+- No third-party dependencies required
+
+----------------------------------------
+[Logic Analysis]
+- ['main.py', 'CLI entrypoint. Parses mode (`prepare_data`, `train_stage1`, `train_stage2`, `train_stage3`, `eval`), loads Hydra config, seeds runtime, builds registry objects, and dispatches to scripts or trainer/evaluator classes. Imports: `src/core/config_schema.py`, `src/core/registry.py`, `src/core/utils.py`, `scripts/*.py`.']
+- ['src/core/config_schema.py', 'Defines typed config contracts (Pydantic dataclasses): data/model/train/eval/runtime. Central dependency for all modules. Must include defaults and validation (paths, batch sizes, crop sizes, stage compatibility).']
+- ['src/core/registry.py', 'Factory/registry for datasets, models, trainers, evaluators. Avoids hardcoded branching in `main.py`. Dependency hub for dependency injection.']
+- ['src/core/utils.py', 'Shared helpers: seeding, distributed init, checkpoint I/O, tensor/device helpers, path creation, JSON/CSV writers. Imported almost everywhere.']
+- ['src/core/logging_utils.py', 'Unified logging and metric sinks (console + JSON + CSV). Ensures all stages produce comparable artifacts for final paper tables.']
+- ['src/data/wsi_reader.py', 'OpenSlide wrapper for reading metadata and regions. Must normalize coordinate conventions and magnification assumptions (20x). Consumed by segmentation/tiling/feature extraction.']
+- ['src/data/segment_tissue.py', 'Implements HSV saturation threshold segmentation + blur/morphological closing + contour filtering. Output: binary tissue masks and contours.']
+- ['src/data/tile_wsi.py', 'Generates non-overlapping 512x512 patch coordinates over segmented tissue. Applies min tissue fraction filtering. Saves coordinate maps for deterministic reruns.']
+- ['src/data/extract_patch_features.py', 'Loads pretrained patch encoder (CONCH-like substitute if unavailable), extracts 768-d features for all tiles, stores feature tensor + coords in HDF5/PT. Hard dependency for all later stages.']
+- ['src/data/build_feature_grid.py', 'Maps sparse (x,y,feat) to 2D feature grids and background masks. Provides random crop APIs: 16x16 for stage1, configurable 64x64 for stage3.']
+- ['src/data/tissue_grouping.py', 'Clusters tissue contours by spatial proximity, removes tiny groups (<16 patches), writes group metadata. Required for stage1 ROI sampling policy.']
+- ['src/data/caption_report_processing.py', 'Text pipeline for stage2/3: cleaning, PHI stripping hooks, tokenization, optional rewrite interfaces. Should support cached JSONL pairs.']
+- ['src/data/datasets.py', 'Defines `Stage1Dataset`, `Stage2Dataset`, `Stage3Dataset`, and downstream eval datasets. Uses grid/caption/report artifacts; returns strongly typed batches.']
+- ['src/data/collate.py', 'Custom collate functions for variable-size grids, token padding, attention masks, and multimodal batch objects.']
+- ['src/models/alibi_2d.py', 'Core 2D ALiBi bias implementation from patch-grid Euclidean distances. Imported by Transformer attention blocks in TITAN encoder.']
+- ['src/models/titan_encoder.py', 'ViT-style slide encoder in feature space: MLP feature embed, 6-layer transformer, 12 heads, dim 768, MLP 3072, ALiBi option. Shared by stage1 and multimodal stages.']
+- ['src/models/ibot_heads.py', 'Student/teacher projection heads for iBOT-style objectives in feature space. Stage1-specific.']
+- ['src/models/text_modules.py', 'Text encoder + tokenizer wrappers (OpenCLIP/HF). Must expose normalized text embeddings and decoder inputs.']
+- ['src/models/coca_multimodal.py', 'CoCa-style multimodal model: TITAN image backbone + contrastive pooler + reconstruction query pooler + multimodal decoder. Used in stage2/3 training and report generation.']
+- ['src/models/losses.py', 'Implements iBOT distillation + masked loss, contrastive InfoNCE loss, captioning cross-entropy, combined stage2/3 losses with weights.']
+- ['src/train/base_trainer.py', 'Common loop engine: AMP, grad accumulation, DDP sync, checkpointing, early stop hooks, metric logging.']
+- ['src/train/stage1_trainer.py', 'Stage1 specifics: generates 2 global + 10 local views from 16x16 crops, teacher EMA update, iBOT loss compute, TITAN-V checkpoint export.']
+- ['src/train/stage2_trainer.py', 'Stage2 ROI-caption continual pretraining: loads TITAN-V, optimizes contrastive+caption losses at ROI scale, large effective batch logic.']
+- ['src/train/stage3_trainer.py', 'Stage3 WSI-report continual pretraining: 64x64 grid crops, lower LR/warmup for vision backbone, final TITAN export.']
+- ['src/eval/embed_api.py', 'Single embedding interface for slide/text/report features. Handles centering + L2 normalization shared across probe/retrieval/zero-shot.']
+- ['src/eval/linear_probe.py', 'scikit-learn logistic regression (L-BFGS), hyperparameter search over regularization grid, multiclass/binary metrics.']
+- ['src/eval/knn_probe.py', 'Prototype and kNN (k=20) evaluation on centered-normalized embeddings.']
+- ['src/eval/few_shot.py', 'Few-shot K={1,2,4,8,16,32}, repeated sampling (50 runs), both SimpleShot prototype and optional linear-probe few-shot variant.']
+- ['src/eval/zero_shot.py', 'Prompt ensemble encoding, cosine similarity logits, class prediction; outputs balanced accuracy/AUROC per dataset.']
+- ['src/eval/retrieval.py', 'Unimodal and cross-modal retrieval evaluators. Computes Acc@K, MVAcc@5, Recall@K, mean recall with FAISS/scipy distances.']
+- ['src/eval/report_generation.py', 'Beam-search generation (`num_beams=5`), computes METEOR/ROUGE-1/BLEU-1 against references.']
+- ['src/eval/survival.py', 'Cox PH linear model with fold protocol and c-index computation using scikit-survival.']
+- ['src/eval/statistics.py', 'Bootstrap CI/s.d. and optional GLMM/Tukey pairwise comparison wrappers for paper-level significance testing.']
+- ['src/baselines/mean_pooling.py', 'Strong unsupervised baseline over patch features. Reused in probe/retrieval pipelines.']
+- ['src/baselines/abmil.py', 'Supervised ABMIL baseline for comparative experiments.']
+- ['scripts/prepare_public_data.py', 'End-to-end artifact preparation script (segmentation -> tiling -> features -> grids -> split manifests). Must be idempotent.']
+- ['scripts/run_stage1.py', 'Thin orchestrator for stage1 training with config overrides and checkpoint resume.']
+- ['scripts/run_stage2.py', 'Orchestrates stage2 multimodal training from TITAN-V checkpoint.']
+- ['scripts/run_stage3.py', 'Orchestrates stage3 multimodal training from stage2 checkpoint.']
+- ['scripts/run_eval.py', 'Runs requested downstream tasks and aggregates outputs into a single report artifact.']
+- ['configs/*.yaml', 'All reproducibility-critical settings in versioned YAML: model sizes, data paths, stage hyperparams, eval toggles, and seed. No hardcoded constants in Python.']
+- ['tests/test_alibi_2d.py', 'Validates ALiBi bias shape/value monotonicity and attention integration.']
+- ['tests/test_feature_grid.py', 'Checks coordinate->grid correctness, masking, and crop determinism.']
+- ['tests/test_losses.py', 'Unit tests for iBOT/contrastive/caption losses and weighted composition.']
+- ['tests/test_eval_metrics.py', 'Metric sanity tests for AUROC, balanced accuracy, retrieval@K, generation metrics.']
+
+----------------------------------------
+[Task list]
+- configs/default.yaml
+- configs/data/public_repro.yaml
+- configs/model/titan_v.yaml
+- configs/model/titan_multimodal.yaml
+- configs/train/stage1_ibot.yaml
+- configs/train/stage2_coca.yaml
+- configs/train/stage3_coca.yaml
+- configs/eval/linear_probe.yaml
+- configs/eval/few_shot.yaml
+- configs/eval/zero_shot.yaml
+- configs/eval/retrieval.yaml
+- configs/eval/report_generation.yaml
+- configs/eval/survival.yaml
+- src/core/config_schema.py
+- src/core/utils.py
+- src/core/logging_utils.py
+- src/core/registry.py
+- src/data/wsi_reader.py
+- src/data/segment_tissue.py
+- src/data/tile_wsi.py
+- src/data/extract_patch_features.py
+- src/data/build_feature_grid.py
+- src/data/tissue_grouping.py
+- src/data/caption_report_processing.py
+- src/data/datasets.py
+- src/data/collate.py
+- src/models/alibi_2d.py
+- src/models/titan_encoder.py
+- src/models/ibot_heads.py
+- src/models/text_modules.py
+- src/models/coca_multimodal.py
+- src/models/losses.py
+- src/train/base_trainer.py
+- src/train/stage1_trainer.py
+- src/train/stage2_trainer.py
+- src/train/stage3_trainer.py
+- scripts/prepare_public_data.py
+- scripts/run_stage1.py
+- scripts/run_stage2.py
+- scripts/run_stage3.py
+- src/eval/embed_api.py
+- src/eval/linear_probe.py
+- src/eval/knn_probe.py
+- src/eval/few_shot.py
+- src/eval/zero_shot.py
+- src/eval/retrieval.py
+- src/eval/report_generation.py
+- src/eval/survival.py
+- src/eval/statistics.py
+- src/baselines/mean_pooling.py
+- src/baselines/abmil.py
+- scripts/run_eval.py
+- main.py
+- tests/test_alibi_2d.py
+- tests/test_feature_grid.py
+- tests/test_losses.py
+- tests/test_eval_metrics.py
+
+----------------------------------------
+[Full API spec]
+
+
+----------------------------------------
+[Shared Knowledge]
+Global constants and conventions must be centralized in config: patch_size=512, train magnification=20x, stage1 region=16x16, stage1 views=(2 global 14x14 + 10 local 6x6), stage3 crop=64x64, embedding_dim=768, transformer_layers=6, heads=12, mlp_dim=3072. All modules must consume the same artifact formats (`features.h5`: coords+features, `grid.pt`: grid+mask, `pairs.jsonl`: slide/report/caption mappings, `splits.csv`: train/val/test/fold). `EmbeddingService` is shared by linear/few-shot/zero-shot/retrieval/survival to avoid inconsistent normalization. Metric definitions are shared in eval utils (balanced accuracy, weighted F1, AUROC, c-index, Acc@K, MVAcc@5, Recall@K, METEOR/ROUGE-1/BLEU-1). Reproducibility settings shared across scripts: deterministic seeds, fold definitions, bootstrap count (1000), run count for few-shot (50), and checkpoint naming (`titan_v.ckpt`, `titan_stage2.ckpt`, `titan_final.ckpt`).
+
+----------------------------------------
+[Anything UNCLEAR]
+Paper-critical details missing from provided text: full supplementary hyperparameters (optimizer betas, LR/WD schedules, warmup lengths, iBOT temperatures/centering/masking, stage2/3 loss weights), exact 2D ALiBi slope schedule, precise feature-space posterization augmentation, exact tissue-group clustering thresholds, and inaccessible internal datasets (Mass-340K and internal eval cohorts). Need decision: strict public-only reproduction vs institution-augmented reproduction.
+

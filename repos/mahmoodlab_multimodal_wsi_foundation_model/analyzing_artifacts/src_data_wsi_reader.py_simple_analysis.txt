@@ -1,0 +1,12 @@
+Implemented the requested logic analysis in [src/data/wsi_reader.py](/Users/mingatlas/Projects/Paper2Code/src/data/wsi_reader.py).
+
+It now contains a structured, paper-aligned analysis covering:
+- exact `WSIReader` interface constraints from the design,
+- coordinate normalization (level-0 convention),
+- 20x/mpp handling tied to `config.yaml`,
+- method-by-method responsibilities and failure modes,
+- downstream contracts with segmentation/tiling/feature extraction,
+- reproducibility and testing implications,
+- explicit handling of unspecified paper details without inventing values.
+
+No executable code was added yet, only analysis content as requested.

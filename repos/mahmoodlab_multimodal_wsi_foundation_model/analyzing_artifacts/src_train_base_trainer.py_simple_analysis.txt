@@ -1,0 +1,13 @@
+Implemented the requested logic analysis in:
+
+- [src/train/base_trainer.py](/Users/mingatlas/Projects/Paper2Code/src/train/base_trainer.py)
+
+What’s in it:
+- A full analysis blueprint for the common training loop engine (no executable code yet), covering:
+  - AMP flow
+  - gradient accumulation semantics
+  - DDP-safe sync/reduction and logging
+  - checkpoint save/load contracts and naming (`titan_v.ckpt`, `titan_stage2.ckpt`, `titan_final.ckpt`)
+  - optional early-stop hook logic
+  - stage-specific integration boundaries (`Stage1Trainer`, `Stage2Trainer`, `Stage3Trainer`)
+- All constraints are tied to the provided `config.yaml` values, and unspecified paper hyperparameters are explicitly treated as unresolved/null (not invented).

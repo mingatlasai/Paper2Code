@@ -1,0 +1,7 @@
+Implemented the requested logic analysis in [src/core/registry.py](/Users/mingatlas/Projects/Paper2Code/src/core/registry.py).
+
+It now documents, in a paper- and config-aligned way, how the registry should:
+- Register/create datasets, models, and trainers via the exact design interface.
+- Enforce stage-safe wiring for Stage 1/2/3 and eval integration.
+- Use only values from `config.yaml` (including null-handling for missing hyperparameters).
+- Centralize dependency injection and validation to avoid hardcoded branching in `main.py`.

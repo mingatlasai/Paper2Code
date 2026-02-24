@@ -1,0 +1,9 @@
+Completed. I wrote the full logic analysis to:
+
+[configs/data/public_repro.yaml](/Users/mingatlas/Projects/Paper2Code/configs/data/public_repro.yaml)
+
+It is now structured as a config-driven implementation guide aligned to:
+- the paper methodology,
+- your fixed design/interfaces,
+- the provided task list,
+- and `config.yaml` as the source of truth (with unresolved values explicitly kept as unresolved/null-driven).

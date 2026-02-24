@@ -1,0 +1,121 @@
+# configs/eval/zero_shot.yaml
+# Zero-shot evaluation configuration for TITAN vision-language slide understanding.
+# Values are constrained to the provided config.yaml and project design.
+
+eval:
+  name: zero_shot
+  enabled: true
+  task_type: classification
+
+  runtime:
+    python_version: "3.9.16"
+    pytorch_version: "2.0.1"
+    cuda_version: "11.8"
+    deterministic: true
+
+  hardware:
+    gpus: 1
+    gpu_type: "NVIDIA 3090 24GB"
+    num_workers: 4
+    pin_memory: true
+
+  data:
+    patch_size_px: 512
+    magnification: "20x"
+    patch_feature_dim: 768
+
+    # Shared artifact contract used across this project.
+    artifacts:
+      features_filename: "features.h5"
+      grid_filename: "grid.pt"
+      pairs_filename: "pairs.jsonl"
+      splits_filename: "splits.csv"
+
+    # Zero-shot evaluation does not fit a classifier; evaluate on fixed split.
+    split_policy:
+      eval_split: "test"
+      use_validation_split: false
+      use_training_split: false
+
+  model:
+    encoder_checkpoint: "titan_final.ckpt"
+    freeze_backbone: true
+
+    slide_encoder:
+      architecture: "ViT in feature space"
+      num_layers: 6
+      num_attention_heads: 12
+      head_dim: 64
+      embedding_dim: 768
+      mlp_hidden_dim: 3072
+      positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+
+    multimodal:
+      framework: "CoCa"
+      reconstruction_queries: 128
+      text_encoder_source: "CONCHv1.5 pretrained text encoder"
+      text_decoder_source: "CONCHv1.5 pretrained multimodal decoder"
+      text_encoder_layers: 12
+      text_decoder_layers: 12
+      text_embedding_dim: 768
+      text_hidden_dim: 3072
+
+  protocol:
+    method: "clip_style_nearest_text_embedding"
+
+    # Prompt-ensemble zero-shot classification:
+    # y_hat = argmax_c <u_i, v_c> where u_i and v_c are L2-normalized.
+    prompt_ensemble:
+      enabled: true
+      prompts_source: "dataset_metadata"
+      class_name_field: "class_name"
+      class_id_field: "class_id"
+      prompt_text_field: "prompt"
+      aggregation: "mean"
+      require_at_least_one_prompt_per_class: true
+
+    similarity:
+      metric: "cosine"
+      temperature: 1.0
+
+    # If prompt templates are unavailable for a class, use deterministic fallback.
+    fallback_prompt_templates:
+      enabled: true
+      templates:
+        - "a pathology whole-slide image of {label}."
+
+  preprocessing:
+    l2_normalize_slide_embeddings: true
+    l2_normalize_text_embeddings: true
+
+    # Centering is not required by the paper zero-shot method.
+    center_slide_embeddings: false
+    center_text_embeddings: false
+
+  metrics:
+    multiclass:
+      - "balanced_accuracy"
+      - "weighted_f1"
+    binary:
+      - "balanced_accuracy"
+      - "auroc"
+
+    aggregate:
+      bootstrap_samples: 1000
+      report_mean_std: true
+
+  io:
+    output_dir: "./outputs/eval/zero_shot"
+    predictions_filename: "zero_shot_predictions.csv"
+    summary_filename: "zero_shot_summary.csv"
+    metrics_filename: "zero_shot_metrics.json"
+    class_prompt_map_filename: "zero_shot_class_prompt_map.json"
+    write_json: true
+    write_csv: true
+
+  constraints:
+    require_embedding_dim_match: true
+    required_embedding_dim: 768
+    require_frozen_model: true
+    require_prompt_class_alignment: true
+    require_deterministic_eval: true

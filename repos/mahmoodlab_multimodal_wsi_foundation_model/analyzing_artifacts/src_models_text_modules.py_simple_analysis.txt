@@ -1,0 +1,9 @@
+Implemented the requested logic analysis in [src/models/text_modules.py](/Users/mingatlas/Projects/Paper2Code/src/models/text_modules.py).
+
+It now provides a paper/config-aligned, design-constrained analysis for:
+- `TextEncoder` interface contracts (`__init__`, `forward`)
+- OpenCLIP/HF wrapper expectations
+- normalized text embedding and decoder-input requirements
+- stage-2/stage-3/eval behavior alignment
+- unresolved hyperparameter handling (kept config-driven, no invented values)
+- failure modes, invariants, and testing implications.

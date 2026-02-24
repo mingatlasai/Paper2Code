@@ -1,0 +1,13 @@
+Added the logic analysis to [scripts/run_eval.py](/Users/mingatlas/Projects/Paper2Code/scripts/run_eval.py).
+
+It now specifies, in paper- and config-aligned detail:
+
+- Orchestrator responsibilities for downstream eval only
+- Strict interface usage from your fixed design (`Evaluator`, `EmbeddingService`, `StatsAnalyzer`, `Registry`)
+- Checkpoint capability gating (`titan_v` vs multimodal checkpoints)
+- Task dispatch logic for linear/kNN/few-shot/zero-shot/retrieval/cross-modal/report-generation/survival
+- Shared embedding reuse and leakage-safe normalization policy
+- Statistical aggregation and consolidated artifact schema (`eval_report.json`)
+- Hard invariants and fail-fast conditions tied to the provided `config.yaml` values
+
+If you want, I can now implement the executable version of this script from this analysis.

@@ -1,0 +1,9 @@
+Implemented the requested logic analysis in:
+
+- [src/core/config_schema.py](/Users/mingatlas/Projects/Paper2Code/src/core/config_schema.py)
+
+It is analysis-only (no implementation code), and it covers:
+- Typed config contract decomposition (`runtime/data/model/train/eval/experiment`)
+- Exact bindings to provided `config.yaml`
+- Cross-field validation logic and stage-compatibility checks
+- Invariants, failure modes, and unresolved (nullable) paper details without inventing values.

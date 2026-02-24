@@ -1,0 +1,10 @@
+Implemented the requested logic analysis in [tests/test_feature_grid.py](/Users/mingatlas/Projects/Paper2Code/tests/test_feature_grid.py).
+
+It now contains an analysis-only test plan covering:
+- coordinate-to-grid mapping correctness,
+- valid/background mask consistency,
+- stage-specific crop shape contracts (`16x16`, `64x64`),
+- deterministic and seeded-random crop reproducibility,
+- invalid-input failure cases aligned to config/design constraints.
+
+No executable tests were added yet, and no test run was performed.

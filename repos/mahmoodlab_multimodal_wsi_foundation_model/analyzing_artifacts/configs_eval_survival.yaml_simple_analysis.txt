@@ -1,0 +1,5 @@
+Completed. I created the requested logic analysis in:
+
+- [configs/eval/survival.yaml](/Users/mingatlas/Projects/Paper2Code/configs/eval/survival.yaml)
+
+It is aligned to the paper, your design interfaces, the task spec, and `config.yaml` (without inventing missing hyperparameters).

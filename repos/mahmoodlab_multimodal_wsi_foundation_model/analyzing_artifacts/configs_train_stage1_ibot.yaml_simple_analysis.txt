@@ -1,0 +1,5 @@
+Implemented the logic analysis in:
+
+- [configs/train/stage1_ibot.yaml](/Users/mingatlas/Projects/Paper2Code/configs/train/stage1_ibot.yaml)
+
+It is fully aligned to the provided paper excerpt, plan/design interfaces, task constraints, and `config.yaml`, with unresolved paper-only hyperparameters kept explicit as `null`/deferred rather than invented.

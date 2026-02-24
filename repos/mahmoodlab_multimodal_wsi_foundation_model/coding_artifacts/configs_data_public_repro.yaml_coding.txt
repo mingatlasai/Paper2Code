@@ -1,0 +1,43 @@
+## Code: configs/data/public_repro.yaml
+```yaml
+# configs/data/public_repro.yaml
+# Public-data reproduction profile for TITAN-style preprocessing and artifacts.
+
+profile:
+  name: public_repro
+  tier: public_data_only
+
+# DataConfig-aligned fields (see design: DataConfig)
+wsi_root: "./data/wsi"
+meta_csv: "./data/metadata/public_metadata.csv"
+splits_path: "./data/processed/splits.csv"
+
+# Source-of-truth constants from config.yaml
+patch_size: 512
+magnification: "20x"
+feature_dim: 768
+
+# Shared pipeline geometry from config.yaml
+roi_region_size_px: 8192
+roi_region_grid_size: [16, 16]
+stage3_wsi_crop_grid_size: [64, 64]
+stage3_wsi_crop_size_px: 32768
+
+# Shared artifact contract (from design/task)
+artifacts:
+  root_dir: "./data/processed"
+  features_filename: "features.h5"
+  grid_filename: "grid.pt"
+  groups_filename: "groups.json"
+  pairs_filename: "pairs.jsonl"
+  splits_filename: "splits.csv"
+
+# Stage-1 eligibility threshold from paper/task plan
+tissue_grouping:
+  min_patches_per_group: 16
+
+# Deterministic reproducibility defaults used across preparation/eval
+reproducibility:
+  bootstrap_samples: 1000
+  few_shot_runs: 50
+```

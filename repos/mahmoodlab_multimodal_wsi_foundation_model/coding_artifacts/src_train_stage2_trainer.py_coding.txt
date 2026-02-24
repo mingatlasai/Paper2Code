@@ -1,0 +1,689 @@
+## Code: src/train/stage2_trainer.py
+```python
+"""Stage-2 trainer for TITAN multimodal ROI-caption alignment.
+
+This module implements the design-locked public interface:
+- Stage2Trainer.__init__(model: CoCaModel, cfg: TrainConfig) -> None
+- Stage2Trainer.train_step(batch: MultimodalBatch) -> dict
+
+It extends BaseTrainer for loop orchestration, AMP/grad accumulation,
+checkpointing, and metric logging.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+import torch
+from torch.optim import AdamW
+
+from src.core.config_schema import TrainConfig
+from src.data.build_feature_grid import FeatureGrid
+from src.data.datasets import MultimodalBatch
+from src.models.coca_multimodal import CoCaModel
+from src.models.losses import compute_multimodal_stage_loss
+from src.train.base_trainer import BaseTrainer, TrainerConfigError
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml and task contract.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+_STAGE2_NUM_PAIRS: int = 423_122
+_STAGE2_BATCH_SIZE_PER_GPU: int = 196
+_STAGE2_GRAD_ACCUM_STEPS: int = 2
+_STAGE2_EFFECTIVE_BATCH_SIZE: int = 3_136
+
+# Explicit defaults for unresolved supplementary hyperparameters.
+_DEFAULT_LR: float = 1.0e-4
+_DEFAULT_WEIGHT_DECAY: float = 0.05
+_DEFAULT_BETA1: float = 0.9
+_DEFAULT_BETA2: float = 0.95
+_DEFAULT_CONTRASTIVE_WEIGHT: float = 1.0
+_DEFAULT_CAPTION_WEIGHT: float = 1.0
+_DEFAULT_LABEL_IGNORE_INDEX: int = -100
+
+_DEFAULT_SEED: int = 42
+
+
+class Stage2TrainerError(RuntimeError):
+    """Base exception for Stage2Trainer failures."""
+
+
+@dataclass(frozen=True)
+class _Stage2Batch:
+    """Normalized Stage-2 multimodal batch tensors."""
+
+    image_features: torch.Tensor
+    image_coords_xy: torch.Tensor
+    image_valid_mask: torch.Tensor
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    labels: torch.Tensor
+    slide_ids: Tuple[str, ...]
+
+
+class Stage2Trainer(BaseTrainer):
+    """Stage-2 CoCa trainer for ROI-caption continual pretraining."""
+
+    def __init__(self, model: CoCaModel, cfg: TrainConfig) -> None:
+        """Initialize Stage2Trainer.
+
+        Args:
+            model: CoCa multimodal model with TITAN vision backbone.
+            cfg: Stage-2 training config.
+        """
+        if not isinstance(model, CoCaModel):
+            raise TrainerConfigError(f"model must be CoCaModel, got {type(model).__name__}.")
+        if not isinstance(cfg, TrainConfig):
+            raise TrainerConfigError(f"cfg must be TrainConfig, got {type(cfg).__name__}.")
+
+        super().__init__(model=model, cfg=cfg)
+
+        if str(self.stage) != "stage2_roi_caption_alignment":
+            raise TrainerConfigError(
+                "Stage2Trainer requires cfg.stage='stage2_roi_caption_alignment', "
+                f"got {self.stage!r}."
+            )
+
+        # Type-narrow for static/runtime clarity.
+        self.model: CoCaModel = model.to(self.device)
+
+        # Provenance constants.
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.feature_dim: int = _FEATURE_DIM
+        self.stage1_region_grid: Tuple[int, int] = _STAGE1_REGION_GRID
+        self.stage3_crop_grid: Tuple[int, int] = _STAGE3_CROP_GRID
+        self.stage2_num_pairs: int = _STAGE2_NUM_PAIRS
+
+        self._seed: int = self._resolve_seed_value(cfg)
+        self._label_ignore_index: int = self._resolve_label_ignore_index(cfg)
+        self.contrastive_weight: float = self._resolve_contrastive_weight(cfg)
+        self.caption_weight: float = self._resolve_caption_weight(cfg)
+
+        optimizer_lr: float = self._resolve_optimizer_lr(cfg)
+        optimizer_weight_decay: float = self._resolve_optimizer_weight_decay(cfg)
+        optimizer_betas: Tuple[float, float] = self._resolve_optimizer_betas(cfg)
+
+        self.optimizer = AdamW(
+            params=list(self.model.parameters()),
+            lr=optimizer_lr,
+            betas=optimizer_betas,
+            weight_decay=optimizer_weight_decay,
+        )
+        self.scheduler = None
+
+        self._validate_stage2_invariants(cfg)
+
+        self.logger.info(
+            "Initialized Stage2Trainer.",
+            context={
+                "stage": self.stage,
+                "epochs": self.epochs,
+                "batch_size": self.batch_size,
+                "grad_accum_steps": self.grad_accum_steps,
+                "effective_batch_size": self.effective_batch_size,
+                "num_pairs": self.stage2_num_pairs,
+                "contrastive_weight": self.contrastive_weight,
+                "caption_weight": self.caption_weight,
+                "label_ignore_index": self._label_ignore_index,
+                "optimizer": "AdamW",
+                "optimizer_lr": optimizer_lr,
+                "optimizer_weight_decay": optimizer_weight_decay,
+                "optimizer_betas": optimizer_betas,
+            },
+        )
+
+    def train_step(self, batch: MultimodalBatch) -> dict:
+        """Run one Stage-2 multimodal optimization micro-step.
+
+        Args:
+            batch: Stage-2 batch as MultimodalBatch or collated mapping.
+
+        Returns:
+            Metric mapping containing at least `loss`.
+        """
+        normalized: _Stage2Batch = self._normalize_stage2_batch(batch)
+
+        # CoCa contrastive path.
+        contrastive_outputs: Dict[str, Any] = self.model.forward_contrastive(
+            {
+                "image_features": normalized.image_features,
+                "image_coords_xy": normalized.image_coords_xy,
+                "image_valid_mask": normalized.image_valid_mask,
+                "input_ids": normalized.input_ids,
+                "attention_mask": normalized.attention_mask,
+                "labels": normalized.labels,
+                "slide_ids": list(normalized.slide_ids),
+            }
+        )
+
+        # CoCa caption/report generation path.
+        caption_outputs: Dict[str, Any] = self.model.forward_captioning(
+            {
+                "image_features": normalized.image_features,
+                "image_coords_xy": normalized.image_coords_xy,
+                "image_valid_mask": normalized.image_valid_mask,
+                "input_ids": normalized.input_ids,
+                "attention_mask": normalized.attention_mask,
+                "labels": normalized.labels,
+                "slide_ids": list(normalized.slide_ids),
+            }
+        )
+
+        loss_outputs: Dict[str, torch.Tensor] = compute_multimodal_stage_loss(
+            contrastive_outputs=contrastive_outputs,
+            caption_outputs=caption_outputs,
+            contrastive_weight=self.contrastive_weight,
+            caption_weight=self.caption_weight,
+            ignore_index=self._label_ignore_index,
+        )
+
+        loss_total: torch.Tensor = loss_outputs["loss_total"]
+        if loss_total.ndim != 0:
+            raise Stage2TrainerError(
+                f"loss_total must be scalar tensor, got shape {tuple(loss_total.shape)}."
+            )
+        if not torch.isfinite(loss_total):
+            raise Stage2TrainerError("Stage2 train_step produced non-finite loss.")
+
+        batch_size: int = int(normalized.input_ids.shape[0])
+        seq_len: int = int(normalized.input_ids.shape[1])
+
+        metrics: Dict[str, Any] = {
+            "loss": loss_total,
+            "loss_total": loss_total.detach(),
+            "loss_contrastive": loss_outputs["loss_contrastive"].detach(),
+            "loss_caption": loss_outputs["loss_caption"].detach(),
+            "loss_i2t": loss_outputs["loss_i2t"].detach(),
+            "loss_t2i": loss_outputs["loss_t2i"].detach(),
+            "acc_i2t": loss_outputs["acc_i2t"].detach(),
+            "acc_t2i": loss_outputs["acc_t2i"].detach(),
+            "token_accuracy": loss_outputs["token_accuracy"].detach(),
+            "num_valid_tokens": loss_outputs["num_valid_tokens"].detach(),
+            "batch_size_micro": torch.tensor(float(batch_size), device=loss_total.device, dtype=loss_total.dtype),
+            "seq_len": torch.tensor(float(seq_len), device=loss_total.device, dtype=loss_total.dtype),
+            "contrastive_weight": torch.tensor(
+                float(self.contrastive_weight), device=loss_total.device, dtype=loss_total.dtype
+            ),
+            "caption_weight": torch.tensor(
+                float(self.caption_weight), device=loss_total.device, dtype=loss_total.dtype
+            ),
+        }
+        return metrics
+
+    def validate_step(self, batch: MultimodalBatch) -> dict:
+        """Validation step using the same Stage-2 objective."""
+        normalized: _Stage2Batch = self._normalize_stage2_batch(batch)
+
+        contrastive_outputs: Dict[str, Any] = self.model.forward_contrastive(
+            {
+                "image_features": normalized.image_features,
+                "image_coords_xy": normalized.image_coords_xy,
+                "image_valid_mask": normalized.image_valid_mask,
+                "input_ids": normalized.input_ids,
+                "attention_mask": normalized.attention_mask,
+                "labels": normalized.labels,
+                "slide_ids": list(normalized.slide_ids),
+            }
+        )
+
+        caption_outputs: Dict[str, Any] = self.model.forward_captioning(
+            {
+                "image_features": normalized.image_features,
+                "image_coords_xy": normalized.image_coords_xy,
+                "image_valid_mask": normalized.image_valid_mask,
+                "input_ids": normalized.input_ids,
+                "attention_mask": normalized.attention_mask,
+                "labels": normalized.labels,
+                "slide_ids": list(normalized.slide_ids),
+            }
+        )
+
+        loss_outputs: Dict[str, torch.Tensor] = compute_multimodal_stage_loss(
+            contrastive_outputs=contrastive_outputs,
+            caption_outputs=caption_outputs,
+            contrastive_weight=self.contrastive_weight,
+            caption_weight=self.caption_weight,
+            ignore_index=self._label_ignore_index,
+        )
+
+        metrics: Dict[str, Any] = {
+            "loss": loss_outputs["loss_total"],
+            "loss_total": loss_outputs["loss_total"],
+            "loss_contrastive": loss_outputs["loss_contrastive"],
+            "loss_caption": loss_outputs["loss_caption"],
+            "loss_i2t": loss_outputs["loss_i2t"],
+            "loss_t2i": loss_outputs["loss_t2i"],
+            "acc_i2t": loss_outputs["acc_i2t"],
+            "acc_t2i": loss_outputs["acc_t2i"],
+            "token_accuracy": loss_outputs["token_accuracy"],
+            "num_valid_tokens": loss_outputs["num_valid_tokens"],
+        }
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _normalize_stage2_batch(self, batch: Any) -> _Stage2Batch:
+        if isinstance(batch, MultimodalBatch):
+            return self._normalize_dataclass_batch(batch)
+
+        if isinstance(batch, Mapping):
+            if "image_features" in batch:
+                return self._normalize_collated_mapping(batch)
+            if "image_grid" in batch:
+                return self._normalize_single_mapping(batch)
+
+        raise Stage2TrainerError(
+            "Unsupported stage2 batch type. Expected MultimodalBatch or mapping with "
+            "image_features/image_grid. "
+            f"Got {type(batch).__name__}."
+        )
+
+    def _normalize_dataclass_batch(self, batch: MultimodalBatch) -> _Stage2Batch:
+        if not isinstance(batch.image_grid, FeatureGrid):
+            raise Stage2TrainerError("MultimodalBatch.image_grid must be FeatureGrid.")
+
+        image_features: torch.Tensor = batch.image_grid.features.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_coords_xy: torch.Tensor = batch.image_grid.coords_xy.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_valid_mask: torch.Tensor = batch.image_grid.valid_mask.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+
+        input_ids: torch.Tensor = self._to_2d_long(batch.input_ids, "input_ids")
+        attention_mask: torch.Tensor = self._to_2d_long(batch.attention_mask, "attention_mask")
+        labels: torch.Tensor = self._to_2d_long(batch.labels, "labels")
+
+        if int(input_ids.shape[0]) != 1:
+            raise Stage2TrainerError(
+                f"Dataclass batch must normalize to B=1, got B={int(input_ids.shape[0])}."
+            )
+
+        self._validate_text_shapes(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        self._validate_image_shapes(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+        )
+
+        return _Stage2Batch(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=(str(batch.slide_id),),
+        )
+
+    def _normalize_collated_mapping(self, batch: Mapping[str, Any]) -> _Stage2Batch:
+        image_features_obj: Any = batch.get("image_features")
+        image_coords_obj: Any = batch.get("image_coords_xy")
+        image_mask_obj: Any = batch.get("image_valid_mask")
+
+        input_ids_obj: Any = batch.get("input_ids")
+        attention_mask_obj: Any = batch.get("attention_mask")
+        labels_obj: Any = batch.get("labels")
+        slide_ids_obj: Any = batch.get("slide_ids")
+
+        if not isinstance(image_features_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'image_features' must be torch.Tensor.")
+        if not isinstance(image_coords_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'image_coords_xy' must be torch.Tensor.")
+        if not isinstance(image_mask_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'image_valid_mask' must be torch.Tensor.")
+
+        image_features: torch.Tensor = image_features_obj.to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_coords_xy: torch.Tensor = image_coords_obj.to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_valid_mask: torch.Tensor = image_mask_obj.to(
+            device=self.device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+
+        if not isinstance(input_ids_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'input_ids' must be torch.Tensor.")
+        if not isinstance(attention_mask_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'attention_mask' must be torch.Tensor.")
+        if not isinstance(labels_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'labels' must be torch.Tensor.")
+
+        input_ids: torch.Tensor = self._to_2d_long(input_ids_obj, "input_ids")
+        attention_mask: torch.Tensor = self._to_2d_long(attention_mask_obj, "attention_mask")
+        labels: torch.Tensor = self._to_2d_long(labels_obj, "labels")
+
+        self._validate_text_shapes(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        self._validate_image_shapes(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+        )
+
+        batch_size: int = int(input_ids.shape[0])
+        slide_ids: Tuple[str, ...] = self._normalize_slide_ids(slide_ids_obj=slide_ids_obj, batch_size=batch_size)
+
+        if int(image_features.shape[0]) != batch_size:
+            raise Stage2TrainerError(
+                "Image/text batch size mismatch. "
+                f"image B={int(image_features.shape[0])}, text B={batch_size}."
+            )
+
+        return _Stage2Batch(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=slide_ids,
+        )
+
+    def _normalize_single_mapping(self, batch: Mapping[str, Any]) -> _Stage2Batch:
+        image_grid_obj: Any = batch.get("image_grid")
+        if not isinstance(image_grid_obj, FeatureGrid):
+            raise Stage2TrainerError("Batch key 'image_grid' must be FeatureGrid.")
+
+        input_ids_obj: Any = batch.get("input_ids")
+        attention_mask_obj: Any = batch.get("attention_mask")
+        labels_obj: Any = batch.get("labels")
+        slide_id_obj: Any = batch.get("slide_id")
+
+        if not isinstance(input_ids_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'input_ids' must be torch.Tensor.")
+        if not isinstance(attention_mask_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'attention_mask' must be torch.Tensor.")
+        if not isinstance(labels_obj, torch.Tensor):
+            raise Stage2TrainerError("Batch key 'labels' must be torch.Tensor.")
+
+        image_features: torch.Tensor = image_grid_obj.features.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_coords_xy: torch.Tensor = image_grid_obj.coords_xy.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_valid_mask: torch.Tensor = image_grid_obj.valid_mask.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+
+        input_ids: torch.Tensor = self._to_2d_long(input_ids_obj, "input_ids")
+        attention_mask: torch.Tensor = self._to_2d_long(attention_mask_obj, "attention_mask")
+        labels: torch.Tensor = self._to_2d_long(labels_obj, "labels")
+
+        if int(input_ids.shape[0]) != 1:
+            raise Stage2TrainerError(
+                f"Single-sample mapping must normalize to B=1, got B={int(input_ids.shape[0])}."
+            )
+
+        self._validate_text_shapes(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        self._validate_image_shapes(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+        )
+
+        slide_id: str = str(slide_id_obj) if slide_id_obj is not None else "unknown"
+
+        return _Stage2Batch(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=(slide_id,),
+        )
+
+    @staticmethod
+    def _to_2d_long(value: torch.Tensor, name: str) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor):
+            raise Stage2TrainerError(f"{name} must be torch.Tensor, got {type(value).__name__}.")
+
+        if value.ndim == 1:
+            tensor: torch.Tensor = value.unsqueeze(0)
+        elif value.ndim == 2:
+            tensor = value
+        else:
+            raise Stage2TrainerError(
+                f"{name} must have shape [L] or [B,L], got {tuple(value.shape)}."
+            )
+
+        if int(tensor.shape[0]) <= 0 or int(tensor.shape[1]) <= 0:
+            raise Stage2TrainerError(f"{name} has invalid shape {tuple(tensor.shape)}.")
+
+        return tensor.to(dtype=torch.long)
+
+    @staticmethod
+    def _normalize_slide_ids(slide_ids_obj: Any, batch_size: int) -> Tuple[str, ...]:
+        if slide_ids_obj is None:
+            return tuple(f"sample_{idx}" for idx in range(batch_size))
+
+        if isinstance(slide_ids_obj, (list, tuple)):
+            slide_ids: Tuple[str, ...] = tuple(str(item) for item in slide_ids_obj)
+            if len(slide_ids) != batch_size:
+                raise Stage2TrainerError(
+                    "slide_ids length must match batch size. "
+                    f"Got len(slide_ids)={len(slide_ids)}, batch_size={batch_size}."
+                )
+            return slide_ids
+
+        if isinstance(slide_ids_obj, str):
+            if batch_size != 1:
+                raise Stage2TrainerError(
+                    "String slide_ids is only valid for batch_size=1. "
+                    f"Got batch_size={batch_size}."
+                )
+            return (slide_ids_obj,)
+
+        raise Stage2TrainerError(f"Unsupported slide_ids type: {type(slide_ids_obj).__name__}.")
+
+    def _validate_text_shapes(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor) -> None:
+        if tuple(input_ids.shape) != tuple(attention_mask.shape) or tuple(input_ids.shape) != tuple(labels.shape):
+            raise Stage2TrainerError(
+                "Text tensors must share shape [B,L]. "
+                f"Got input_ids={tuple(input_ids.shape)}, attention_mask={tuple(attention_mask.shape)}, "
+                f"labels={tuple(labels.shape)}."
+            )
+
+    def _validate_image_shapes(
+        self,
+        image_features: torch.Tensor,
+        image_coords_xy: torch.Tensor,
+        image_valid_mask: torch.Tensor,
+    ) -> None:
+        if image_features.ndim != 4:
+            raise Stage2TrainerError(
+                f"image_features must have shape [B,H,W,D], got {tuple(image_features.shape)}."
+            )
+        if image_coords_xy.ndim != 4:
+            raise Stage2TrainerError(
+                f"image_coords_xy must have shape [B,H,W,2], got {tuple(image_coords_xy.shape)}."
+            )
+        if image_valid_mask.ndim != 3:
+            raise Stage2TrainerError(
+                f"image_valid_mask must have shape [B,H,W], got {tuple(image_valid_mask.shape)}."
+            )
+
+        batch_size: int = int(image_features.shape[0])
+        grid_h: int = int(image_features.shape[1])
+        grid_w: int = int(image_features.shape[2])
+        feat_dim: int = int(image_features.shape[3])
+
+        if feat_dim != _FEATURE_DIM:
+            raise Stage2TrainerError(
+                f"image_features last dim must be {_FEATURE_DIM}, got {feat_dim}."
+            )
+
+        if tuple(image_coords_xy.shape[:3]) != (batch_size, grid_h, grid_w) or int(image_coords_xy.shape[3]) != 2:
+            raise Stage2TrainerError(
+                "image_coords_xy must align with image_features and have last dim=2. "
+                f"Got features={tuple(image_features.shape)}, coords={tuple(image_coords_xy.shape)}."
+            )
+
+        if tuple(image_valid_mask.shape) != (batch_size, grid_h, grid_w):
+            raise Stage2TrainerError(
+                "image_valid_mask must align with image_features spatial dims. "
+                f"Got features={tuple(image_features.shape)}, mask={tuple(image_valid_mask.shape)}."
+            )
+
+        # Stage-2 uses ROI-level 16x16 semantics; allow larger grids only if they can
+        # still represent ROI crops, but enforce minimum expected context.
+        if grid_h < _STAGE1_REGION_GRID[0] or grid_w < _STAGE1_REGION_GRID[1]:
+            raise Stage2TrainerError(
+                "Stage2 ROI grid must be at least 16x16. "
+                f"Got {(grid_h, grid_w)}."
+            )
+
+    def _validate_stage2_invariants(self, cfg: TrainConfig) -> None:
+        if int(self.batch_size) != _STAGE2_BATCH_SIZE_PER_GPU:
+            raise TrainerConfigError(
+                f"Stage2 batch_size must be {_STAGE2_BATCH_SIZE_PER_GPU}, got {self.batch_size}."
+            )
+        if int(self.grad_accum_steps) != _STAGE2_GRAD_ACCUM_STEPS:
+            raise TrainerConfigError(
+                "Stage2 grad_accum_steps must be "
+                f"{_STAGE2_GRAD_ACCUM_STEPS}, got {self.grad_accum_steps}."
+            )
+        if int(self.effective_batch_size) != _STAGE2_EFFECTIVE_BATCH_SIZE:
+            raise TrainerConfigError(
+                "Stage2 effective_batch_size must be "
+                f"{_STAGE2_EFFECTIVE_BATCH_SIZE}, got {self.effective_batch_size}."
+            )
+
+        # Optional metadata checks when fields are present on stage-specific config.
+        num_pairs_obj: Any = getattr(cfg, "num_pairs", None)
+        if num_pairs_obj is not None and int(num_pairs_obj) != _STAGE2_NUM_PAIRS:
+            raise TrainerConfigError(
+                f"Stage2 num_pairs must be {_STAGE2_NUM_PAIRS}, got {int(num_pairs_obj)}."
+            )
+
+    @staticmethod
+    def _resolve_seed_value(cfg: TrainConfig) -> int:
+        seed_obj: Any = getattr(cfg, "seed", _DEFAULT_SEED)
+        seed_value: int = int(seed_obj)
+        if seed_value < 0:
+            raise TrainerConfigError(f"seed must be >= 0, got {seed_value}.")
+        return seed_value
+
+    @staticmethod
+    def _resolve_optimizer_lr(cfg: TrainConfig) -> float:
+        lr_value: Optional[float] = None
+
+        if getattr(cfg, "lr", None) is not None:
+            lr_value = float(getattr(cfg, "lr"))
+        else:
+            optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+            if optimizer_cfg is not None and getattr(optimizer_cfg, "learning_rate", None) is not None:
+                lr_value = float(getattr(optimizer_cfg, "learning_rate"))
+
+        if lr_value is None:
+            lr_value = _DEFAULT_LR
+        if lr_value <= 0.0:
+            raise TrainerConfigError(f"learning rate must be > 0, got {lr_value}.")
+        return float(lr_value)
+
+    @staticmethod
+    def _resolve_optimizer_weight_decay(cfg: TrainConfig) -> float:
+        wd_value: Optional[float] = None
+
+        if getattr(cfg, "weight_decay", None) is not None:
+            wd_value = float(getattr(cfg, "weight_decay"))
+        else:
+            optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+            if optimizer_cfg is not None and getattr(optimizer_cfg, "weight_decay", None) is not None:
+                wd_value = float(getattr(optimizer_cfg, "weight_decay"))
+
+        if wd_value is None:
+            wd_value = _DEFAULT_WEIGHT_DECAY
+        if wd_value < 0.0:
+            raise TrainerConfigError(f"weight decay must be >= 0, got {wd_value}.")
+        return float(wd_value)
+
+    @staticmethod
+    def _resolve_optimizer_betas(cfg: TrainConfig) -> Tuple[float, float]:
+        beta1: float = _DEFAULT_BETA1
+        beta2: float = _DEFAULT_BETA2
+
+        optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+        betas_obj: Any = None
+        if optimizer_cfg is not None:
+            betas_obj = getattr(optimizer_cfg, "betas", None)
+
+        if isinstance(betas_obj, (list, tuple)) and len(betas_obj) == 2:
+            beta1 = float(betas_obj[0])
+            beta2 = float(betas_obj[1])
+
+        if not (0.0 <= beta1 < 1.0 and 0.0 <= beta2 < 1.0):
+            raise TrainerConfigError(f"optimizer betas must be in [0,1), got ({beta1}, {beta2}).")
+        return float(beta1), float(beta2)
+
+    @staticmethod
+    def _resolve_label_ignore_index(cfg: TrainConfig) -> int:
+        raw_value: Any = getattr(cfg, "label_ignore_index", _DEFAULT_LABEL_IGNORE_INDEX)
+        ignore_index: int = int(raw_value)
+        return ignore_index
+
+    @staticmethod
+    def _resolve_contrastive_weight(cfg: TrainConfig) -> float:
+        weight: Optional[float] = None
+        losses_cfg: Any = getattr(cfg, "losses", None)
+        if losses_cfg is not None and getattr(losses_cfg, "contrastive_weight", None) is not None:
+            weight = float(getattr(losses_cfg, "contrastive_weight"))
+
+        if weight is None:
+            weight = _DEFAULT_CONTRASTIVE_WEIGHT
+        if weight < 0.0:
+            raise TrainerConfigError(f"contrastive_weight must be >= 0, got {weight}.")
+        return float(weight)
+
+    @staticmethod
+    def _resolve_caption_weight(cfg: TrainConfig) -> float:
+        weight: Optional[float] = None
+        losses_cfg: Any = getattr(cfg, "losses", None)
+        if losses_cfg is not None and getattr(losses_cfg, "caption_weight", None) is not None:
+            weight = float(getattr(losses_cfg, "caption_weight"))
+
+        if weight is None:
+            weight = _DEFAULT_CAPTION_WEIGHT
+        if weight < 0.0:
+            raise TrainerConfigError(f"caption_weight must be >= 0, got {weight}.")
+        return float(weight)
+
+
+__all__ = [
+    "Stage2TrainerError",
+    "Stage2Trainer",
+]
+```

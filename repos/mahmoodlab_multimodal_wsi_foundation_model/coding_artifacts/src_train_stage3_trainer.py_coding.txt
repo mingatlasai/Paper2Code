@@ -1,0 +1,896 @@
+## Code: src/train/stage3_trainer.py
+```python
+"""Stage-3 trainer for TITAN WSI-report multimodal continual pretraining.
+
+This module implements the design-locked public interface:
+- Stage3Trainer.__init__(model: CoCaModel, cfg: TrainConfig) -> None
+- Stage3Trainer.train_step(batch: MultimodalBatch) -> dict
+
+It extends BaseTrainer for loop orchestration, AMP/grad accumulation,
+checkpointing, and metric logging.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+
+import torch
+from torch.optim import AdamW
+
+from src.core.config_schema import TrainConfig
+from src.data.build_feature_grid import FeatureGrid
+from src.data.datasets import MultimodalBatch
+from src.models.coca_multimodal import CoCaModel
+from src.models.losses import compute_multimodal_stage_loss
+from src.train.base_trainer import BaseTrainer, TrainerConfigError
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml and task contract.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+_STAGE3_NUM_PAIRS: int = 182_862
+_STAGE3_BATCH_SIZE_PER_GPU: int = 16
+_STAGE3_GRAD_ACCUM_STEPS: int = 2
+_STAGE3_EFFECTIVE_BATCH_SIZE: int = 256
+
+# Explicit defaults for unresolved supplementary hyperparameters.
+_DEFAULT_LR: float = 1.0e-4
+_DEFAULT_WEIGHT_DECAY: float = 0.05
+_DEFAULT_BETA1: float = 0.9
+_DEFAULT_BETA2: float = 0.95
+_DEFAULT_CONTRASTIVE_WEIGHT: float = 1.0
+_DEFAULT_CAPTION_WEIGHT: float = 1.0
+_DEFAULT_LABEL_IGNORE_INDEX: int = -100
+_DEFAULT_WARMUP_STEPS: int = 0
+_DEFAULT_SEED: int = 42
+
+
+class Stage3TrainerError(RuntimeError):
+    """Base exception for Stage3Trainer failures."""
+
+
+@dataclass(frozen=True)
+class _Stage3Batch:
+    """Normalized Stage-3 multimodal batch tensors."""
+
+    image_features: torch.Tensor
+    image_coords_xy: torch.Tensor
+    image_valid_mask: torch.Tensor
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    labels: torch.Tensor
+    slide_ids: Tuple[str, ...]
+
+
+class _ParamGroupWarmupScheduler:
+    """Simple per-parameter-group linear warmup scheduler.
+
+    This scheduler only performs warmup and keeps base learning rates after
+    warmup completion. It is intentionally minimal and state_dict-compatible
+    with BaseTrainer checkpointing.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        warmup_steps_by_group: Sequence[int],
+    ) -> None:
+        if not isinstance(optimizer, torch.optim.Optimizer):
+            raise TypeError("optimizer must be torch.optim.Optimizer.")
+        if not isinstance(warmup_steps_by_group, Sequence):
+            raise TypeError("warmup_steps_by_group must be a sequence.")
+        if len(warmup_steps_by_group) != len(optimizer.param_groups):
+            raise ValueError(
+                "warmup_steps_by_group length must match optimizer.param_groups. "
+                f"Got {len(warmup_steps_by_group)} vs {len(optimizer.param_groups)}."
+            )
+
+        self.optimizer: torch.optim.Optimizer = optimizer
+        self.base_lrs: list[float] = [float(group["lr"]) for group in optimizer.param_groups]
+        self.warmup_steps_by_group: list[int] = []
+        for step_value in warmup_steps_by_group:
+            if isinstance(step_value, bool):
+                raise ValueError("warmup steps must be integers.")
+            step_int: int = int(step_value)
+            if step_int < 0:
+                raise ValueError(f"warmup steps must be >= 0, got {step_int}.")
+            self.warmup_steps_by_group.append(step_int)
+
+        self.last_step: int = 0
+
+        # Initialize current LR for step 0.
+        self._apply_step(step=0)
+
+    def step(self) -> None:
+        """Advance scheduler by one optimizer step."""
+        self.last_step += 1
+        self._apply_step(step=self.last_step)
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Return serializable scheduler state."""
+        return {
+            "last_step": int(self.last_step),
+            "base_lrs": [float(v) for v in self.base_lrs],
+            "warmup_steps_by_group": [int(v) for v in self.warmup_steps_by_group],
+        }
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """Restore scheduler state."""
+        if not isinstance(state_dict, Mapping):
+            raise TypeError("state_dict must be a mapping.")
+
+        last_step_raw: Any = state_dict.get("last_step", 0)
+        self.last_step = int(last_step_raw)
+
+        base_lrs_raw: Any = state_dict.get("base_lrs", self.base_lrs)
+        if isinstance(base_lrs_raw, Sequence):
+            loaded_lrs: list[float] = [float(v) for v in base_lrs_raw]
+            if len(loaded_lrs) == len(self.base_lrs):
+                self.base_lrs = loaded_lrs
+
+        warmup_raw: Any = state_dict.get("warmup_steps_by_group", self.warmup_steps_by_group)
+        if isinstance(warmup_raw, Sequence):
+            loaded_warmup: list[int] = [int(v) for v in warmup_raw]
+            if len(loaded_warmup) == len(self.warmup_steps_by_group):
+                self.warmup_steps_by_group = loaded_warmup
+
+        self._apply_step(step=self.last_step)
+
+    def _apply_step(self, step: int) -> None:
+        for group_index, group in enumerate(self.optimizer.param_groups):
+            base_lr: float = float(self.base_lrs[group_index])
+            warmup_steps: int = int(self.warmup_steps_by_group[group_index])
+
+            if warmup_steps <= 0:
+                scaled_lr: float = base_lr
+            else:
+                progress: float = min(1.0, float(max(0, step)) / float(warmup_steps))
+                scaled_lr = base_lr * progress
+
+            group["lr"] = float(scaled_lr)
+
+
+class Stage3Trainer(BaseTrainer):
+    """Stage-3 CoCa trainer for WSI-report continual pretraining."""
+
+    def __init__(self, model: CoCaModel, cfg: TrainConfig) -> None:
+        """Initialize Stage3Trainer.
+
+        Args:
+            model: CoCa multimodal model initialized from stage-2 checkpoint.
+            cfg: Stage-3 training config.
+        """
+        if not isinstance(model, CoCaModel):
+            raise TrainerConfigError(f"model must be CoCaModel, got {type(model).__name__}.")
+        if not isinstance(cfg, TrainConfig):
+            raise TrainerConfigError(f"cfg must be TrainConfig, got {type(cfg).__name__}.")
+
+        super().__init__(model=model, cfg=cfg)
+
+        if str(self.stage) != "stage3_wsi_report_alignment":
+            raise TrainerConfigError(
+                "Stage3Trainer requires cfg.stage='stage3_wsi_report_alignment', "
+                f"got {self.stage!r}."
+            )
+
+        self.model: CoCaModel = model.to(self.device)
+
+        # Provenance constants.
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.feature_dim: int = _FEATURE_DIM
+        self.stage1_region_grid: Tuple[int, int] = _STAGE1_REGION_GRID
+        self.stage3_crop_grid: Tuple[int, int] = _STAGE3_CROP_GRID
+        self.stage3_num_pairs: int = _STAGE3_NUM_PAIRS
+
+        self._seed: int = self._resolve_seed_value(cfg)
+        self._label_ignore_index: int = self._resolve_label_ignore_index(cfg)
+        self.contrastive_weight: float = self._resolve_contrastive_weight(cfg)
+        self.caption_weight: float = self._resolve_caption_weight(cfg)
+
+        # Optimizer settings.
+        base_lr: float = self._resolve_optimizer_lr(cfg)
+        base_weight_decay: float = self._resolve_optimizer_weight_decay(cfg)
+        optimizer_betas: Tuple[float, float] = self._resolve_optimizer_betas(cfg)
+
+        vision_lr: float = self._resolve_vision_backbone_lr(cfg, base_lr)
+        vision_weight_decay: float = self._resolve_vision_backbone_weight_decay(cfg, base_weight_decay)
+
+        # Build parameter groups:
+        # - vision backbone: conservative LR/WD (config-driven)
+        # - non-vision modules: base LR/WD
+        vision_params, other_params = self._split_parameter_groups(self.model)
+
+        param_groups: list[Dict[str, Any]] = []
+        if len(vision_params) > 0:
+            param_groups.append(
+                {
+                    "params": vision_params,
+                    "lr": float(vision_lr),
+                    "weight_decay": float(vision_weight_decay),
+                    "group_name": "vision_backbone",
+                }
+            )
+        if len(other_params) > 0:
+            param_groups.append(
+                {
+                    "params": other_params,
+                    "lr": float(base_lr),
+                    "weight_decay": float(base_weight_decay),
+                    "group_name": "multimodal_rest",
+                }
+            )
+
+        if len(param_groups) == 0:
+            raise TrainerConfigError("No trainable parameters found for Stage3Trainer optimizer.")
+
+        self.optimizer = AdamW(
+            params=param_groups,
+            lr=float(base_lr),  # group LR overrides are used.
+            betas=optimizer_betas,
+            weight_decay=float(base_weight_decay),
+        )
+
+        # Slow warm-up support (config-driven; no guessed supplementary values).
+        warmup_steps_global: int = self._resolve_warmup_steps(cfg)
+        warmup_steps_vision: int = self._resolve_vision_warmup_steps(cfg, warmup_steps_global)
+        warmup_steps_other: int = warmup_steps_global
+
+        warmup_schedule: list[int] = []
+        for group in self.optimizer.param_groups:
+            group_name: str = str(group.get("group_name", ""))
+            if group_name == "vision_backbone":
+                warmup_schedule.append(int(warmup_steps_vision))
+            else:
+                warmup_schedule.append(int(warmup_steps_other))
+
+        if any(step_value > 0 for step_value in warmup_schedule):
+            self.scheduler = _ParamGroupWarmupScheduler(
+                optimizer=self.optimizer,
+                warmup_steps_by_group=warmup_schedule,
+            )
+        else:
+            self.scheduler = None
+
+        self._validate_stage3_invariants(cfg)
+
+        self.logger.info(
+            "Initialized Stage3Trainer.",
+            context={
+                "stage": self.stage,
+                "epochs": self.epochs,
+                "batch_size": self.batch_size,
+                "grad_accum_steps": self.grad_accum_steps,
+                "effective_batch_size": self.effective_batch_size,
+                "num_pairs": self.stage3_num_pairs,
+                "contrastive_weight": self.contrastive_weight,
+                "caption_weight": self.caption_weight,
+                "label_ignore_index": self._label_ignore_index,
+                "optimizer": "AdamW",
+                "base_lr": base_lr,
+                "base_weight_decay": base_weight_decay,
+                "vision_backbone_lr": vision_lr,
+                "vision_backbone_weight_decay": vision_weight_decay,
+                "optimizer_betas": optimizer_betas,
+                "warmup_steps_global": warmup_steps_global,
+                "warmup_steps_vision": warmup_steps_vision,
+                "scheduler": "group_linear_warmup" if self.scheduler is not None else "none",
+            },
+        )
+
+    def train_step(self, batch: MultimodalBatch) -> dict:
+        """Run one Stage-3 multimodal optimization micro-step.
+
+        Args:
+            batch: Stage-3 batch as MultimodalBatch or collated mapping.
+
+        Returns:
+            Metric mapping containing at least `loss`.
+        """
+        normalized: _Stage3Batch = self._normalize_stage3_batch(batch)
+
+        model_inputs: Dict[str, Any] = {
+            "image_features": normalized.image_features,
+            "image_coords_xy": normalized.image_coords_xy,
+            "image_valid_mask": normalized.image_valid_mask,
+            "input_ids": normalized.input_ids,
+            "attention_mask": normalized.attention_mask,
+            "labels": normalized.labels,
+            "slide_ids": list(normalized.slide_ids),
+        }
+
+        contrastive_outputs: Dict[str, Any] = self.model.forward_contrastive(model_inputs)
+        caption_outputs: Dict[str, Any] = self.model.forward_captioning(model_inputs)
+
+        loss_outputs: Dict[str, torch.Tensor] = compute_multimodal_stage_loss(
+            contrastive_outputs=contrastive_outputs,
+            caption_outputs=caption_outputs,
+            contrastive_weight=self.contrastive_weight,
+            caption_weight=self.caption_weight,
+            ignore_index=self._label_ignore_index,
+        )
+
+        loss_total: torch.Tensor = loss_outputs["loss_total"]
+        if loss_total.ndim != 0:
+            raise Stage3TrainerError(
+                f"loss_total must be scalar tensor, got shape {tuple(loss_total.shape)}."
+            )
+        if not torch.isfinite(loss_total):
+            raise Stage3TrainerError("Stage3 train_step produced non-finite loss.")
+
+        batch_size: int = int(normalized.input_ids.shape[0])
+        seq_len: int = int(normalized.input_ids.shape[1])
+        grid_h: int = int(normalized.image_features.shape[1])
+        grid_w: int = int(normalized.image_features.shape[2])
+
+        metrics: Dict[str, Any] = {
+            "loss": loss_total,
+            "loss_total": loss_total.detach(),
+            "loss_contrastive": loss_outputs["loss_contrastive"].detach(),
+            "loss_caption": loss_outputs["loss_caption"].detach(),
+            "loss_i2t": loss_outputs["loss_i2t"].detach(),
+            "loss_t2i": loss_outputs["loss_t2i"].detach(),
+            "acc_i2t": loss_outputs["acc_i2t"].detach(),
+            "acc_t2i": loss_outputs["acc_t2i"].detach(),
+            "token_accuracy": loss_outputs["token_accuracy"].detach(),
+            "num_valid_tokens": loss_outputs["num_valid_tokens"].detach(),
+            "batch_size_micro": torch.tensor(float(batch_size), device=loss_total.device, dtype=loss_total.dtype),
+            "seq_len": torch.tensor(float(seq_len), device=loss_total.device, dtype=loss_total.dtype),
+            "grid_h": torch.tensor(float(grid_h), device=loss_total.device, dtype=loss_total.dtype),
+            "grid_w": torch.tensor(float(grid_w), device=loss_total.device, dtype=loss_total.dtype),
+            "contrastive_weight": torch.tensor(
+                float(self.contrastive_weight), device=loss_total.device, dtype=loss_total.dtype
+            ),
+            "caption_weight": torch.tensor(
+                float(self.caption_weight), device=loss_total.device, dtype=loss_total.dtype
+            ),
+        }
+
+        # Surface active param-group LRs for tracking conservative backbone updates.
+        if self.optimizer is not None:
+            for group_index, group in enumerate(self.optimizer.param_groups):
+                group_name: str = str(group.get("group_name", f"group_{group_index}"))
+                metrics[f"lr_{group_name}"] = torch.tensor(
+                    float(group.get("lr", 0.0)),
+                    device=loss_total.device,
+                    dtype=loss_total.dtype,
+                )
+
+        return metrics
+
+    def validate_step(self, batch: MultimodalBatch) -> dict:
+        """Validation step using the same Stage-3 objective."""
+        normalized: _Stage3Batch = self._normalize_stage3_batch(batch)
+
+        model_inputs: Dict[str, Any] = {
+            "image_features": normalized.image_features,
+            "image_coords_xy": normalized.image_coords_xy,
+            "image_valid_mask": normalized.image_valid_mask,
+            "input_ids": normalized.input_ids,
+            "attention_mask": normalized.attention_mask,
+            "labels": normalized.labels,
+            "slide_ids": list(normalized.slide_ids),
+        }
+
+        contrastive_outputs: Dict[str, Any] = self.model.forward_contrastive(model_inputs)
+        caption_outputs: Dict[str, Any] = self.model.forward_captioning(model_inputs)
+
+        loss_outputs: Dict[str, torch.Tensor] = compute_multimodal_stage_loss(
+            contrastive_outputs=contrastive_outputs,
+            caption_outputs=caption_outputs,
+            contrastive_weight=self.contrastive_weight,
+            caption_weight=self.caption_weight,
+            ignore_index=self._label_ignore_index,
+        )
+
+        metrics: Dict[str, Any] = {
+            "loss": loss_outputs["loss_total"],
+            "loss_total": loss_outputs["loss_total"],
+            "loss_contrastive": loss_outputs["loss_contrastive"],
+            "loss_caption": loss_outputs["loss_caption"],
+            "loss_i2t": loss_outputs["loss_i2t"],
+            "loss_t2i": loss_outputs["loss_t2i"],
+            "acc_i2t": loss_outputs["acc_i2t"],
+            "acc_t2i": loss_outputs["acc_t2i"],
+            "token_accuracy": loss_outputs["token_accuracy"],
+            "num_valid_tokens": loss_outputs["num_valid_tokens"],
+        }
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _normalize_stage3_batch(self, batch: Any) -> _Stage3Batch:
+        if isinstance(batch, MultimodalBatch):
+            return self._normalize_dataclass_batch(batch)
+
+        if isinstance(batch, Mapping):
+            if "image_features" in batch:
+                return self._normalize_collated_mapping(batch)
+            if "image_grid" in batch:
+                return self._normalize_single_mapping(batch)
+
+        raise Stage3TrainerError(
+            "Unsupported stage3 batch type. Expected MultimodalBatch or mapping with "
+            "image_features/image_grid. "
+            f"Got {type(batch).__name__}."
+        )
+
+    def _normalize_dataclass_batch(self, batch: MultimodalBatch) -> _Stage3Batch:
+        if not isinstance(batch.image_grid, FeatureGrid):
+            raise Stage3TrainerError("MultimodalBatch.image_grid must be FeatureGrid.")
+
+        image_features: torch.Tensor = batch.image_grid.features.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_coords_xy: torch.Tensor = batch.image_grid.coords_xy.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_valid_mask: torch.Tensor = batch.image_grid.valid_mask.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+
+        input_ids: torch.Tensor = self._to_2d_long(batch.input_ids, "input_ids")
+        attention_mask: torch.Tensor = self._to_2d_long(batch.attention_mask, "attention_mask")
+        labels: torch.Tensor = self._to_2d_long(batch.labels, "labels")
+
+        if int(input_ids.shape[0]) != 1:
+            raise Stage3TrainerError(
+                f"Dataclass batch must normalize to B=1, got B={int(input_ids.shape[0])}."
+            )
+
+        self._validate_text_shapes(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        self._validate_image_shapes(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+        )
+
+        return _Stage3Batch(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=(str(batch.slide_id),),
+        )
+
+    def _normalize_collated_mapping(self, batch: Mapping[str, Any]) -> _Stage3Batch:
+        image_features_obj: Any = batch.get("image_features")
+        image_coords_obj: Any = batch.get("image_coords_xy")
+        image_mask_obj: Any = batch.get("image_valid_mask")
+
+        input_ids_obj: Any = batch.get("input_ids")
+        attention_mask_obj: Any = batch.get("attention_mask")
+        labels_obj: Any = batch.get("labels")
+        slide_ids_obj: Any = batch.get("slide_ids")
+
+        if not isinstance(image_features_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'image_features' must be torch.Tensor.")
+        if not isinstance(image_coords_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'image_coords_xy' must be torch.Tensor.")
+        if not isinstance(image_mask_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'image_valid_mask' must be torch.Tensor.")
+
+        image_features: torch.Tensor = image_features_obj.to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_coords_xy: torch.Tensor = image_coords_obj.to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_valid_mask: torch.Tensor = image_mask_obj.to(
+            device=self.device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+
+        if not isinstance(input_ids_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'input_ids' must be torch.Tensor.")
+        if not isinstance(attention_mask_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'attention_mask' must be torch.Tensor.")
+        if not isinstance(labels_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'labels' must be torch.Tensor.")
+
+        input_ids: torch.Tensor = self._to_2d_long(input_ids_obj, "input_ids")
+        attention_mask: torch.Tensor = self._to_2d_long(attention_mask_obj, "attention_mask")
+        labels: torch.Tensor = self._to_2d_long(labels_obj, "labels")
+
+        self._validate_text_shapes(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        self._validate_image_shapes(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+        )
+
+        batch_size: int = int(input_ids.shape[0])
+        slide_ids: Tuple[str, ...] = self._normalize_slide_ids(slide_ids_obj=slide_ids_obj, batch_size=batch_size)
+
+        if int(image_features.shape[0]) != batch_size:
+            raise Stage3TrainerError(
+                "Image/text batch size mismatch. "
+                f"image B={int(image_features.shape[0])}, text B={batch_size}."
+            )
+
+        return _Stage3Batch(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=slide_ids,
+        )
+
+    def _normalize_single_mapping(self, batch: Mapping[str, Any]) -> _Stage3Batch:
+        image_grid_obj: Any = batch.get("image_grid")
+        if not isinstance(image_grid_obj, FeatureGrid):
+            raise Stage3TrainerError("Batch key 'image_grid' must be FeatureGrid.")
+
+        input_ids_obj: Any = batch.get("input_ids")
+        attention_mask_obj: Any = batch.get("attention_mask")
+        labels_obj: Any = batch.get("labels")
+        slide_id_obj: Any = batch.get("slide_id")
+
+        if not isinstance(input_ids_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'input_ids' must be torch.Tensor.")
+        if not isinstance(attention_mask_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'attention_mask' must be torch.Tensor.")
+        if not isinstance(labels_obj, torch.Tensor):
+            raise Stage3TrainerError("Batch key 'labels' must be torch.Tensor.")
+
+        image_features: torch.Tensor = image_grid_obj.features.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_coords_xy: torch.Tensor = image_grid_obj.coords_xy.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        image_valid_mask: torch.Tensor = image_grid_obj.valid_mask.unsqueeze(0).to(
+            device=self.device,
+            dtype=torch.bool,
+            non_blocking=True,
+        )
+
+        input_ids: torch.Tensor = self._to_2d_long(input_ids_obj, "input_ids")
+        attention_mask: torch.Tensor = self._to_2d_long(attention_mask_obj, "attention_mask")
+        labels: torch.Tensor = self._to_2d_long(labels_obj, "labels")
+
+        if int(input_ids.shape[0]) != 1:
+            raise Stage3TrainerError(
+                f"Single-sample mapping must normalize to B=1, got B={int(input_ids.shape[0])}."
+            )
+
+        self._validate_text_shapes(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        self._validate_image_shapes(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+        )
+
+        slide_id: str = str(slide_id_obj) if slide_id_obj is not None else "unknown"
+
+        return _Stage3Batch(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=(slide_id,),
+        )
+
+    @staticmethod
+    def _to_2d_long(value: torch.Tensor, name: str) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor):
+            raise Stage3TrainerError(f"{name} must be torch.Tensor, got {type(value).__name__}.")
+
+        if value.ndim == 1:
+            tensor: torch.Tensor = value.unsqueeze(0)
+        elif value.ndim == 2:
+            tensor = value
+        else:
+            raise Stage3TrainerError(
+                f"{name} must have shape [L] or [B,L], got {tuple(value.shape)}."
+            )
+
+        if int(tensor.shape[0]) <= 0 or int(tensor.shape[1]) <= 0:
+            raise Stage3TrainerError(f"{name} has invalid shape {tuple(tensor.shape)}.")
+
+        return tensor.to(dtype=torch.long)
+
+    @staticmethod
+    def _normalize_slide_ids(slide_ids_obj: Any, batch_size: int) -> Tuple[str, ...]:
+        if slide_ids_obj is None:
+            return tuple(f"sample_{idx}" for idx in range(batch_size))
+
+        if isinstance(slide_ids_obj, (list, tuple)):
+            slide_ids: Tuple[str, ...] = tuple(str(item) for item in slide_ids_obj)
+            if len(slide_ids) != batch_size:
+                raise Stage3TrainerError(
+                    "slide_ids length must match batch size. "
+                    f"Got len(slide_ids)={len(slide_ids)}, batch_size={batch_size}."
+                )
+            return slide_ids
+
+        if isinstance(slide_ids_obj, str):
+            if batch_size != 1:
+                raise Stage3TrainerError(
+                    "String slide_ids is only valid for batch_size=1. "
+                    f"Got batch_size={batch_size}."
+                )
+            return (slide_ids_obj,)
+
+        raise Stage3TrainerError(f"Unsupported slide_ids type: {type(slide_ids_obj).__name__}.")
+
+    def _validate_text_shapes(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor) -> None:
+        if tuple(input_ids.shape) != tuple(attention_mask.shape) or tuple(input_ids.shape) != tuple(labels.shape):
+            raise Stage3TrainerError(
+                "Text tensors must share shape [B,L]. "
+                f"Got input_ids={tuple(input_ids.shape)}, attention_mask={tuple(attention_mask.shape)}, "
+                f"labels={tuple(labels.shape)}."
+            )
+
+    def _validate_image_shapes(
+        self,
+        image_features: torch.Tensor,
+        image_coords_xy: torch.Tensor,
+        image_valid_mask: torch.Tensor,
+    ) -> None:
+        if image_features.ndim != 4:
+            raise Stage3TrainerError(
+                f"image_features must have shape [B,H,W,D], got {tuple(image_features.shape)}."
+            )
+        if image_coords_xy.ndim != 4:
+            raise Stage3TrainerError(
+                f"image_coords_xy must have shape [B,H,W,2], got {tuple(image_coords_xy.shape)}."
+            )
+        if image_valid_mask.ndim != 3:
+            raise Stage3TrainerError(
+                f"image_valid_mask must have shape [B,H,W], got {tuple(image_valid_mask.shape)}."
+            )
+
+        batch_size: int = int(image_features.shape[0])
+        grid_h: int = int(image_features.shape[1])
+        grid_w: int = int(image_features.shape[2])
+        feat_dim: int = int(image_features.shape[3])
+
+        if feat_dim != _FEATURE_DIM:
+            raise Stage3TrainerError(
+                f"image_features last dim must be {_FEATURE_DIM}, got {feat_dim}."
+            )
+
+        if tuple(image_coords_xy.shape[:3]) != (batch_size, grid_h, grid_w) or int(image_coords_xy.shape[3]) != 2:
+            raise Stage3TrainerError(
+                "image_coords_xy must align with image_features and have last dim=2. "
+                f"Got features={tuple(image_features.shape)}, coords={tuple(image_coords_xy.shape)}."
+            )
+
+        if tuple(image_valid_mask.shape) != (batch_size, grid_h, grid_w):
+            raise Stage3TrainerError(
+                "image_valid_mask must align with image_features spatial dims. "
+                f"Got features={tuple(image_features.shape)}, mask={tuple(image_valid_mask.shape)}."
+            )
+
+        # Stage-3 semantic contract: 64x64 WSI crops.
+        if (grid_h, grid_w) != _STAGE3_CROP_GRID:
+            raise Stage3TrainerError(
+                f"Stage3 grid must be exactly {_STAGE3_CROP_GRID}, got {(grid_h, grid_w)}."
+            )
+
+    @staticmethod
+    def _split_parameter_groups(model: CoCaModel) -> Tuple[list[torch.nn.Parameter], list[torch.nn.Parameter]]:
+        vision_param_ids: set[int] = set()
+        for param in model.vision.parameters():
+            if param.requires_grad:
+                vision_param_ids.add(id(param))
+
+        vision_params: list[torch.nn.Parameter] = []
+        other_params: list[torch.nn.Parameter] = []
+
+        for param in model.parameters():
+            if not param.requires_grad:
+                continue
+            if id(param) in vision_param_ids:
+                vision_params.append(param)
+            else:
+                other_params.append(param)
+
+        return vision_params, other_params
+
+    def _validate_stage3_invariants(self, cfg: TrainConfig) -> None:
+        if int(self.batch_size) != _STAGE3_BATCH_SIZE_PER_GPU:
+            raise TrainerConfigError(
+                f"Stage3 batch_size must be {_STAGE3_BATCH_SIZE_PER_GPU}, got {self.batch_size}."
+            )
+        if int(self.grad_accum_steps) != _STAGE3_GRAD_ACCUM_STEPS:
+            raise TrainerConfigError(
+                "Stage3 grad_accum_steps must be "
+                f"{_STAGE3_GRAD_ACCUM_STEPS}, got {self.grad_accum_steps}."
+            )
+        if int(self.effective_batch_size) != _STAGE3_EFFECTIVE_BATCH_SIZE:
+            raise TrainerConfigError(
+                "Stage3 effective_batch_size must be "
+                f"{_STAGE3_EFFECTIVE_BATCH_SIZE}, got {self.effective_batch_size}."
+            )
+
+        num_pairs_obj: Any = getattr(cfg, "num_pairs", None)
+        if num_pairs_obj is not None and int(num_pairs_obj) != _STAGE3_NUM_PAIRS:
+            raise TrainerConfigError(
+                f"Stage3 num_pairs must be {_STAGE3_NUM_PAIRS}, got {int(num_pairs_obj)}."
+            )
+
+    @staticmethod
+    def _resolve_seed_value(cfg: TrainConfig) -> int:
+        seed_obj: Any = getattr(cfg, "seed", _DEFAULT_SEED)
+        seed_value: int = int(seed_obj)
+        if seed_value < 0:
+            raise TrainerConfigError(f"seed must be >= 0, got {seed_value}.")
+        return seed_value
+
+    @staticmethod
+    def _resolve_optimizer_lr(cfg: TrainConfig) -> float:
+        lr_value: Optional[float] = None
+
+        if getattr(cfg, "lr", None) is not None:
+            lr_value = float(getattr(cfg, "lr"))
+        else:
+            optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+            if optimizer_cfg is not None and getattr(optimizer_cfg, "learning_rate", None) is not None:
+                lr_value = float(getattr(optimizer_cfg, "learning_rate"))
+
+        if lr_value is None:
+            lr_value = _DEFAULT_LR
+        if lr_value <= 0.0:
+            raise TrainerConfigError(f"learning rate must be > 0, got {lr_value}.")
+        return float(lr_value)
+
+    @staticmethod
+    def _resolve_optimizer_weight_decay(cfg: TrainConfig) -> float:
+        wd_value: Optional[float] = None
+
+        if getattr(cfg, "weight_decay", None) is not None:
+            wd_value = float(getattr(cfg, "weight_decay"))
+        else:
+            optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+            if optimizer_cfg is not None and getattr(optimizer_cfg, "weight_decay", None) is not None:
+                wd_value = float(getattr(optimizer_cfg, "weight_decay"))
+
+        if wd_value is None:
+            wd_value = _DEFAULT_WEIGHT_DECAY
+        if wd_value < 0.0:
+            raise TrainerConfigError(f"weight decay must be >= 0, got {wd_value}.")
+        return float(wd_value)
+
+    @staticmethod
+    def _resolve_optimizer_betas(cfg: TrainConfig) -> Tuple[float, float]:
+        beta1: float = _DEFAULT_BETA1
+        beta2: float = _DEFAULT_BETA2
+
+        optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+        betas_obj: Any = None
+        if optimizer_cfg is not None:
+            betas_obj = getattr(optimizer_cfg, "betas", None)
+
+        if isinstance(betas_obj, (list, tuple)) and len(betas_obj) == 2:
+            beta1 = float(betas_obj[0])
+            beta2 = float(betas_obj[1])
+
+        if not (0.0 <= beta1 < 1.0 and 0.0 <= beta2 < 1.0):
+            raise TrainerConfigError(f"optimizer betas must be in [0,1), got ({beta1}, {beta2}).")
+        return float(beta1), float(beta2)
+
+    @staticmethod
+    def _resolve_vision_backbone_lr(cfg: TrainConfig, base_lr: float) -> float:
+        optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+        raw_value: Any = None
+        if optimizer_cfg is not None and getattr(optimizer_cfg, "vision_backbone_learning_rate", None) is not None:
+            raw_value = getattr(optimizer_cfg, "vision_backbone_learning_rate")
+
+        if raw_value is None:
+            # Config keeps this null in provided file; fallback to base LR is explicit and reproducible.
+            return float(base_lr)
+
+        lr_value: float = float(raw_value)
+        if lr_value <= 0.0:
+            raise TrainerConfigError(f"vision_backbone_learning_rate must be > 0, got {lr_value}.")
+        return float(lr_value)
+
+    @staticmethod
+    def _resolve_vision_backbone_weight_decay(cfg: TrainConfig, base_weight_decay: float) -> float:
+        optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+        raw_value: Any = None
+        if optimizer_cfg is not None and getattr(optimizer_cfg, "vision_backbone_weight_decay", None) is not None:
+            raw_value = getattr(optimizer_cfg, "vision_backbone_weight_decay")
+
+        if raw_value is None:
+            # Config keeps this null in provided file; fallback to base WD is explicit and reproducible.
+            return float(base_weight_decay)
+
+        wd_value: float = float(raw_value)
+        if wd_value < 0.0:
+            raise TrainerConfigError(f"vision_backbone_weight_decay must be >= 0, got {wd_value}.")
+        return float(wd_value)
+
+    @staticmethod
+    def _resolve_warmup_steps(cfg: TrainConfig) -> int:
+        optimizer_cfg: Any = getattr(cfg, "optimizer", None)
+        raw_value: Any = None
+        if optimizer_cfg is not None and getattr(optimizer_cfg, "warmup", None) is not None:
+            raw_value = getattr(optimizer_cfg, "warmup")
+
+        if raw_value is None:
+            return int(_DEFAULT_WARMUP_STEPS)
+
+        warmup_steps: int = int(raw_value)
+        if warmup_steps < 0:
+            raise TrainerConfigError(f"warmup steps must be >= 0, got {warmup_steps}.")
+        return warmup_steps
+
+    @staticmethod
+    def _resolve_vision_warmup_steps(cfg: TrainConfig, global_warmup_steps: int) -> int:
+        _ = cfg
+        # No dedicated stage3 config field exists for vision warmup length.
+        # Keep explicit default to global warmup (config-driven, no fabricated scale).
+        if global_warmup_steps < 0:
+            raise TrainerConfigError("global_warmup_steps must be >= 0.")
+        return int(global_warmup_steps)
+
+    @staticmethod
+    def _resolve_label_ignore_index(cfg: TrainConfig) -> int:
+        raw_value: Any = getattr(cfg, "label_ignore_index", _DEFAULT_LABEL_IGNORE_INDEX)
+        return int(raw_value)
+
+    @staticmethod
+    def _resolve_contrastive_weight(cfg: TrainConfig) -> float:
+        weight: Optional[float] = None
+        losses_cfg: Any = getattr(cfg, "losses", None)
+        if losses_cfg is not None and getattr(losses_cfg, "contrastive_weight", None) is not None:
+            weight = float(getattr(losses_cfg, "contrastive_weight"))
+
+        if weight is None:
+            weight = _DEFAULT_CONTRASTIVE_WEIGHT
+        if weight < 0.0:
+            raise TrainerConfigError(f"contrastive_weight must be >= 0, got {weight}.")
+        return float(weight)
+
+    @staticmethod
+    def _resolve_caption_weight(cfg: TrainConfig) -> float:
+        weight: Optional[float] = None
+        losses_cfg: Any = getattr(cfg, "losses", None)
+        if losses_cfg is not None and getattr(losses_cfg, "caption_weight", None) is not None:
+            weight = float(getattr(losses_cfg, "caption_weight"))
+
+        if weight is None:
+            weight = _DEFAULT_CAPTION_WEIGHT
+        if weight < 0.0:
+            raise TrainerConfigError(f"caption_weight must be >= 0, got {weight}.")
+        return float(weight)
+
+
+__all__ = [
+    "Stage3TrainerError",
+    "Stage3Trainer",
+]
+```

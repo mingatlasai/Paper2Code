@@ -1,0 +1,5 @@
+Completed. I created the requested logic analysis at:
+
+- [configs/eval/linear_probe.yaml](/Users/mingatlas/Projects/Paper2Code/configs/eval/linear_probe.yaml)
+
+It is structured to match the existing analysis-style config files, strictly follows the provided design interfaces, and binds all explicit values to `config.yaml` (including L-BFGS, 45-point log L2 grid `1e-6..10`, `max_iter=500`, and no-val defaults `L2=1`, `max_iter=1000`). I also validated the YAML parses successfully.

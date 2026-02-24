@@ -1,0 +1,782 @@
+"""CoCa-style multimodal TITAN model for stage-2/3 training and inference.
+
+This module implements the design-locked public interface:
+- CoCaModel.__init__(vision: TITANEncoder, text_encoder: TextEncoder, decoder: MultimodalDecoder)
+- CoCaModel.forward_contrastive(batch: MultimodalBatch) -> dict
+- CoCaModel.forward_captioning(batch: MultimodalBatch) -> dict
+- CoCaModel.encode_image(grid: FeatureGrid) -> torch.Tensor
+- CoCaModel.encode_text(input_ids: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor
+- CoCaModel.generate_report(grid: FeatureGrid, num_beams: int = 5) -> str
+
+The implementation is strictly aligned with provided config/design constraints:
+- Feature dim / embedding dim: 768
+- Reconstruction queries: 128
+- Stage-2 ROI grid semantics: 16x16
+- Stage-3 WSI crop semantics: 64x64
+- Report generation default: beam search with num_beams=5
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from src.data.build_feature_grid import FeatureGrid
+from src.data.datasets import MultimodalBatch
+from src.models.text_modules import MultimodalDecoder, TextEncoder
+from src.models.titan_encoder import TITANEncoder
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml and design contract.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+_RECONSTRUCTION_QUERIES: int = 128
+_CONTRASTIVE_QUERIES: int = 1
+
+_TEXT_EMBED_DIM: int = 768
+_DEFAULT_NUM_BEAMS: int = 5
+_DEFAULT_NUM_BEAM_GROUPS: int = 1
+_DEFAULT_MAX_NEW_TOKENS: int = 128
+
+_DEFAULT_PAD_TOKEN_ID: int = 0
+_DEFAULT_BOS_TOKEN_ID: int = 2
+_DEFAULT_EOS_TOKEN_ID: int = 3
+
+_DEFAULT_ATTN_DROPOUT: float = 0.0
+_DEFAULT_PROJ_DROPOUT: float = 0.0
+_DEFAULT_LAYER_NORM_EPS: float = 1.0e-6
+
+
+class CoCaModelError(RuntimeError):
+    """Base exception for CoCaModel failures."""
+
+
+class CoCaModelConfigError(CoCaModelError):
+    """Raised when CoCaModel initialization/configuration is invalid."""
+
+
+@dataclass(frozen=True)
+class _BatchTensors:
+    """Normalized multimodal batch tensors for model internals."""
+
+    image_features: torch.Tensor
+    image_coords_xy: torch.Tensor
+    image_valid_mask: torch.Tensor
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    labels: torch.Tensor
+    slide_ids: List[str]
+
+
+class _AttentionalPooler(nn.Module):
+    """Query-based attentional pooler used by CoCa.
+
+    This implements learned queries attending over vision token sequences.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        num_queries: int,
+        attn_dropout: float = _DEFAULT_ATTN_DROPOUT,
+        proj_dropout: float = _DEFAULT_PROJ_DROPOUT,
+    ) -> None:
+        super().__init__()
+
+        if isinstance(embed_dim, bool) or not isinstance(embed_dim, int):
+            raise CoCaModelConfigError("embed_dim must be an integer.")
+        if isinstance(num_heads, bool) or not isinstance(num_heads, int):
+            raise CoCaModelConfigError("num_heads must be an integer.")
+        if isinstance(num_queries, bool) or not isinstance(num_queries, int):
+            raise CoCaModelConfigError("num_queries must be an integer.")
+
+        if embed_dim <= 0:
+            raise CoCaModelConfigError("embed_dim must be > 0.")
+        if num_heads <= 0:
+            raise CoCaModelConfigError("num_heads must be > 0.")
+        if num_queries <= 0:
+            raise CoCaModelConfigError("num_queries must be > 0.")
+        if embed_dim % num_heads != 0:
+            raise CoCaModelConfigError("embed_dim must be divisible by num_heads.")
+
+        self.embed_dim: int = int(embed_dim)
+        self.num_heads: int = int(num_heads)
+        self.num_queries: int = int(num_queries)
+
+        self.query_tokens: nn.Parameter = nn.Parameter(
+            torch.randn(1, self.num_queries, self.embed_dim, dtype=torch.float32) * 0.02
+        )
+        self.query_norm: nn.LayerNorm = nn.LayerNorm(self.embed_dim, eps=_DEFAULT_LAYER_NORM_EPS)
+        self.key_norm: nn.LayerNorm = nn.LayerNorm(self.embed_dim, eps=_DEFAULT_LAYER_NORM_EPS)
+
+        self.attn: nn.MultiheadAttention = nn.MultiheadAttention(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            dropout=float(attn_dropout),
+            batch_first=True,
+        )
+        self.out_norm: nn.LayerNorm = nn.LayerNorm(self.embed_dim, eps=_DEFAULT_LAYER_NORM_EPS)
+        self.out_proj: nn.Linear = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_drop: nn.Dropout = nn.Dropout(float(proj_dropout))
+
+    def forward(self, tokens: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        """Pool token sequence with learned queries.
+
+        Args:
+            tokens: [B, T, D]
+            valid_mask: [B, T] where True means valid token.
+
+        Returns:
+            Tensor [B, Q, D].
+        """
+        if not isinstance(tokens, torch.Tensor):
+            raise TypeError(f"tokens must be torch.Tensor, got {type(tokens).__name__}.")
+        if not isinstance(valid_mask, torch.Tensor):
+            raise TypeError(f"valid_mask must be torch.Tensor, got {type(valid_mask).__name__}.")
+
+        if tokens.ndim != 3:
+            raise CoCaModelError(f"tokens must have shape [B,T,D], got {tuple(tokens.shape)}.")
+        if valid_mask.ndim != 2:
+            raise CoCaModelError(
+                f"valid_mask must have shape [B,T], got {tuple(valid_mask.shape)}."
+            )
+        if int(tokens.shape[0]) != int(valid_mask.shape[0]) or int(tokens.shape[1]) != int(valid_mask.shape[1]):
+            raise CoCaModelError(
+                "tokens and valid_mask must align on batch/token dimensions. "
+                f"Got tokens={tuple(tokens.shape)}, valid_mask={tuple(valid_mask.shape)}."
+            )
+        if int(tokens.shape[2]) != self.embed_dim:
+            raise CoCaModelError(
+                f"tokens last dimension must be {self.embed_dim}, got {int(tokens.shape[2])}."
+            )
+
+        batch_size: int = int(tokens.shape[0])
+
+        # Query tokens are shared across samples and expanded per batch.
+        queries: torch.Tensor = self.query_tokens.expand(batch_size, -1, -1)
+        queries = self.query_norm(queries)
+        keys_values: torch.Tensor = self.key_norm(tokens)
+
+        key_padding_mask: torch.Tensor = ~valid_mask.to(dtype=torch.bool)
+
+        pooled, _ = self.attn(
+            query=queries,
+            key=keys_values,
+            value=keys_values,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        pooled = self.out_norm(pooled)
+        pooled = self.out_proj(pooled)
+        pooled = self.out_drop(pooled)
+
+        return pooled
+
+
+class CoCaModel(nn.Module):
+    """CoCa-style multimodal model composed from TITAN vision + text modules."""
+
+    def __init__(self, vision: TITANEncoder, text_encoder: TextEncoder, decoder: MultimodalDecoder) -> None:
+        """Initialize CoCa model.
+
+        Args:
+            vision: TITAN vision encoder initialized from stage-1/2 checkpoints.
+            text_encoder: Text encoder in shared embedding space.
+            decoder: Multimodal decoder for caption/report generation.
+        """
+        super().__init__()
+
+        if not isinstance(vision, TITANEncoder):
+            raise CoCaModelConfigError(f"vision must be TITANEncoder, got {type(vision).__name__}.")
+        if not isinstance(text_encoder, TextEncoder):
+            raise CoCaModelConfigError(
+                f"text_encoder must be TextEncoder, got {type(text_encoder).__name__}."
+            )
+        if not isinstance(decoder, MultimodalDecoder):
+            raise CoCaModelConfigError(
+                f"decoder must be MultimodalDecoder, got {type(decoder).__name__}."
+            )
+
+        self.vision: TITANEncoder = vision
+        self.text_encoder: TextEncoder = text_encoder
+        self.decoder: MultimodalDecoder = decoder
+
+        self.embed_dim: int = int(self.vision.embed_dim)
+        self.num_heads: int = int(self.vision.num_heads)
+
+        if self.embed_dim != _TEXT_EMBED_DIM:
+            raise CoCaModelConfigError(
+                f"Vision/text embedding dimension must be {_TEXT_EMBED_DIM}, got {self.embed_dim}."
+            )
+        if int(self.text_encoder.embed_dim) != self.embed_dim:
+            raise CoCaModelConfigError(
+                "text_encoder.embed_dim must match vision embed dim. "
+                f"Got text={self.text_encoder.embed_dim}, vision={self.embed_dim}."
+            )
+        if int(self.decoder.embed_dim) != self.embed_dim:
+            raise CoCaModelConfigError(
+                "decoder.embed_dim must match vision embed dim. "
+                f"Got decoder={self.decoder.embed_dim}, vision={self.embed_dim}."
+            )
+
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.feature_dim: int = _FEATURE_DIM
+        self.stage1_region_grid: Tuple[int, int] = _STAGE1_REGION_GRID
+        self.stage3_crop_grid: Tuple[int, int] = _STAGE3_CROP_GRID
+
+        self.reconstruction_queries: int = _RECONSTRUCTION_QUERIES
+        self.contrastive_queries: int = _CONTRASTIVE_QUERIES
+
+        self.contrastive_pooler: _AttentionalPooler = _AttentionalPooler(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            num_queries=self.contrastive_queries,
+        )
+        self.reconstruction_pooler: _AttentionalPooler = _AttentionalPooler(
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            num_queries=self.reconstruction_queries,
+        )
+
+        # Learnable inverse temperature parameter for contrastive logits.
+        # Initialize to log(1/0.07), CLIP-style.
+        self.logit_scale: nn.Parameter = nn.Parameter(
+            torch.tensor(float(torch.log(torch.tensor(1.0 / 0.07)).item()), dtype=torch.float32)
+        )
+
+    def forward_contrastive(self, batch: MultimodalBatch) -> dict:
+        """Run contrastive image-text forward path.
+
+        Args:
+            batch: Multimodal batch (single or collated).
+
+        Returns:
+            Dictionary with normalized embeddings and logits.
+        """
+        normalized: _BatchTensors = self._normalize_batch(batch)
+
+        vision_tokens: torch.Tensor = self._encode_vision_tokens(
+            image_features=normalized.image_features,
+            image_coords_xy=normalized.image_coords_xy,
+            image_valid_mask=normalized.image_valid_mask,
+        )
+
+        contrastive_tokens: torch.Tensor = self.contrastive_pooler(
+            tokens=vision_tokens,
+            valid_mask=normalized.image_valid_mask,
+        )
+        image_embeddings: torch.Tensor = contrastive_tokens[:, 0, :]
+        image_embeddings = F.normalize(image_embeddings, p=2.0, dim=-1, eps=1.0e-12)
+
+        text_embeddings: torch.Tensor = self.encode_text(
+            input_ids=normalized.input_ids,
+            attn_mask=normalized.attention_mask,
+        )
+        if text_embeddings.ndim == 1:
+            text_embeddings = text_embeddings.unsqueeze(0)
+        text_embeddings = F.normalize(text_embeddings, p=2.0, dim=-1, eps=1.0e-12)
+
+        if int(image_embeddings.shape[0]) != int(text_embeddings.shape[0]):
+            raise CoCaModelError(
+                "Image/text batch sizes must match in contrastive forward. "
+                f"Got image={tuple(image_embeddings.shape)}, text={tuple(text_embeddings.shape)}."
+            )
+
+        logit_scale: torch.Tensor = self.logit_scale.exp().clamp(max=100.0)
+        logits_per_image: torch.Tensor = logit_scale * torch.matmul(
+            image_embeddings, text_embeddings.transpose(0, 1)
+        )
+        logits_per_text: torch.Tensor = logits_per_image.transpose(0, 1)
+
+        return {
+            "image_embeddings": image_embeddings,
+            "text_embeddings": text_embeddings,
+            "logit_scale": logit_scale,
+            "logits_per_image": logits_per_image,
+            "logits_per_text": logits_per_text,
+            "slide_ids": list(normalized.slide_ids),
+            "batch_size": int(image_embeddings.shape[0]),
+        }
+
+    def forward_captioning(self, batch: MultimodalBatch) -> dict:
+        """Run caption/report generation forward path.
+
+        Args:
+            batch: Multimodal batch (single or collated).
+
+        Returns:
+            Dictionary with decoder logits and supervision tensors.
+        """
+        normalized: _BatchTensors = self._normalize_batch(batch)
+
+        vision_tokens: torch.Tensor = self._encode_vision_tokens(
+            image_features=normalized.image_features,
+            image_coords_xy=normalized.image_coords_xy,
+            image_valid_mask=normalized.image_valid_mask,
+        )
+
+        reconstruction_tokens: torch.Tensor = self.reconstruction_pooler(
+            tokens=vision_tokens,
+            valid_mask=normalized.image_valid_mask,
+        )
+
+        decoder_logits: torch.Tensor = self.decoder(
+            image_tokens=reconstruction_tokens,
+            input_ids=normalized.input_ids,
+        )
+
+        if decoder_logits.ndim != 3:
+            raise CoCaModelError(
+                f"decoder logits must have shape [B,L,V], got {tuple(decoder_logits.shape)}."
+            )
+
+        if int(decoder_logits.shape[0]) != int(normalized.input_ids.shape[0]) or int(
+            decoder_logits.shape[1]
+        ) != int(normalized.input_ids.shape[1]):
+            raise CoCaModelError(
+                "Decoder output must align with text input shape. "
+                f"Got logits={tuple(decoder_logits.shape)}, input_ids={tuple(normalized.input_ids.shape)}."
+            )
+
+        return {
+            "decoder_logits": decoder_logits,
+            "labels": normalized.labels,
+            "input_ids": normalized.input_ids,
+            "attention_mask": normalized.attention_mask,
+            "image_tokens": reconstruction_tokens,
+            "slide_ids": list(normalized.slide_ids),
+            "batch_size": int(normalized.input_ids.shape[0]),
+        }
+
+    def encode_image(self, grid: FeatureGrid) -> torch.Tensor:
+        """Encode one slide grid into a normalized image embedding [D]."""
+        if not isinstance(grid, FeatureGrid):
+            raise TypeError(f"grid must be FeatureGrid, got {type(grid).__name__}.")
+
+        image_features: torch.Tensor = grid.features.unsqueeze(0)
+        image_coords_xy: torch.Tensor = grid.coords_xy.unsqueeze(0)
+        image_valid_mask: torch.Tensor = grid.valid_mask.unsqueeze(0)
+
+        vision_tokens: torch.Tensor = self._encode_vision_tokens(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+        )
+
+        pooled_tokens: torch.Tensor = self.contrastive_pooler(
+            tokens=vision_tokens,
+            valid_mask=image_valid_mask.to(dtype=torch.bool),
+        )
+        embedding: torch.Tensor = pooled_tokens[:, 0, :]
+        embedding = F.normalize(embedding, p=2.0, dim=-1, eps=1.0e-12)
+        return embedding.squeeze(0)
+
+    def encode_text(self, input_ids: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+        """Encode text tokens into normalized embedding(s)."""
+        if not isinstance(input_ids, torch.Tensor):
+            raise TypeError(f"input_ids must be torch.Tensor, got {type(input_ids).__name__}.")
+        if not isinstance(attn_mask, torch.Tensor):
+            raise TypeError(f"attn_mask must be torch.Tensor, got {type(attn_mask).__name__}.")
+
+        squeeze_output: bool = False
+        ids: torch.Tensor
+        mask: torch.Tensor
+
+        if input_ids.ndim == 1:
+            ids = input_ids.unsqueeze(0)
+            squeeze_output = True
+        elif input_ids.ndim == 2:
+            ids = input_ids
+        else:
+            raise CoCaModelError(
+                f"input_ids must have shape [L] or [B,L], got {tuple(input_ids.shape)}."
+            )
+
+        if attn_mask.ndim == 1:
+            mask = attn_mask.unsqueeze(0)
+        elif attn_mask.ndim == 2:
+            mask = attn_mask
+        else:
+            raise CoCaModelError(
+                f"attn_mask must have shape [L] or [B,L], got {tuple(attn_mask.shape)}."
+            )
+
+        if tuple(ids.shape) != tuple(mask.shape):
+            raise CoCaModelError(
+                "input_ids and attn_mask shapes must match. "
+                f"Got ids={tuple(ids.shape)}, mask={tuple(mask.shape)}."
+            )
+
+        text_embeddings: torch.Tensor = self.text_encoder(
+            input_ids=ids.to(dtype=torch.long),
+            attn_mask=mask.to(dtype=torch.long),
+        )
+        text_embeddings = F.normalize(text_embeddings, p=2.0, dim=-1, eps=1.0e-12)
+
+        if squeeze_output:
+            return text_embeddings.squeeze(0)
+        return text_embeddings
+
+    def generate_report(self, grid: FeatureGrid, num_beams: int = _DEFAULT_NUM_BEAMS) -> str:
+        """Generate a pathology report string for one slide grid.
+
+        Uses decoder beam search with config-aligned defaults.
+        """
+        if not isinstance(grid, FeatureGrid):
+            raise TypeError(f"grid must be FeatureGrid, got {type(grid).__name__}.")
+        if isinstance(num_beams, bool) or not isinstance(num_beams, int):
+            raise CoCaModelError("num_beams must be an integer.")
+        if num_beams <= 0:
+            raise CoCaModelError("num_beams must be > 0.")
+
+        # Design/config require one beam group; decoder API does not expose beam groups,
+        # so we keep this invariant as metadata-level constraint.
+        _ = _DEFAULT_NUM_BEAM_GROUPS
+
+        image_features: torch.Tensor = grid.features.unsqueeze(0)
+        image_coords_xy: torch.Tensor = grid.coords_xy.unsqueeze(0)
+        image_valid_mask: torch.Tensor = grid.valid_mask.unsqueeze(0)
+
+        vision_tokens: torch.Tensor = self._encode_vision_tokens(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+        )
+        image_tokens: torch.Tensor = self.reconstruction_pooler(
+            tokens=vision_tokens,
+            valid_mask=image_valid_mask,
+        )
+
+        generated_ids: torch.Tensor = self.decoder.generate(
+            image_tokens=image_tokens,
+            num_beams=int(num_beams),
+            max_new_tokens=_DEFAULT_MAX_NEW_TOKENS,
+        )
+
+        if generated_ids.ndim != 2 or int(generated_ids.shape[0]) != 1:
+            raise CoCaModelError(
+                "Decoder generate must return shape [1, T] for single-grid input. "
+                f"Got {tuple(generated_ids.shape)}."
+            )
+
+        token_ids: List[int] = [int(v) for v in generated_ids[0].detach().cpu().tolist()]
+        report: str = self._decode_token_ids(token_ids)
+        return report
+
+    def _encode_vision_tokens(
+        self,
+        image_features: torch.Tensor,
+        image_coords_xy: torch.Tensor,
+        image_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode dense grid tensors to contextualized token sequence [B,T,D]."""
+        if image_features.ndim != 4:
+            raise CoCaModelError(
+                f"image_features must have shape [B,H,W,D], got {tuple(image_features.shape)}."
+            )
+        if image_coords_xy.ndim != 4:
+            raise CoCaModelError(
+                f"image_coords_xy must have shape [B,H,W,2], got {tuple(image_coords_xy.shape)}."
+            )
+        if image_valid_mask.ndim != 3:
+            raise CoCaModelError(
+                f"image_valid_mask must have shape [B,H,W], got {tuple(image_valid_mask.shape)}."
+            )
+
+        batch_size: int = int(image_features.shape[0])
+        grid_h: int = int(image_features.shape[1])
+        grid_w: int = int(image_features.shape[2])
+        feat_dim: int = int(image_features.shape[3])
+
+        if feat_dim != self.embed_dim:
+            raise CoCaModelError(
+                f"image_features last dim must be {self.embed_dim}, got {feat_dim}."
+            )
+        if tuple(image_coords_xy.shape[:3]) != (batch_size, grid_h, grid_w) or int(
+            image_coords_xy.shape[3]
+        ) != 2:
+            raise CoCaModelError(
+                "image_coords_xy must align with image_features spatial dims and last dim=2. "
+                f"Got features={tuple(image_features.shape)}, coords={tuple(image_coords_xy.shape)}."
+            )
+        if tuple(image_valid_mask.shape) != (batch_size, grid_h, grid_w):
+            raise CoCaModelError(
+                "image_valid_mask must align with image_features spatial dims. "
+                f"Got features={tuple(image_features.shape)}, mask={tuple(image_valid_mask.shape)}."
+            )
+
+        encoded_tokens: torch.Tensor = self.vision(
+            grid_tokens=image_features.to(dtype=torch.float32),
+            pos_xy=image_coords_xy.to(dtype=torch.float32),
+            attn_mask=image_valid_mask.to(dtype=torch.bool),
+        )
+
+        if encoded_tokens.ndim != 3:
+            raise CoCaModelError(
+                f"vision forward must return [B,T,D], got {tuple(encoded_tokens.shape)}."
+            )
+
+        expected_tokens: int = grid_h * grid_w
+        if int(encoded_tokens.shape[0]) != batch_size or int(encoded_tokens.shape[1]) != expected_tokens or int(
+            encoded_tokens.shape[2]
+        ) != self.embed_dim:
+            raise CoCaModelError(
+                "vision forward output shape mismatch. "
+                f"Expected ({batch_size}, {expected_tokens}, {self.embed_dim}), "
+                f"got {tuple(encoded_tokens.shape)}."
+            )
+
+        # Re-apply valid mask for safety.
+        valid_bt: torch.Tensor = image_valid_mask.reshape(batch_size, expected_tokens).to(dtype=encoded_tokens.dtype)
+        encoded_tokens = encoded_tokens * valid_bt.unsqueeze(-1)
+
+        return encoded_tokens
+
+    def _normalize_batch(self, batch: Any) -> _BatchTensors:
+        """Normalize supported batch formats to a single tensor contract.
+
+        Supported inputs:
+        - MultimodalBatch (single sample)
+        - Mapping from collate_multimodal with keys:
+          image_features, image_coords_xy, image_valid_mask,
+          input_ids, attention_mask, labels, slide_ids
+        - Mapping with `image_grid` + text tensors (single sample)
+        """
+        if isinstance(batch, MultimodalBatch):
+            return self._normalize_multimodal_dataclass(batch)
+
+        if isinstance(batch, Mapping):
+            if "image_features" in batch:
+                return self._normalize_collated_mapping(batch)
+            if "image_grid" in batch:
+                return self._normalize_single_mapping(batch)
+
+        raise CoCaModelError(
+            "Unsupported batch type for CoCaModel forward. "
+            f"Got {type(batch).__name__}."
+        )
+
+    def _normalize_multimodal_dataclass(self, batch: MultimodalBatch) -> _BatchTensors:
+        image_grid: FeatureGrid = batch.image_grid
+        if not isinstance(image_grid, FeatureGrid):
+            raise CoCaModelError("MultimodalBatch.image_grid must be FeatureGrid.")
+
+        image_features: torch.Tensor = image_grid.features.unsqueeze(0).to(dtype=torch.float32)
+        image_coords_xy: torch.Tensor = image_grid.coords_xy.unsqueeze(0).to(dtype=torch.float32)
+        image_valid_mask: torch.Tensor = image_grid.valid_mask.unsqueeze(0).to(dtype=torch.bool)
+
+        input_ids: torch.Tensor = self._ensure_2d_long(batch.input_ids, "input_ids")
+        attention_mask: torch.Tensor = self._ensure_2d_long(batch.attention_mask, "attention_mask")
+        labels: torch.Tensor = self._ensure_2d_long(batch.labels, "labels")
+
+        if tuple(input_ids.shape) != tuple(attention_mask.shape) or tuple(input_ids.shape) != tuple(labels.shape):
+            raise CoCaModelError(
+                "Text tensors must share shape [B,L] after normalization. "
+                f"Got input_ids={tuple(input_ids.shape)}, attention_mask={tuple(attention_mask.shape)}, "
+                f"labels={tuple(labels.shape)}."
+            )
+
+        # Dataclass stores single sample, enforce B=1 text tensors.
+        if int(input_ids.shape[0]) != 1:
+            raise CoCaModelError(
+                "MultimodalBatch dataclass input must correspond to one sample (B=1). "
+                f"Got B={int(input_ids.shape[0])}."
+            )
+
+        return _BatchTensors(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=[str(batch.slide_id)],
+        )
+
+    def _normalize_collated_mapping(self, batch: Mapping[str, Any]) -> _BatchTensors:
+        image_features_obj: Any = batch.get("image_features")
+        image_coords_obj: Any = batch.get("image_coords_xy")
+        image_mask_obj: Any = batch.get("image_valid_mask")
+
+        input_ids_obj: Any = batch.get("input_ids")
+        attn_mask_obj: Any = batch.get("attention_mask")
+        labels_obj: Any = batch.get("labels")
+        slide_ids_obj: Any = batch.get("slide_ids")
+
+        if not isinstance(image_features_obj, torch.Tensor):
+            raise CoCaModelError("Collated batch key 'image_features' must be torch.Tensor.")
+        if not isinstance(image_coords_obj, torch.Tensor):
+            raise CoCaModelError("Collated batch key 'image_coords_xy' must be torch.Tensor.")
+        if not isinstance(image_mask_obj, torch.Tensor):
+            raise CoCaModelError("Collated batch key 'image_valid_mask' must be torch.Tensor.")
+
+        if not isinstance(input_ids_obj, torch.Tensor):
+            raise CoCaModelError("Collated batch key 'input_ids' must be torch.Tensor.")
+        if not isinstance(attn_mask_obj, torch.Tensor):
+            raise CoCaModelError("Collated batch key 'attention_mask' must be torch.Tensor.")
+        if not isinstance(labels_obj, torch.Tensor):
+            raise CoCaModelError("Collated batch key 'labels' must be torch.Tensor.")
+
+        image_features: torch.Tensor = image_features_obj.to(dtype=torch.float32)
+        image_coords_xy: torch.Tensor = image_coords_obj.to(dtype=torch.float32)
+        image_valid_mask: torch.Tensor = image_mask_obj.to(dtype=torch.bool)
+
+        input_ids: torch.Tensor = self._ensure_2d_long(input_ids_obj, "input_ids")
+        attention_mask: torch.Tensor = self._ensure_2d_long(attn_mask_obj, "attention_mask")
+        labels: torch.Tensor = self._ensure_2d_long(labels_obj, "labels")
+
+        if tuple(input_ids.shape) != tuple(attention_mask.shape) or tuple(input_ids.shape) != tuple(labels.shape):
+            raise CoCaModelError(
+                "Text tensors in collated batch must share shape [B,L]. "
+                f"Got input_ids={tuple(input_ids.shape)}, attention_mask={tuple(attention_mask.shape)}, "
+                f"labels={tuple(labels.shape)}."
+            )
+
+        batch_size: int = int(image_features.shape[0])
+        if int(input_ids.shape[0]) != batch_size:
+            raise CoCaModelError(
+                "Image/text batch sizes must match. "
+                f"Got image B={batch_size}, text B={int(input_ids.shape[0])}."
+            )
+
+        slide_ids: List[str] = self._normalize_slide_ids(slide_ids_obj=slide_ids_obj, batch_size=batch_size)
+
+        return _BatchTensors(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=slide_ids,
+        )
+
+    def _normalize_single_mapping(self, batch: Mapping[str, Any]) -> _BatchTensors:
+        image_grid_obj: Any = batch.get("image_grid")
+        if not isinstance(image_grid_obj, FeatureGrid):
+            raise CoCaModelError("Mapping batch key 'image_grid' must be FeatureGrid.")
+
+        input_ids_obj: Any = batch.get("input_ids")
+        attn_mask_obj: Any = batch.get("attention_mask")
+        labels_obj: Any = batch.get("labels")
+        slide_id_obj: Any = batch.get("slide_id")
+
+        if not isinstance(input_ids_obj, torch.Tensor):
+            raise CoCaModelError("Mapping batch key 'input_ids' must be torch.Tensor.")
+        if not isinstance(attn_mask_obj, torch.Tensor):
+            raise CoCaModelError("Mapping batch key 'attention_mask' must be torch.Tensor.")
+        if not isinstance(labels_obj, torch.Tensor):
+            raise CoCaModelError("Mapping batch key 'labels' must be torch.Tensor.")
+
+        image_features: torch.Tensor = image_grid_obj.features.unsqueeze(0).to(dtype=torch.float32)
+        image_coords_xy: torch.Tensor = image_grid_obj.coords_xy.unsqueeze(0).to(dtype=torch.float32)
+        image_valid_mask: torch.Tensor = image_grid_obj.valid_mask.unsqueeze(0).to(dtype=torch.bool)
+
+        input_ids: torch.Tensor = self._ensure_2d_long(input_ids_obj, "input_ids")
+        attention_mask: torch.Tensor = self._ensure_2d_long(attn_mask_obj, "attention_mask")
+        labels: torch.Tensor = self._ensure_2d_long(labels_obj, "labels")
+
+        if int(input_ids.shape[0]) != 1:
+            raise CoCaModelError(
+                "Single mapping batch must represent one sample (B=1). "
+                f"Got B={int(input_ids.shape[0])}."
+            )
+
+        slide_id: str = str(slide_id_obj) if slide_id_obj is not None else "unknown"
+
+        return _BatchTensors(
+            image_features=image_features,
+            image_coords_xy=image_coords_xy,
+            image_valid_mask=image_valid_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            slide_ids=[slide_id],
+        )
+
+    @staticmethod
+    def _ensure_2d_long(value: torch.Tensor, name: str) -> torch.Tensor:
+        if not isinstance(value, torch.Tensor):
+            raise CoCaModelError(f"{name} must be torch.Tensor, got {type(value).__name__}.")
+
+        if value.ndim == 1:
+            tensor: torch.Tensor = value.unsqueeze(0)
+        elif value.ndim == 2:
+            tensor = value
+        else:
+            raise CoCaModelError(
+                f"{name} must have shape [L] or [B,L], got {tuple(value.shape)}."
+            )
+
+        if int(tensor.shape[0]) <= 0 or int(tensor.shape[1]) <= 0:
+            raise CoCaModelError(f"{name} has invalid shape {tuple(tensor.shape)}.")
+
+        return tensor.to(dtype=torch.long)
+
+    @staticmethod
+    def _normalize_slide_ids(slide_ids_obj: Any, batch_size: int) -> List[str]:
+        if slide_ids_obj is None:
+            return [f"sample_{idx}" for idx in range(batch_size)]
+
+        if isinstance(slide_ids_obj, (list, tuple)):
+            slide_ids: List[str] = [str(item) for item in slide_ids_obj]
+            if len(slide_ids) != batch_size:
+                raise CoCaModelError(
+                    "slide_ids length must match batch size. "
+                    f"Got len(slide_ids)={len(slide_ids)}, batch_size={batch_size}."
+                )
+            return slide_ids
+
+        if isinstance(slide_ids_obj, str):
+            if batch_size != 1:
+                raise CoCaModelError(
+                    "String slide_ids is only valid for batch_size=1. "
+                    f"Got batch_size={batch_size}."
+                )
+            return [slide_ids_obj]
+
+        raise CoCaModelError(
+            f"Unsupported slide_ids type: {type(slide_ids_obj).__name__}."
+        )
+
+    @staticmethod
+    def _decode_token_ids(token_ids: Sequence[int]) -> str:
+        """Fallback token-id decoder to readable plain text.
+
+        Since tokenizer decode hooks are not part of the current design interface,
+        this method emits deterministic placeholder tokens while removing special
+        control tokens.
+        """
+        visible_tokens: List[str] = []
+        for token_id in token_ids:
+            token_int: int = int(token_id)
+            if token_int in {_DEFAULT_PAD_TOKEN_ID, _DEFAULT_BOS_TOKEN_ID}:
+                continue
+            if token_int == _DEFAULT_EOS_TOKEN_ID:
+                break
+            visible_tokens.append(f"tok_{token_int}")
+
+        if len(visible_tokens) == 0:
+            return ""
+
+        return " ".join(visible_tokens)
+
+
+__all__ = [
+    "CoCaModelError",
+    "CoCaModelConfigError",
+    "CoCaModel",
+]

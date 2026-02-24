@@ -1,0 +1,3 @@
+Implemented the requested logic analysis in [src/baselines/abmil.py](/Users/mingatlas/Projects/Paper2Code/src/baselines/abmil.py).
+
+It is aligned to the paper + provided `config.yaml` and covers ABMIL scope, training protocol (batch size 1, AdamW, cosine, 20 epochs), shared artifact contracts, fairness constraints against TITAN baselines, evaluation integration, and explicit failure/reproducibility guardrails.

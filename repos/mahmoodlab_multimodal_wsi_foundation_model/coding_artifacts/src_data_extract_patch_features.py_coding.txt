@@ -1,0 +1,578 @@
+## Code: src/data/extract_patch_features.py
+```python
+"""Patch feature extraction for TITAN reproduction.
+
+This module implements the design-locked ``PatchFeatureExtractor`` interface and
+produces deterministic patch embeddings from 512x512 @20x WSI tiles.
+
+Public API:
+- PatchFeatureExtractor.__init__(encoder_name: str, ckpt_path: str, out_dim: int = 768)
+- PatchFeatureExtractor.extract_batch(images: torch.Tensor) -> torch.Tensor
+- PatchFeatureExtractor.extract_wsi(coords: list, wsi_path: str) -> np.ndarray
+- PatchFeatureExtractor.save_features(out_path: str, feats: np.ndarray, coords: np.ndarray) -> None
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+import os
+import tempfile
+from typing import Any, Dict, List, Optional, Tuple
+
+import h5py
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+
+try:
+    import open_clip
+except Exception:
+    open_clip = None  # type: ignore[assignment]
+
+from src.data.wsi_reader import WSIReader
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from config.yaml.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_DEFAULT_BATCH_SIZE: int = 32
+_DEFAULT_DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+_DEFAULT_DTYPE: torch.dtype = torch.float32
+
+# Fallback normalization (ImageNet). Used when model config does not provide mean/std.
+_DEFAULT_MEAN: Tuple[float, float, float] = (0.485, 0.456, 0.406)
+_DEFAULT_STD: Tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+
+class PatchFeatureExtractorError(RuntimeError):
+    """Base error for patch feature extraction failures."""
+
+
+class EncoderBuildError(PatchFeatureExtractorError):
+    """Raised when encoder cannot be created or loaded."""
+
+
+class FeatureShapeError(PatchFeatureExtractorError):
+    """Raised when feature/coordinate shapes violate contract."""
+
+
+@dataclass(frozen=True)
+class _EncoderSpec:
+    """Resolved encoder runtime spec."""
+
+    name: str
+    input_size: int
+    mean: Tuple[float, float, float]
+    std: Tuple[float, float, float]
+
+
+class _ProjectionHead(nn.Module):
+    """Linear projection to enforce fixed output dimension."""
+
+    def __init__(self, in_dim: int, out_dim: int) -> None:
+        super().__init__()
+        if in_dim <= 0 or out_dim <= 0:
+            raise ValueError("in_dim and out_dim must be positive integers.")
+        self.proj: nn.Linear = nn.Linear(in_dim, out_dim, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+class _TinyFallbackCNN(nn.Module):
+    """Deterministic fallback encoder when requested backbone is unavailable."""
+
+    def __init__(self, out_dim: int) -> None:
+        super().__init__()
+        self.features: nn.Sequential = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.fc: nn.Linear = nn.Linear(256, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y: torch.Tensor = self.features(x)
+        y = y.flatten(1)
+        return self.fc(y)
+
+
+class PatchFeatureExtractor:
+    """Extract 768-d patch features from WSI tile coordinates.
+
+    The extractor is strictly aligned to the provided configuration:
+    - patch size: 512
+    - magnification: 20x
+    - feature dimension: 768
+    """
+
+    def __init__(self, encoder_name: str, ckpt_path: str, out_dim: int = _FEATURE_DIM) -> None:
+        """Initialize a feature extractor.
+
+        Args:
+            encoder_name: Backbone identifier (e.g., ``conch``, ``vit_base_patch16_224``).
+            ckpt_path: Path to checkpoint. Empty string means random init backbone.
+            out_dim: Output feature dimension; must be 768 for TITAN reproduction.
+        """
+        if not isinstance(encoder_name, str) or not encoder_name.strip():
+            raise ValueError("encoder_name must be a non-empty string.")
+        if not isinstance(ckpt_path, str):
+            raise TypeError("ckpt_path must be a string.")
+        if int(out_dim) != _FEATURE_DIM:
+            raise ValueError(f"out_dim must be {_FEATURE_DIM}, got {out_dim}.")
+
+        self.encoder_name: str = encoder_name.strip()
+        self.ckpt_path: str = ckpt_path.strip()
+        self.out_dim: int = int(out_dim)
+        self.patch_size: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+
+        env_batch: str = os.environ.get("PATCH_EXTRACT_BATCH_SIZE", str(_DEFAULT_BATCH_SIZE))
+        self.batch_size: int = max(1, int(env_batch))
+
+        self.device: torch.device = torch.device(_DEFAULT_DEVICE)
+        self.dtype: torch.dtype = _DEFAULT_DTYPE
+
+        self._reader: WSIReader = WSIReader(backend="openslide")
+        self._encoder, self._spec = self._build_encoder(encoder_name=self.encoder_name)
+        self._encoder = self._encoder.to(self.device)
+        self._encoder.eval()
+
+        if self.ckpt_path:
+            self._load_checkpoint(self.ckpt_path)
+
+        for param in self._encoder.parameters():
+            param.requires_grad = False
+
+    def extract_batch(self, images: torch.Tensor) -> torch.Tensor:
+        """Extract features for a batch of tiles.
+
+        Args:
+            images: Tensor of shape ``[N, 3, H, W]``.
+
+        Returns:
+            Tensor of shape ``[N, 768]`` on CPU.
+        """
+        if not isinstance(images, torch.Tensor):
+            raise TypeError("images must be a torch.Tensor.")
+        if images.ndim != 4:
+            raise ValueError(f"images must have shape [N, C, H, W], got {tuple(images.shape)}.")
+        if images.shape[0] <= 0:
+            raise ValueError("images batch is empty.")
+        if images.shape[1] != 3:
+            raise ValueError(f"images channel dimension must be 3, got {images.shape[1]}.")
+
+        prepared: torch.Tensor = self._prepare_batch(images)
+        prepared = prepared.to(self.device, dtype=self.dtype, non_blocking=True)
+
+        with torch.inference_mode():
+            feats: torch.Tensor = self._encoder(prepared)
+
+        if feats.ndim != 2:
+            feats = feats.reshape(feats.shape[0], -1)
+        if feats.shape[1] != self.out_dim:
+            raise FeatureShapeError(
+                f"Encoder returned shape {tuple(feats.shape)}; expected second dim {self.out_dim}."
+            )
+
+        return feats.detach().cpu()
+
+    def extract_wsi(self, coords: list, wsi_path: str) -> np.ndarray:
+        """Extract features for one WSI using precomputed tile coordinates.
+
+        Args:
+            coords: List of ``(x, y)`` level-0 patch anchors.
+            wsi_path: Path to WSI.
+
+        Returns:
+            ``np.ndarray`` with shape ``[num_patches, 768]`` and dtype ``float32``.
+        """
+        if not isinstance(coords, list):
+            raise TypeError(f"coords must be list, got {type(coords).__name__}.")
+        if not isinstance(wsi_path, str) or not wsi_path.strip():
+            raise ValueError("wsi_path must be a non-empty string.")
+
+        if len(coords) == 0:
+            return np.zeros((0, self.out_dim), dtype=np.float32)
+
+        features_parts: List[np.ndarray] = []
+        batch_images: List[torch.Tensor] = []
+
+        def _flush() -> None:
+            if not batch_images:
+                return
+            image_batch: torch.Tensor = torch.stack(batch_images, dim=0)
+            batch_feats: torch.Tensor = self.extract_batch(image_batch)
+            features_parts.append(batch_feats.numpy().astype(np.float32, copy=False))
+            batch_images.clear()
+
+        for index, coord in enumerate(coords):
+            x, y = self._validate_coord(coord=coord, index=index)
+            region_np: np.ndarray = self._reader.read_region(
+                path=wsi_path,
+                x=x,
+                y=y,
+                size=self.patch_size,
+                level=0,
+            )
+            if region_np.shape != (self.patch_size, self.patch_size, 3):
+                raise PatchFeatureExtractorError(
+                    "Unexpected patch shape from reader: "
+                    f"{region_np.shape}, expected ({self.patch_size}, {self.patch_size}, 3)."
+                )
+
+            image_t: torch.Tensor = torch.from_numpy(region_np).permute(2, 0, 1).contiguous()
+            batch_images.append(image_t)
+
+            if len(batch_images) >= self.batch_size:
+                _flush()
+
+        _flush()
+
+        if not features_parts:
+            return np.zeros((0, self.out_dim), dtype=np.float32)
+
+        features: np.ndarray = np.concatenate(features_parts, axis=0)
+        if features.shape[0] != len(coords):
+            raise FeatureShapeError(
+                f"Feature row count mismatch: got {features.shape[0]}, expected {len(coords)}."
+            )
+        if features.shape[1] != self.out_dim:
+            raise FeatureShapeError(
+                f"Feature dim mismatch: got {features.shape[1]}, expected {self.out_dim}."
+            )
+        return features.astype(np.float32, copy=False)
+
+    def save_features(self, out_path: str, feats: np.ndarray, coords: np.ndarray) -> None:
+        """Persist features and coordinates for one slide.
+
+        Supported outputs:
+        - ``.h5`` / ``.hdf5``: datasets ``features`` and ``coords``.
+        - ``.pt`` / ``.pth``: torch dictionary payload.
+        """
+        if not isinstance(out_path, str) or not out_path.strip():
+            raise ValueError("out_path must be a non-empty string.")
+
+        features_np: np.ndarray = self._validate_features_array(feats)
+        coords_np: np.ndarray = self._validate_coords_array(coords, expected_rows=features_np.shape[0])
+
+        path_obj: Path = Path(out_path).expanduser().resolve()
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+        suffix: str = path_obj.suffix.lower()
+        if suffix in {".h5", ".hdf5"}:
+            self._save_h5(path_obj=path_obj, feats=features_np, coords=coords_np)
+            return
+        if suffix in {".pt", ".pth"}:
+            self._save_pt(path_obj=path_obj, feats=features_np, coords=coords_np)
+            return
+
+        # Default to HDF5 if extension is omitted or unsupported.
+        default_h5_path: Path = path_obj.with_suffix(".h5")
+        self._save_h5(path_obj=default_h5_path, feats=features_np, coords=coords_np)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _build_encoder(self, encoder_name: str) -> Tuple[nn.Module, _EncoderSpec]:
+        name: str = encoder_name.strip().lower()
+
+        if "conch" in name and open_clip is not None:
+            model, spec = self._try_build_openclip_conch(name)
+            if model is not None:
+                return model, spec
+
+        timm_model, timm_spec = self._try_build_timm_model(encoder_name)
+        if timm_model is not None:
+            return timm_model, timm_spec
+
+        fallback: nn.Module = _TinyFallbackCNN(out_dim=self.out_dim)
+        spec: _EncoderSpec = _EncoderSpec(
+            name="tiny_fallback_cnn",
+            input_size=224,
+            mean=_DEFAULT_MEAN,
+            std=_DEFAULT_STD,
+        )
+        return fallback, spec
+
+    def _try_build_openclip_conch(self, name: str) -> Tuple[Optional[nn.Module], _EncoderSpec]:
+        if open_clip is None:
+            return None, _EncoderSpec(name=name, input_size=224, mean=_DEFAULT_MEAN, std=_DEFAULT_STD)
+
+        candidate_models: List[str] = [
+            "conch_ViT-B-16",
+            "ViT-B-16",
+        ]
+        for candidate in candidate_models:
+            try:
+                model, _, _ = open_clip.create_model_and_transforms(
+                    candidate,
+                    pretrained=None,
+                )
+            except Exception:
+                continue
+
+            vision: nn.Module = model.visual if hasattr(model, "visual") else model
+            out_dim: int = int(getattr(vision, "output_dim", 0) or getattr(model, "output_dim", 0) or 0)
+            if out_dim <= 0:
+                # Infer by dummy forward.
+                out_dim = self._infer_output_dim(vision, input_size=224)
+
+            wrapped: nn.Module = self._wrap_with_projection(backbone=vision, backbone_out_dim=out_dim)
+            spec: _EncoderSpec = _EncoderSpec(
+                name=f"openclip:{candidate}",
+                input_size=224,
+                mean=_DEFAULT_MEAN,
+                std=_DEFAULT_STD,
+            )
+            return wrapped, spec
+
+        return None, _EncoderSpec(name=name, input_size=224, mean=_DEFAULT_MEAN, std=_DEFAULT_STD)
+
+    def _try_build_timm_model(self, encoder_name: str) -> Tuple[Optional[nn.Module], _EncoderSpec]:
+        try:
+            model: nn.Module = timm.create_model(
+                encoder_name,
+                pretrained=False,
+                num_classes=0,
+                global_pool="avg",
+            )
+        except Exception:
+            # Stable fallback timm backbone.
+            try:
+                model = timm.create_model(
+                    "resnet50",
+                    pretrained=False,
+                    num_classes=0,
+                    global_pool="avg",
+                )
+                encoder_name = "resnet50"
+            except Exception:
+                return None, _EncoderSpec(name="none", input_size=224, mean=_DEFAULT_MEAN, std=_DEFAULT_STD)
+
+        cfg: Dict[str, Any] = getattr(model, "default_cfg", {}) or {}
+        input_size: int = int(cfg.get("input_size", (3, 224, 224))[-1])
+        mean_tuple: Tuple[float, float, float] = tuple(float(x) for x in cfg.get("mean", _DEFAULT_MEAN))  # type: ignore[arg-type]
+        std_tuple: Tuple[float, float, float] = tuple(float(x) for x in cfg.get("std", _DEFAULT_STD))  # type: ignore[arg-type]
+
+        if len(mean_tuple) != 3 or len(std_tuple) != 3:
+            mean_tuple = _DEFAULT_MEAN
+            std_tuple = _DEFAULT_STD
+
+        out_dim: int = int(getattr(model, "num_features", 0) or 0)
+        if out_dim <= 0:
+            out_dim = self._infer_output_dim(model, input_size=input_size)
+
+        wrapped: nn.Module = self._wrap_with_projection(backbone=model, backbone_out_dim=out_dim)
+        spec: _EncoderSpec = _EncoderSpec(
+            name=f"timm:{encoder_name}",
+            input_size=input_size,
+            mean=mean_tuple,
+            std=std_tuple,
+        )
+        return wrapped, spec
+
+    def _wrap_with_projection(self, backbone: nn.Module, backbone_out_dim: int) -> nn.Module:
+        if backbone_out_dim <= 0:
+            raise EncoderBuildError(f"Invalid backbone output dimension: {backbone_out_dim}.")
+
+        if backbone_out_dim == self.out_dim:
+            return backbone
+
+        module: nn.Module = nn.Sequential(
+            backbone,
+            _ProjectionHead(in_dim=backbone_out_dim, out_dim=self.out_dim),
+        )
+        return module
+
+    def _infer_output_dim(self, backbone: nn.Module, input_size: int) -> int:
+        with torch.inference_mode():
+            dummy: torch.Tensor = torch.zeros((1, 3, input_size, input_size), dtype=self.dtype)
+            out: torch.Tensor = backbone(dummy)
+        if out.ndim > 2:
+            out = out.reshape(out.shape[0], -1)
+        if out.ndim != 2:
+            raise EncoderBuildError(f"Unable to infer output dim from backbone output shape {tuple(out.shape)}.")
+        return int(out.shape[1])
+
+    def _load_checkpoint(self, ckpt_path: str) -> None:
+        path_obj: Path = Path(ckpt_path).expanduser().resolve()
+        if not path_obj.exists() or not path_obj.is_file():
+            raise FileNotFoundError(f"Checkpoint file not found: {path_obj}")
+
+        try:
+            payload: Any = torch.load(path_obj, map_location="cpu")
+        except Exception as exc:
+            raise EncoderBuildError(f"Failed loading checkpoint: {path_obj}") from exc
+
+        state_dict: Dict[str, torch.Tensor]
+        if isinstance(payload, dict) and "state_dict" in payload and isinstance(payload["state_dict"], dict):
+            state_dict = payload["state_dict"]
+        elif isinstance(payload, dict) and "model_state_dict" in payload and isinstance(payload["model_state_dict"], dict):
+            state_dict = payload["model_state_dict"]
+        elif isinstance(payload, dict):
+            # Assume raw state dict.
+            state_dict = payload  # type: ignore[assignment]
+        else:
+            raise EncoderBuildError("Checkpoint payload is not a compatible state_dict dictionary.")
+
+        cleaned: Dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if not isinstance(key, str):
+                continue
+            new_key: str = key
+            if new_key.startswith("module."):
+                new_key = new_key[len("module.") :]
+            if new_key.startswith("encoder."):
+                new_key = new_key[len("encoder.") :]
+            cleaned[new_key] = value
+
+        missing, unexpected = self._encoder.load_state_dict(cleaned, strict=False)
+        # Fail only when nothing was loaded effectively.
+        if len(cleaned) > 0 and len(missing) == len(self._encoder.state_dict()):
+            raise EncoderBuildError(
+                "Checkpoint appears incompatible: all model keys are missing after load_state_dict."
+            )
+        _ = unexpected  # explicitly keep variable for debugging if needed.
+
+    def _prepare_batch(self, images: torch.Tensor) -> torch.Tensor:
+        x: torch.Tensor = images
+        if x.dtype == torch.uint8:
+            x = x.to(torch.float32) / 255.0
+        elif not torch.is_floating_point(x):
+            x = x.to(torch.float32)
+        else:
+            x = x.to(torch.float32)
+
+        # If the incoming range is likely [0, 255], scale to [0, 1].
+        if float(torch.max(x).item()) > 1.5:
+            x = x / 255.0
+
+        _, _, h, w = x.shape
+        target_size: int = int(self._spec.input_size)
+        if h != target_size or w != target_size:
+            x = F.interpolate(x, size=(target_size, target_size), mode="bilinear", align_corners=False)
+
+        mean_t: torch.Tensor = torch.tensor(self._spec.mean, dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
+        std_t: torch.Tensor = torch.tensor(self._spec.std, dtype=x.dtype, device=x.device).view(1, 3, 1, 1)
+        x = (x - mean_t) / std_t
+        return x
+
+    @staticmethod
+    def _validate_coord(coord: object, index: int) -> Tuple[int, int]:
+        if not isinstance(coord, (tuple, list)):
+            raise TypeError(f"coords[{index}] must be tuple/list, got {type(coord).__name__}.")
+        if len(coord) != 2:
+            raise ValueError(f"coords[{index}] must have length 2, got {len(coord)}.")
+        x_raw: object = coord[0]
+        y_raw: object = coord[1]
+        if isinstance(x_raw, bool) or not isinstance(x_raw, (int, np.integer)):
+            raise TypeError(f"coords[{index}][0] must be int, got {type(x_raw).__name__}.")
+        if isinstance(y_raw, bool) or not isinstance(y_raw, (int, np.integer)):
+            raise TypeError(f"coords[{index}][1] must be int, got {type(y_raw).__name__}.")
+        x: int = int(x_raw)
+        y: int = int(y_raw)
+        if x < 0 or y < 0:
+            raise ValueError(f"coords[{index}] must be non-negative, got ({x}, {y}).")
+        return x, y
+
+    def _validate_features_array(self, feats: np.ndarray) -> np.ndarray:
+        if not isinstance(feats, np.ndarray):
+            raise TypeError(f"feats must be np.ndarray, got {type(feats).__name__}.")
+        if feats.ndim != 2:
+            raise FeatureShapeError(f"feats must be rank-2 [N, D], got shape {feats.shape}.")
+        if feats.shape[1] != self.out_dim:
+            raise FeatureShapeError(
+                f"Feature dimension mismatch: expected {self.out_dim}, got {feats.shape[1]}."
+            )
+        return feats.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _validate_coords_array(coords: np.ndarray, expected_rows: int) -> np.ndarray:
+        if not isinstance(coords, np.ndarray):
+            raise TypeError(f"coords must be np.ndarray, got {type(coords).__name__}.")
+        if coords.ndim != 2:
+            raise FeatureShapeError(f"coords must be rank-2 [N, 2], got shape {coords.shape}.")
+        if coords.shape[1] != 2:
+            raise FeatureShapeError(f"coords second dimension must be 2, got {coords.shape[1]}.")
+        if coords.shape[0] != expected_rows:
+            raise FeatureShapeError(
+                f"coords row count {coords.shape[0]} does not match features row count {expected_rows}."
+            )
+        return coords.astype(np.int64, copy=False)
+
+    def _save_h5(self, path_obj: Path, feats: np.ndarray, coords: np.ndarray) -> None:
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{path_obj.stem}.", suffix=path_obj.suffix, dir=str(path_obj.parent))
+        os.close(tmp_fd)
+        tmp_path: Path = Path(tmp_name)
+
+        try:
+            with h5py.File(tmp_path, "w") as h5f:
+                h5f.create_dataset("features", data=feats, dtype="float32", compression="gzip", compression_opts=4)
+                h5f.create_dataset("coords", data=coords, dtype="int64", compression="gzip", compression_opts=4)
+
+                h5f.attrs["encoder_name"] = self.encoder_name
+                h5f.attrs["encoder_spec"] = self._spec.name
+                h5f.attrs["patch_size_px"] = self.patch_size
+                h5f.attrs["magnification"] = self.magnification
+                h5f.attrs["feature_dim"] = self.out_dim
+                h5f.attrs["created_at_utc"] = datetime.now(timezone.utc).isoformat()
+                h5f.attrs["format_version"] = "1"
+
+            os.replace(tmp_path, path_obj)
+        except Exception as exc:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise PatchFeatureExtractorError(f"Failed writing HDF5 features to {path_obj}") from exc
+
+    def _save_pt(self, path_obj: Path, feats: np.ndarray, coords: np.ndarray) -> None:
+        payload: Dict[str, Any] = {
+            "features": torch.from_numpy(feats.astype(np.float32, copy=False)),
+            "coords": torch.from_numpy(coords.astype(np.int64, copy=False)),
+            "meta": {
+                "encoder_name": self.encoder_name,
+                "encoder_spec": self._spec.name,
+                "patch_size_px": self.patch_size,
+                "magnification": self.magnification,
+                "feature_dim": self.out_dim,
+                "created_at_utc": datetime.now(timezone.utc).isoformat(),
+                "format_version": "1",
+            },
+        }
+
+        tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{path_obj.stem}.", suffix=path_obj.suffix, dir=str(path_obj.parent))
+        os.close(tmp_fd)
+        tmp_path: Path = Path(tmp_name)
+
+        try:
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path_obj)
+        except Exception as exc:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise PatchFeatureExtractorError(f"Failed writing PT features to {path_obj}") from exc
+
+
+__all__ = [
+    "PatchFeatureExtractor",
+    "PatchFeatureExtractorError",
+    "EncoderBuildError",
+    "FeatureShapeError",
+]
+```

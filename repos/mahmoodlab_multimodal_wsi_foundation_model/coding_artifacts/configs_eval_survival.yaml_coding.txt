@@ -1,0 +1,86 @@
+## Code: configs/eval/survival.yaml
+```yaml
+# configs/eval/survival.yaml
+# Survival evaluation configuration for TITAN frozen slide embeddings.
+# This file is constrained to values provided in config.yaml.
+
+eval:
+  name: survival
+  enabled: true
+  task_type: survival
+
+  runtime:
+    python_version: "3.9.16"
+    pytorch_version: "2.0.1"
+    cuda_version: "11.8"
+    deterministic: true
+
+  hardware:
+    gpus: 1
+    gpu_type: "NVIDIA 3090 24GB"
+
+  data:
+    patch_size_px: 512
+    magnification: "20x"
+    patch_feature_dim: 768
+
+    artifacts:
+      features_filename: "features.h5"
+      grid_filename: "grid.pt"
+      splits_filename: "splits.csv"
+
+    split_policy:
+      site_preserved_five_fold_if_available: true
+      default_fold_count: 5
+      fallback_to_predefined_single_split: true
+
+  model:
+    encoder_checkpoint: "titan_final.ckpt"
+    freeze_backbone: true
+
+    slide_encoder:
+      architecture: "ViT in feature space"
+      num_layers: 6
+      num_attention_heads: 12
+      head_dim: 64
+      embedding_dim: 768
+      mlp_hidden_dim: 3072
+      positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+
+  protocol:
+    model: "linear Cox proportional hazards"
+    package: "scikit-survival"
+    endpoint: "disease_specific_survival"
+
+    # Explicit defaults for paper-critical but not fully specified optimizer/search details.
+    regularization_search:
+      enabled: false
+      values: null
+      selection_rule: null
+
+  preprocessing:
+    center_embeddings: false
+    l2_normalize_embeddings: false
+    fit_statistics_on_train_only: true
+
+  metrics:
+    primary:
+      - "c_index"
+
+    aggregate:
+      report_fold_mean_std: true
+      bootstrap_samples_single_split: 1000
+
+  io:
+    output_dir: "./outputs/eval/survival"
+    fold_metrics_filename: "survival_fold_results.csv"
+    metrics_filename: "survival_metrics.json"
+    write_json: true
+    write_csv: true
+
+  constraints:
+    require_embedding_dim_match: true
+    required_embedding_dim: 768
+    require_frozen_model: true
+    require_time_event_alignment: true
+```

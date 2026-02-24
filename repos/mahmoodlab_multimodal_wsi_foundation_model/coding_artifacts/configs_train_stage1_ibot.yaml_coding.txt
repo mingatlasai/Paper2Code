@@ -1,0 +1,146 @@
+## Code: configs/train/stage1_ibot.yaml
+```yaml
+# configs/train/stage1_ibot.yaml
+# Stage-1 TITAN-V training configuration (iBOT in feature space).
+# Values are bound to the provided config.yaml; unresolved paper-only details
+# remain explicit nulls and must be set by override when available.
+
+train:
+  stage: stage1
+  name: stage1_ibot
+  objective: "iBOT (student-teacher distillation + masked image modeling) in feature space"
+
+  runtime:
+    python_version: "3.9.16"
+    pytorch_version: "2.0.1"
+    cuda_version: "11.8"
+    distributed_backend: "nccl"
+    mixed_precision: true
+    deterministic: true
+
+  hardware:
+    gpus: 4
+    gpu_type: "NVIDIA A100 80GB"
+    local_batch_size_per_gpu: 256
+    effective_batch_size: 1024
+    gradient_accumulation_steps: 1
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+
+  data:
+    patch_size_px: 512
+    magnification: "20x"
+    patch_feature_dim: 768
+
+    # Stage-1 train-short geometry.
+    roi_region_size_px: 8192
+    roi_region_grid_size: [16, 16]
+
+    # Stage-1 tissue-group policy from paper/method plan.
+    min_patches_per_group: 16
+
+    # Shared artifact contract.
+    artifacts:
+      features_filename: "features.h5"
+      grid_filename: "grid.pt"
+      groups_filename: "groups.json"
+      splits_filename: "splits.csv"
+
+  model:
+    architecture: "titan_encoder"
+    variant: "titan_v"
+
+    encoder:
+      embed_dim: 768
+      num_layers: 6
+      num_heads: 12
+      head_dim: 64
+      mlp_dim: 3072
+      use_alibi_2d: true
+      positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+
+      # Derived from 16x16 train region.
+      max_tokens_train: 256
+
+    alibi_2d:
+      enabled: true
+      distance_metric: "euclidean"
+      coordinate_normalization: "divide_by_patch_size"
+      patch_size_px: 512
+
+      # Not specified in provided config.yaml / excerpted methods.
+      slopes: null
+
+  views:
+    # View policy reported for stage-1 iBOT.
+    global_views: 2
+    global_view_grid_size: [14, 14]
+    local_views: 10
+    local_view_grid_size: [6, 6]
+    interpolation: "none"
+
+  augmentations:
+    horizontal_flip: true
+    vertical_flip: true
+    feature_posterization: true
+
+    # Supplementary details for posterization are not in provided config.
+    feature_posterization_levels: null
+
+  optimization:
+    epochs: 270
+    iterations: 91260
+    clip_grad_norm: null
+
+    optimizer:
+      name: null
+      learning_rate: null
+      weight_decay: null
+      betas: null
+      eps: null
+
+    scheduler:
+      name: null
+      warmup: null
+      min_learning_rate: null
+
+  ibot:
+    enabled: true
+
+    # Stage-1 uses student/teacher distillation + masked modeling.
+    use_student_teacher: true
+    use_masked_modeling: true
+
+    # Supplementary-only details (explicitly unresolved).
+    student_temperature: null
+    teacher_temperature: null
+    center_momentum: null
+    teacher_momentum: null
+    mask_ratio: null
+
+  io:
+    output_dir: "./outputs/stage1"
+    checkpoint_dir: "./outputs/stage1/checkpoints"
+    checkpoint_name: "titan_v.ckpt"
+    save_every_n_epochs: 1
+    keep_last_k_checkpoints: 3
+
+    resume_from_checkpoint: null
+    strict_checkpoint_load: true
+
+  logging:
+    log_every_n_steps: 20
+    write_json: true
+    write_csv: true
+    write_tensorboard: false
+
+  reproducibility:
+    seed: 42
+
+  constraints:
+    require_embed_dim_equals_patch_feature_dim: true
+    require_heads_times_head_dim_equals_embed_dim: true
+    require_effective_batch_consistency: true
+    require_stage1_view_policy_consistency: true
+```

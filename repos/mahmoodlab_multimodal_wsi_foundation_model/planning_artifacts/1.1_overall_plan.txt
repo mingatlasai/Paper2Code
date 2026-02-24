@@ -1,0 +1,170 @@
+**Reproduction Roadmap (TITAN, no official code)**
+
+## 1. Define the reproduction scope first
+1. Reproduce the full pipeline in three stages:
+- Stage 1: vision-only slide pretraining (`TITAN V`) with iBOT in feature space.
+- Stage 2: ROI-caption vision-language alignment (CoCa).
+- Stage 3: WSI-report vision-language alignment (CoCa), yielding `TITAN`.
+
+2. Split deliverables into two tracks:
+- Core reproducibility: architecture, pretraining recipe, and key evaluations.
+- Practical reproducibility: public-data-only variant (since Mass-340K and many internal cohorts are inaccessible).
+
+---
+
+## 2. Methodology implementation plan
+
+### 2.1 Data pipeline and preprocessing
+1. Implement WSI preprocessing (CLAM-style):
+- Tissue segmentation on low-res HSV saturation channel.
+- Median blur, morphological closing, contour-area filtering.
+- Tile non-overlapping `512x512` patches at `20x`.
+- Extract per-patch `768-d` features using `CONCHv1.5`.
+
+2. Build spatial feature grids:
+- Place patch features into 2D grid by original WSI coordinates.
+- Keep background mask for non-tissue locations.
+- Support variable-size grids per WSI.
+
+3. Tissue-group preprocessing (for stage 1 sampling):
+- Cluster segmented contours by spatial proximity.
+- Filter groups with `<16` patches.
+- Save per-group coordinate/index metadata.
+
+### 2.2 TITAN V architecture (stage 1 backbone)
+1. Vision encoder:
+- ViT-style encoder with `6` transformer blocks.
+- `12` attention heads, head dim `64`.
+- Embedding dim `768`, MLP hidden dim `3072`.
+- Replace pixel patch-embedding layer with MLP for feature tokens.
+
+2. Positional encoding:
+- Implement 2D ALiBi bias in attention using Euclidean distance between token coordinates (coordinates normalized by patch size `512` as described).
+- Keep compatibility with train-short/test-long extrapolation.
+
+### 2.3 Stage 1 training: iBOT in feature space
+1. Sampling and views:
+- Randomly sample `16x16` region crops from tissue groups (`8192x8192` context at 20x).
+- From each region crop create `2` global views (`14x14`) and `10` local views (`6x6`), no resize interpolation.
+
+2. Augmentations:
+- Horizontal/vertical flips.
+- Feature-space posterization augmentation (paper cites frozen feature augmentation).
+
+3. Training setup (reported):
+- `270` epochs (`91,260` iterations).
+- `4 x A100 80GB`, DDP.
+- Local batch `256/GPU` (effective `1024`).
+- Save checkpoints for later stage initialization and ablations.
+
+### 2.4 Stage 2/3 multimodal CoCa continual pretraining
+1. Multimodal model components:
+- Image encoder initialized from `TITAN V`.
+- Add two attentional poolers:
+- Single-query contrastive pooler for global embedding.
+- `128`-query reconstruction pooler for decoder interaction.
+- Text encoder + multimodal decoder initialized from CONCHv1.5 (12 layers, dim 768, hidden 3072).
+
+2. Stage 2 (ROI-caption):
+- Train on `423,122` pairs of `8192x8192` ROI and synthetic captions.
+- Reported compute: `8 x A100 80GB`, local batch `196/GPU`, grad accum `2`, effective batch `3136`.
+
+3. Stage 3 (WSI-report):
+- Train on `182,862` WSI-report pairs.
+- Random crop WSI grids to `64x64` tokens (`32768x32768` px equivalent).
+- Reported setup: local batch `16/GPU`, grad accum `2`, effective batch `256`.
+- Use reduced LR/WD + slow warmup for vision backbone to avoid degradation.
+
+---
+
+## 3. Dataset and experiment plan
+
+## 3.1 Pretraining data requirements
+1. Target (paper): Mass-340K (`335,645` WSIs, 20 organs, mixed stains/scanners) + synthetic captions + paired reports.
+2. Reality: most data is internal; create two reproducibility tiers:
+- Tier A (closest): institutional/private data agreements + GTEx/TCGA additions.
+- Tier B (public-only): GTEx/TCGA/CPTAC/EBRAINS and other public pathology sets with same preprocessing and staged training logic.
+
+## 3.2 Downstream task suite to implement
+1. Linear probe tasks:
+- Multiclass morphology/subtyping.
+- Binary molecular markers.
+- Ordinal grading.
+- Survival prediction.
+
+2. Few-shot:
+- K in `{1,2,4,8,16,32}`.
+- 50 random runs, fixed test split.
+
+3. Retrieval:
+- Unimodal slide retrieval: Acc@1/3/5, MVAcc@5.
+- Cross-modal retrieval: Recall@1/3/5/10 + mean recall.
+
+4. Zero-shot classification:
+- Prompt-ensemble text embeddings per class.
+- Classify by nearest text embedding (cosine / equivalent normalized dot product).
+
+5. Report generation:
+- Zero-shot generation with beam search (`num_beams=5`, `num_beam_groups=1`).
+- Metrics: METEOR, ROUGE-1, BLEU-1.
+
+## 3.3 Baselines to reproduce
+1. Mean pooling on same patch features.
+2. ABMIL supervised baseline.
+3. If available: PRISM, GigaPath, CHIEF (public checkpoints/code constraints apply).
+4. Fine-tuning comparisons:
+- Pretrained TITAN/TITAN V fine-tune vs random init fine-tune.
+
+---
+
+## 4. Exact evaluation settings to follow
+1. Linear probing:
+- scikit-learn logistic regression (L-BFGS).
+- L2 search over 45 log-spaced values from `1e-6` to `10`.
+- Max iter `500`.
+- No-validation/few-shot setting: L2=`1`, iter=`1000`.
+
+2. k-NN probing:
+- SimpleShot prototypes (class mean embeddings).
+- k-NN with `k=20`.
+- Center + L2-normalize embeddings; Euclidean distance.
+
+3. Survival:
+- Linear Cox model (`scikit-survival`), disease-specific survival endpoint.
+- Five-fold site-preserved stratification where applicable.
+- Hyperparameter search for regularization over log-spaced grid (exact range partially unclear from parse; see ambiguity list).
+
+4. Statistics/reporting:
+- 5-fold datasets: mean ± SD across folds.
+- Single split: bootstrap (`n=1000`).
+- GLMM (beta family) for multi-dataset method comparisons + Tukey-corrected Wald tests.
+
+---
+
+## 5. Execution order for implementation (before coding details)
+1. Lock reproducibility scope (full vs public-only).
+2. Build data preprocessing + feature extraction pipeline.
+3. Implement TITAN V + stage 1 iBOT training.
+4. Implement CoCa multimodal stack and stage 2/3 training.
+5. Implement shared embedding inference API (slide/text/report modes).
+6. Implement evaluation harnesses (linear, few-shot, retrieval, zero-shot, report generation, survival).
+7. Run ablations:
+- ALiBi vs absolute PE.
+- 4/6/12 layers.
+- Region size (`4096^2` vs `8192^2`).
+- With/without stage 1 pretraining.
+8. Reproduce headline tables/figures with confidence intervals and significance tests.
+
+---
+
+## 6. What is unclear or missing from the paper
+1. Many critical hyperparameters are only in Supplementary Tables (2,3,4,5,6,7,8,9,10, etc.), not in provided text.
+2. Exact iBOT settings are incomplete: optimizer, LR schedule, EMA/teacher temperatures, mask ratio/details, weight decay, etc.
+3. Exact 2D ALiBi slope schedule per head is not fully specified in the excerpt.
+4. “Posterization feature augmentation” implementation details are under-specified.
+5. Tissue-group clustering algorithm details and thresholds are not fully specified.
+6. Synthetic caption/report-cleaning prompts (PathChat + Qwen2) are referenced but not fully included.
+7. Rare-Cancer and many benchmark datasets are internal/private or partially inaccessible.
+8. Some numeric ranges in parsed methods appear OCR-corrupted (for example Cox regularization search range).
+
+If you want, the next step is a concrete implementation spec document (module-by-module APIs, config schema, and training/eval command matrix) so coding can start directly.

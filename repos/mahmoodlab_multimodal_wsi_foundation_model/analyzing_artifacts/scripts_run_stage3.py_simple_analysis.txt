@@ -1,0 +1,5 @@
+Implemented the requested logic analysis in:
+
+- [scripts/run_stage3.py](/Users/mingatlas/Projects/Paper2Code/scripts/run_stage3.py)
+
+It is analysis-only (no code), aligned with the paper/design/task/config, and focused on Stage-3 orchestration from `titan_stage2.ckpt` to `titan_final.ckpt` with strict interface and config-fidelity constraints.

@@ -1,0 +1,700 @@
+## Code: src/models/titan_encoder.py
+```python
+"""TITAN slide encoder (ViT in feature space) for pathology WSIs.
+
+This module implements the design-locked TITANEncoder interface:
+- TITANEncoder.__init__(cfg: ModelConfig) -> None
+- TITANEncoder.forward(grid_tokens, pos_xy, attn_mask) -> torch.Tensor
+- TITANEncoder.encode_slide(grid: FeatureGrid) -> torch.Tensor
+- TITANEncoder.load_pretrained(path: str) -> None
+- TITANEncoder.save(path: str) -> None
+
+The implementation follows config.yaml constraints:
+- patch feature dim: 768
+- layers: 6
+- heads: 12
+- head dim: 64
+- MLP hidden dim: 3072
+- positional encoding: 2D ALiBi (Euclidean-distance attention bias)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from src.core.config_schema import ModelConfig
+from src.data.build_feature_grid import FeatureGrid
+from src.models.alibi_2d import ALiBi2D
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_NUM_LAYERS: int = 6
+_NUM_HEADS: int = 12
+_HEAD_DIM: int = 64
+_EMBED_DIM: int = 768
+_MLP_DIM: int = 3072
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+_DEFAULT_ATTN_DROPOUT: float = 0.0
+_DEFAULT_PROJ_DROPOUT: float = 0.0
+_DEFAULT_MLP_DROPOUT: float = 0.0
+_DEFAULT_LAYER_NORM_EPS: float = 1.0e-6
+
+
+class TITANEncoderError(RuntimeError):
+    """Base exception for TITAN encoder failures."""
+
+
+class TITANEncoderConfigError(TITANEncoderError):
+    """Raised when encoder configuration violates required invariants."""
+
+
+@dataclass(frozen=True)
+class _InputLayout:
+    """Tracks input shape layout to reconstruct output rank when needed."""
+
+    had_batch_dim: bool
+    had_spatial_dim: bool
+
+
+class _FeatureInputProjection(nn.Module):
+    """Feature-space projection replacing image patch embedding."""
+
+    def __init__(self, embed_dim: int) -> None:
+        super().__init__()
+        self.norm: nn.LayerNorm = nn.LayerNorm(embed_dim, eps=_DEFAULT_LAYER_NORM_EPS)
+        self.fc1: nn.Linear = nn.Linear(embed_dim, embed_dim)
+        self.act: nn.GELU = nn.GELU()
+        self.fc2: nn.Linear = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y: torch.Tensor = self.norm(x)
+        y = self.fc1(y)
+        y = self.act(y)
+        y = self.fc2(y)
+        return y
+
+
+class _MultiHeadSelfAttention2D(nn.Module):
+    """Multi-head self-attention with optional 2D ALiBi bias."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        head_dim: int,
+        use_alibi_2d: bool,
+        attn_dropout: float,
+        proj_dropout: float,
+        alibi_slopes: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+
+        if embed_dim <= 0:
+            raise TITANEncoderConfigError("embed_dim must be > 0.")
+        if num_heads <= 0:
+            raise TITANEncoderConfigError("num_heads must be > 0.")
+        if head_dim <= 0:
+            raise TITANEncoderConfigError("head_dim must be > 0.")
+        if num_heads * head_dim != embed_dim:
+            raise TITANEncoderConfigError(
+                "num_heads * head_dim must equal embed_dim. "
+                f"Got num_heads={num_heads}, head_dim={head_dim}, embed_dim={embed_dim}."
+            )
+
+        self.embed_dim: int = int(embed_dim)
+        self.num_heads: int = int(num_heads)
+        self.head_dim: int = int(head_dim)
+        self.scale: float = float(self.head_dim) ** -0.5
+        self.use_alibi_2d: bool = bool(use_alibi_2d)
+
+        self.qkv: nn.Linear = nn.Linear(self.embed_dim, self.embed_dim * 3, bias=True)
+        self.attn_drop: nn.Dropout = nn.Dropout(float(attn_dropout))
+        self.proj: nn.Linear = nn.Linear(self.embed_dim, self.embed_dim, bias=True)
+        self.proj_drop: nn.Dropout = nn.Dropout(float(proj_dropout))
+
+        self.alibi_2d: Optional[ALiBi2D]
+        if self.use_alibi_2d:
+            slopes: torch.Tensor
+            if alibi_slopes is None:
+                slopes = _build_default_alibi_slopes(self.num_heads)
+            else:
+                slopes = alibi_slopes.detach().flatten().to(dtype=torch.float32)
+            self.alibi_2d = ALiBi2D(num_heads=self.num_heads, slopes=slopes)
+        else:
+            self.alibi_2d = None
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        pos_xy: Optional[torch.Tensor],
+        attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run attention.
+
+        Args:
+            tokens: [B, T, D]
+            pos_xy: [B, T, 2] or None
+            attn_mask: [B, T] bool mask (True=valid) or None
+
+        Returns:
+            Contextualized tokens [B, T, D].
+        """
+        if tokens.ndim != 3:
+            raise TITANEncoderError(f"tokens must have shape [B,T,D], got {tuple(tokens.shape)}.")
+
+        batch_size: int = int(tokens.shape[0])
+        num_tokens: int = int(tokens.shape[1])
+        embed_dim: int = int(tokens.shape[2])
+        if embed_dim != self.embed_dim:
+            raise TITANEncoderError(
+                f"tokens last dim must be {self.embed_dim}, got {embed_dim}."
+            )
+
+        qkv: torch.Tensor = self.qkv(tokens)
+        qkv = qkv.view(batch_size, num_tokens, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        query: torch.Tensor = qkv[0]
+        key: torch.Tensor = qkv[1]
+        value: torch.Tensor = qkv[2]
+
+        attn_scores: torch.Tensor = torch.matmul(query, key.transpose(-2, -1)) * self.scale
+
+        if self.alibi_2d is not None:
+            if pos_xy is None:
+                raise TITANEncoderError("pos_xy is required when use_alibi_2d=True.")
+            if pos_xy.ndim != 3 or int(pos_xy.shape[0]) != batch_size or int(pos_xy.shape[1]) != num_tokens:
+                raise TITANEncoderError(
+                    "pos_xy must have shape [B,T,2] aligned with tokens. "
+                    f"Got {tuple(pos_xy.shape)} for tokens {tuple(tokens.shape)}."
+                )
+            bias: torch.Tensor = self.alibi_2d.build_bias(pos_xy)
+            attn_scores = self.alibi_2d.apply(attn_scores=attn_scores, bias=bias)
+
+        valid_mask: Optional[torch.Tensor] = None
+        if attn_mask is not None:
+            if attn_mask.ndim != 2 or int(attn_mask.shape[0]) != batch_size or int(attn_mask.shape[1]) != num_tokens:
+                raise TITANEncoderError(
+                    "attn_mask must have shape [B,T] aligned with tokens. "
+                    f"Got {tuple(attn_mask.shape)} for tokens {tuple(tokens.shape)}."
+                )
+            valid_mask = attn_mask.to(device=tokens.device, dtype=torch.bool)
+
+            key_mask: torch.Tensor = valid_mask.unsqueeze(1).unsqueeze(1)
+            min_value: float = torch.finfo(attn_scores.dtype).min
+            attn_scores = attn_scores.masked_fill(~key_mask, min_value)
+
+        attn_probs: torch.Tensor = F.softmax(attn_scores, dim=-1)
+        attn_probs = torch.where(torch.isfinite(attn_probs), attn_probs, torch.zeros_like(attn_probs))
+        attn_probs = self.attn_drop(attn_probs)
+
+        context: torch.Tensor = torch.matmul(attn_probs, value)
+        context = context.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.embed_dim)
+        context = self.proj(context)
+        context = self.proj_drop(context)
+
+        if valid_mask is not None:
+            context = context * valid_mask.unsqueeze(-1).to(dtype=context.dtype)
+
+        return context
+
+
+class _TransformerEncoderBlock(nn.Module):
+    """Pre-norm Transformer block for feature-space tokens."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        head_dim: int,
+        mlp_dim: int,
+        use_alibi_2d: bool,
+        attn_dropout: float,
+        proj_dropout: float,
+        mlp_dropout: float,
+        alibi_slopes: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+
+        self.norm1: nn.LayerNorm = nn.LayerNorm(embed_dim, eps=_DEFAULT_LAYER_NORM_EPS)
+        self.attn: _MultiHeadSelfAttention2D = _MultiHeadSelfAttention2D(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            use_alibi_2d=use_alibi_2d,
+            attn_dropout=attn_dropout,
+            proj_dropout=proj_dropout,
+            alibi_slopes=alibi_slopes,
+        )
+
+        self.norm2: nn.LayerNorm = nn.LayerNorm(embed_dim, eps=_DEFAULT_LAYER_NORM_EPS)
+        self.mlp: nn.Sequential = nn.Sequential(
+            nn.Linear(embed_dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(float(mlp_dropout)),
+            nn.Linear(mlp_dim, embed_dim),
+            nn.Dropout(float(mlp_dropout)),
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        pos_xy: Optional[torch.Tensor],
+        attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        residual: torch.Tensor = tokens
+        x: torch.Tensor = self.norm1(tokens)
+        x = self.attn(tokens=x, pos_xy=pos_xy, attn_mask=attn_mask)
+        tokens = residual + x
+
+        residual = tokens
+        x = self.norm2(tokens)
+        x = self.mlp(x)
+        tokens = residual + x
+
+        if attn_mask is not None:
+            tokens = tokens * attn_mask.unsqueeze(-1).to(dtype=tokens.dtype)
+
+        return tokens
+
+
+class TITANEncoder(nn.Module):
+    """Transformer-based slide encoder operating in patch-feature space."""
+
+    def __init__(self, cfg: ModelConfig) -> None:
+        """Initialize TITAN encoder from validated model config."""
+        super().__init__()
+
+        if not isinstance(cfg, ModelConfig):
+            raise TITANEncoderConfigError(
+                f"cfg must be ModelConfig, got {type(cfg).__name__}."
+            )
+
+        self.cfg: ModelConfig = cfg
+
+        self.embed_dim: int = int(cfg.embed_dim)
+        self.num_layers: int = int(cfg.num_layers)
+        self.num_heads: int = int(cfg.num_heads)
+        self.head_dim: int = int(cfg.head_dim)
+        self.mlp_dim: int = int(cfg.mlp_dim)
+        self.use_alibi_2d: bool = bool(cfg.use_alibi_2d)
+        self.max_tokens_train: int = int(cfg.max_tokens_train)
+
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.feature_dim: int = _FEATURE_DIM
+
+        self._validate_architecture()
+
+        alibi_slopes: Optional[torch.Tensor] = None
+        if hasattr(cfg, "alibi_slopes"):
+            raw_slopes: Any = getattr(cfg, "alibi_slopes")
+            if raw_slopes is not None:
+                alibi_slopes = torch.as_tensor(raw_slopes, dtype=torch.float32)
+
+        self.input_projection: _FeatureInputProjection = _FeatureInputProjection(embed_dim=self.embed_dim)
+        self.blocks: nn.ModuleList = nn.ModuleList(
+            [
+                _TransformerEncoderBlock(
+                    embed_dim=self.embed_dim,
+                    num_heads=self.num_heads,
+                    head_dim=self.head_dim,
+                    mlp_dim=self.mlp_dim,
+                    use_alibi_2d=self.use_alibi_2d,
+                    attn_dropout=_DEFAULT_ATTN_DROPOUT,
+                    proj_dropout=_DEFAULT_PROJ_DROPOUT,
+                    mlp_dropout=_DEFAULT_MLP_DROPOUT,
+                    alibi_slopes=alibi_slopes,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
+        self.final_norm: nn.LayerNorm = nn.LayerNorm(self.embed_dim, eps=_DEFAULT_LAYER_NORM_EPS)
+
+    def forward(
+        self,
+        grid_tokens: torch.Tensor,
+        pos_xy: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode tokenized feature grids.
+
+        Args:
+            grid_tokens: Token features with shape [B,T,D], [T,D], [B,H,W,D], or [H,W,D].
+            pos_xy: Coordinates aligned to tokens with shape [B,T,2], [T,2], [B,H,W,2], or [H,W,2].
+            attn_mask: Valid mask aligned to tokens with shape [B,T], [T], [B,H,W], or [H,W].
+
+        Returns:
+            Contextualized token embeddings with shape [B,T,D] or [T,D] (matching batch presence).
+        """
+        tokens_btd, pos_btd, mask_bt, layout = self._prepare_inputs(
+            grid_tokens=grid_tokens,
+            pos_xy=pos_xy,
+            attn_mask=attn_mask,
+        )
+
+        tokens_btd = self.input_projection(tokens_btd)
+
+        for block in self.blocks:
+            tokens_btd = block(tokens=tokens_btd, pos_xy=pos_btd, attn_mask=mask_bt)
+
+        tokens_btd = self.final_norm(tokens_btd)
+        tokens_btd = tokens_btd * mask_bt.unsqueeze(-1).to(dtype=tokens_btd.dtype)
+
+        if layout.had_batch_dim:
+            return tokens_btd
+        return tokens_btd.squeeze(0)
+
+    def encode_slide(self, grid: FeatureGrid) -> torch.Tensor:
+        """Encode one slide FeatureGrid into a slide-level embedding.
+
+        Uses mask-aware mean pooling over token embeddings.
+
+        Args:
+            grid: Input slide grid.
+
+        Returns:
+            Slide embedding tensor of shape [D].
+        """
+        if not isinstance(grid, FeatureGrid):
+            raise TITANEncoderError(f"grid must be FeatureGrid, got {type(grid).__name__}.")
+
+        tokens_btd: torch.Tensor = grid.features.unsqueeze(0)
+        pos_btd: torch.Tensor = grid.coords_xy.unsqueeze(0)
+        mask_bt: torch.Tensor = grid.valid_mask.unsqueeze(0)
+
+        encoded: torch.Tensor = self.forward(
+            grid_tokens=tokens_btd,
+            pos_xy=pos_btd,
+            attn_mask=mask_bt,
+        )
+        if encoded.ndim != 3:
+            raise TITANEncoderError(f"Internal forward returned invalid shape {tuple(encoded.shape)}.")
+
+        valid_mask: torch.Tensor = mask_bt.to(dtype=encoded.dtype)
+        numerator: torch.Tensor = (encoded * valid_mask.unsqueeze(-1)).sum(dim=1)
+        denominator: torch.Tensor = valid_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled: torch.Tensor = numerator / denominator
+
+        return pooled.squeeze(0)
+
+    def load_pretrained(self, path: str) -> None:
+        """Load encoder weights from a checkpoint path."""
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("path must be a non-empty string.")
+
+        checkpoint_path: Path = Path(path).expanduser().resolve()
+        if not checkpoint_path.exists() or not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+        try:
+            payload: Any = torch.load(checkpoint_path, map_location="cpu")
+        except Exception as exc:
+            raise TITANEncoderError(f"Failed loading checkpoint: {checkpoint_path}") from exc
+
+        state_dict: Optional[Mapping[str, Any]] = self._extract_state_dict(payload)
+        if state_dict is None:
+            raise TITANEncoderError(
+                "Checkpoint does not contain a compatible state dict. "
+                f"Path: {checkpoint_path}"
+            )
+
+        cleaned_state: Dict[str, Any] = {}
+        current_keys: set[str] = set(self.state_dict().keys())
+        for raw_key, value in state_dict.items():
+            if not isinstance(raw_key, str):
+                continue
+            candidate_keys: Tuple[str, ...] = (
+                raw_key,
+                self._strip_prefix(raw_key, "module."),
+                self._strip_prefix(raw_key, "model."),
+                self._strip_prefix(raw_key, "encoder."),
+                self._strip_prefix(raw_key, "vision."),
+                self._strip_prefix(raw_key, "vision_model."),
+            )
+
+            selected_key: Optional[str] = None
+            for candidate_key in candidate_keys:
+                if candidate_key in current_keys:
+                    selected_key = candidate_key
+                    break
+            if selected_key is not None:
+                cleaned_state[selected_key] = value
+
+        if len(cleaned_state) == 0:
+            raise TITANEncoderError(
+                "No matching TITANEncoder keys found in checkpoint. "
+                f"Path: {checkpoint_path}"
+            )
+
+        missing_keys, unexpected_keys = self.load_state_dict(cleaned_state, strict=False)
+
+        loaded_count: int = len(cleaned_state)
+        if loaded_count == 0 or loaded_count < max(1, int(0.1 * len(current_keys))):
+            raise TITANEncoderError(
+                "Loaded too few parameters from checkpoint; refusing partial load. "
+                f"loaded={loaded_count}, total={len(current_keys)}, "
+                f"missing={len(missing_keys)}, unexpected={len(unexpected_keys)}"
+            )
+
+    def save(self, path: str) -> None:
+        """Save encoder weights and minimal config snapshot."""
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("path must be a non-empty string.")
+
+        output_path: Path = Path(path).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload: Dict[str, Any] = {
+            "model_state_dict": self.state_dict(),
+            "model_config": {
+                "embed_dim": self.embed_dim,
+                "num_layers": self.num_layers,
+                "num_heads": self.num_heads,
+                "head_dim": self.head_dim,
+                "mlp_dim": self.mlp_dim,
+                "use_alibi_2d": self.use_alibi_2d,
+                "max_tokens_train": self.max_tokens_train,
+                "patch_size_px": self.patch_size_px,
+                "magnification": self.magnification,
+                "feature_dim": self.feature_dim,
+                "stage1_region_grid": list(_STAGE1_REGION_GRID),
+                "stage3_crop_grid": list(_STAGE3_CROP_GRID),
+            },
+        }
+
+        torch.save(payload, output_path)
+
+    def _validate_architecture(self) -> None:
+        if self.embed_dim != _EMBED_DIM:
+            raise TITANEncoderConfigError(
+                f"embed_dim must be {_EMBED_DIM}, got {self.embed_dim}."
+            )
+        if self.num_layers != _NUM_LAYERS:
+            raise TITANEncoderConfigError(
+                f"num_layers must be {_NUM_LAYERS}, got {self.num_layers}."
+            )
+        if self.num_heads != _NUM_HEADS:
+            raise TITANEncoderConfigError(
+                f"num_heads must be {_NUM_HEADS}, got {self.num_heads}."
+            )
+        if self.head_dim != _HEAD_DIM:
+            raise TITANEncoderConfigError(
+                f"head_dim must be {_HEAD_DIM}, got {self.head_dim}."
+            )
+        if self.mlp_dim != _MLP_DIM:
+            raise TITANEncoderConfigError(
+                f"mlp_dim must be {_MLP_DIM}, got {self.mlp_dim}."
+            )
+        if self.num_heads * self.head_dim != self.embed_dim:
+            raise TITANEncoderConfigError(
+                "Invalid attention dimensions: num_heads * head_dim must equal embed_dim."
+            )
+
+    def _prepare_inputs(
+        self,
+        grid_tokens: torch.Tensor,
+        pos_xy: torch.Tensor,
+        attn_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, _InputLayout]:
+        if not isinstance(grid_tokens, torch.Tensor):
+            raise TITANEncoderError(
+                f"grid_tokens must be torch.Tensor, got {type(grid_tokens).__name__}."
+            )
+        if not isinstance(pos_xy, torch.Tensor):
+            raise TITANEncoderError(f"pos_xy must be torch.Tensor, got {type(pos_xy).__name__}.")
+        if not isinstance(attn_mask, torch.Tensor):
+            raise TITANEncoderError(
+                f"attn_mask must be torch.Tensor, got {type(attn_mask).__name__}."
+            )
+
+        tokens: torch.Tensor
+        coords: torch.Tensor
+        mask: torch.Tensor
+
+        had_batch_dim: bool
+        had_spatial_dim: bool
+
+        if grid_tokens.ndim == 4:
+            had_batch_dim = True
+            had_spatial_dim = True
+            batch_size, h_tokens, w_tokens, feat_dim = grid_tokens.shape
+            if int(feat_dim) != self.embed_dim:
+                raise TITANEncoderError(
+                    f"grid_tokens last dim must be {self.embed_dim}, got {feat_dim}."
+                )
+            tokens = grid_tokens.reshape(batch_size, h_tokens * w_tokens, feat_dim)
+
+            if pos_xy.ndim != 4 or tuple(pos_xy.shape[:3]) != (batch_size, h_tokens, w_tokens) or int(pos_xy.shape[3]) != 2:
+                raise TITANEncoderError(
+                    "For 4D tokens, pos_xy must have shape [B,H,W,2]. "
+                    f"Got tokens={tuple(grid_tokens.shape)}, pos_xy={tuple(pos_xy.shape)}."
+                )
+            coords = pos_xy.reshape(batch_size, h_tokens * w_tokens, 2)
+
+            if attn_mask.ndim != 3 or tuple(attn_mask.shape) != (batch_size, h_tokens, w_tokens):
+                raise TITANEncoderError(
+                    "For 4D tokens, attn_mask must have shape [B,H,W]. "
+                    f"Got {tuple(attn_mask.shape)}."
+                )
+            mask = attn_mask.reshape(batch_size, h_tokens * w_tokens)
+
+        elif grid_tokens.ndim == 3:
+            if int(grid_tokens.shape[-1]) == self.embed_dim:
+                # [B,T,D]
+                had_batch_dim = True
+                had_spatial_dim = False
+                batch_size, num_tokens, feat_dim = grid_tokens.shape
+                tokens = grid_tokens
+                if pos_xy.ndim != 3 or tuple(pos_xy.shape) != (batch_size, num_tokens, 2):
+                    raise TITANEncoderError(
+                        "For [B,T,D] tokens, pos_xy must be [B,T,2]. "
+                        f"Got tokens={tuple(grid_tokens.shape)}, pos_xy={tuple(pos_xy.shape)}."
+                    )
+                coords = pos_xy
+                if attn_mask.ndim != 2 or tuple(attn_mask.shape) != (batch_size, num_tokens):
+                    raise TITANEncoderError(
+                        "For [B,T,D] tokens, attn_mask must be [B,T]. "
+                        f"Got {tuple(attn_mask.shape)}."
+                    )
+                mask = attn_mask
+            else:
+                # [H,W,D]
+                had_batch_dim = False
+                had_spatial_dim = True
+                h_tokens, w_tokens, feat_dim = grid_tokens.shape
+                if int(feat_dim) != self.embed_dim:
+                    raise TITANEncoderError(
+                        f"grid_tokens last dim must be {self.embed_dim}, got {feat_dim}."
+                    )
+                tokens = grid_tokens.reshape(1, h_tokens * w_tokens, feat_dim)
+
+                if pos_xy.ndim != 3 or tuple(pos_xy.shape[:2]) != (h_tokens, w_tokens) or int(pos_xy.shape[2]) != 2:
+                    raise TITANEncoderError(
+                        "For [H,W,D] tokens, pos_xy must be [H,W,2]. "
+                        f"Got tokens={tuple(grid_tokens.shape)}, pos_xy={tuple(pos_xy.shape)}."
+                    )
+                coords = pos_xy.reshape(1, h_tokens * w_tokens, 2)
+
+                if attn_mask.ndim != 2 or tuple(attn_mask.shape) != (h_tokens, w_tokens):
+                    raise TITANEncoderError(
+                        "For [H,W,D] tokens, attn_mask must be [H,W]. "
+                        f"Got {tuple(attn_mask.shape)}."
+                    )
+                mask = attn_mask.reshape(1, h_tokens * w_tokens)
+
+        elif grid_tokens.ndim == 2:
+            had_batch_dim = False
+            had_spatial_dim = False
+            num_tokens, feat_dim = grid_tokens.shape
+            if int(feat_dim) != self.embed_dim:
+                raise TITANEncoderError(
+                    f"grid_tokens last dim must be {self.embed_dim}, got {feat_dim}."
+                )
+            tokens = grid_tokens.unsqueeze(0)
+
+            if pos_xy.ndim != 2 or tuple(pos_xy.shape) != (num_tokens, 2):
+                raise TITANEncoderError(
+                    "For [T,D] tokens, pos_xy must be [T,2]. "
+                    f"Got tokens={tuple(grid_tokens.shape)}, pos_xy={tuple(pos_xy.shape)}."
+                )
+            coords = pos_xy.unsqueeze(0)
+
+            if attn_mask.ndim != 1 or int(attn_mask.shape[0]) != num_tokens:
+                raise TITANEncoderError(
+                    "For [T,D] tokens, attn_mask must be [T]. "
+                    f"Got {tuple(attn_mask.shape)}."
+                )
+            mask = attn_mask.unsqueeze(0)
+
+        else:
+            raise TITANEncoderError(
+                "grid_tokens must have rank 2, 3, or 4. "
+                f"Got rank={grid_tokens.ndim} shape={tuple(grid_tokens.shape)}."
+            )
+
+        tokens = tokens.to(dtype=torch.float32)
+        coords = coords.to(dtype=torch.float32)
+        mask = mask.to(dtype=torch.bool)
+
+        if int(tokens.shape[0]) <= 0 or int(tokens.shape[1]) <= 0:
+            raise TITANEncoderError(f"Invalid token shape after normalization: {tuple(tokens.shape)}.")
+
+        return tokens, coords, mask, _InputLayout(had_batch_dim=had_batch_dim, had_spatial_dim=had_spatial_dim)
+
+    @staticmethod
+    def _extract_state_dict(payload: Any) -> Optional[Mapping[str, Any]]:
+        if isinstance(payload, Mapping):
+            if "model_state_dict" in payload and isinstance(payload["model_state_dict"], Mapping):
+                return payload["model_state_dict"]
+            if "state_dict" in payload and isinstance(payload["state_dict"], Mapping):
+                return payload["state_dict"]
+            # If mapping already looks like raw state dict.
+            if len(payload) > 0 and all(isinstance(k, str) for k in payload.keys()):
+                first_value: Any = next(iter(payload.values()))
+                if torch.is_tensor(first_value) or isinstance(first_value, Mapping):
+                    return payload
+        return None
+
+    @staticmethod
+    def _strip_prefix(key: str, prefix: str) -> str:
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+        return key
+
+
+def _build_default_alibi_slopes(num_heads: int) -> torch.Tensor:
+    """Build deterministic ALiBi slopes.
+
+    Follows the standard ALiBi slope recipe with support for non power-of-two
+    head counts.
+    """
+    if num_heads <= 0:
+        raise ValueError("num_heads must be > 0.")
+
+    def _power_of_two_slopes(n: int) -> torch.Tensor:
+        start: float = 2.0 ** (-(2.0 ** -(float(torch.log2(torch.tensor(float(n))).item()) - 3.0)))
+        ratio: float = start
+        values = [start * (ratio ** i) for i in range(n)]
+        return torch.tensor(values, dtype=torch.float32)
+
+    if float(num_heads).is_integer() and (num_heads & (num_heads - 1) == 0):
+        return _power_of_two_slopes(num_heads)
+
+    closest_power_of_two: int = 1
+    while closest_power_of_two * 2 <= num_heads:
+        closest_power_of_two *= 2
+
+    slopes_primary: torch.Tensor = _power_of_two_slopes(closest_power_of_two)
+    slopes_secondary: torch.Tensor = _power_of_two_slopes(2 * closest_power_of_two)
+    slopes_secondary = slopes_secondary[0::2][: num_heads - closest_power_of_two]
+    slopes: torch.Tensor = torch.cat([slopes_primary, slopes_secondary], dim=0)
+
+    if int(slopes.shape[0]) != num_heads:
+        raise RuntimeError(
+            f"Failed to construct ALiBi slopes for {num_heads} heads; got {int(slopes.shape[0])}."
+        )
+
+    return slopes
+
+
+__all__ = [
+    "TITANEncoderError",
+    "TITANEncoderConfigError",
+    "TITANEncoder",
+]
+```

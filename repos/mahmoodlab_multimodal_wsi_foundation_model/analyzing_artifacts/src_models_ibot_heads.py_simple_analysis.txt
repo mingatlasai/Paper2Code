@@ -1,0 +1,6 @@
+Added the logic analysis to [src/models/ibot_heads.py](/Users/mingatlas/Projects/Paper2Code/src/models/ibot_heads.py).
+
+It is now aligned with:
+- your stage-1-only scope (`iBOT` student/teacher heads),
+- the fixed design interface (`IBOTHead.__init__`, `IBOTHead.forward` only),
+- and `config.yaml` constraints (768-d features, 14x14/6x6 views, batch/epoch settings, unresolved supplementary hyperparameters kept unspecified).

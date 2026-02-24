@@ -1,0 +1,241 @@
+## configs/default.yaml
+# Canonical experiment config for TITAN reproduction.
+# Source-of-truth values are taken from the provided config.yaml.
+
+version: 1
+
+mode: "prepare_data"  # one of: prepare_data, train_stage1, train_stage2, train_stage3, eval
+stage: "stage1_titan_v"  # one of: stage1_titan_v, stage2_roi_caption_alignment, stage3_wsi_report_alignment
+
+runtime:
+  seed: 42
+  deterministic: true
+  benchmark: false
+  num_workers: 8
+  pin_memory: true
+  python_version: "3.9.16"
+  pytorch_version: "2.0.1"
+  cuda_version: "11.8"
+  device: "cuda"
+  distributed:
+    enabled: false
+    backend: "nccl"
+    init_method: "env://"
+
+hardware:
+  stage1:
+    gpus: 4
+    gpu_type: "NVIDIA A100 80GB"
+  stage2:
+    gpus: 8
+    gpu_type: "NVIDIA A100 80GB"
+  stage3:
+    gpus: 8
+    gpu_type: "NVIDIA A100 80GB"
+  downstream_eval:
+    gpus: 1
+    gpu_type: "NVIDIA 3090 24GB"
+
+paths:
+  project_root: "."
+  data_root: "./data"
+  output_root: "./outputs"
+  logs_root: "./outputs/logs"
+  checkpoints_root: "./outputs/checkpoints"
+  artifacts_root: "./outputs/artifacts"
+
+artifacts:
+  features_h5_name: "features.h5"
+  feature_grid_name: "grid.pt"
+  pairs_jsonl_name: "pairs.jsonl"
+  splits_csv_name: "splits.csv"
+  tissue_groups_name: "groups.json"
+  stage1_checkpoint_name: "titan_v.ckpt"
+  stage2_checkpoint_name: "titan_stage2.ckpt"
+  stage3_checkpoint_name: "titan_final.ckpt"
+
+init_checkpoints:
+  stage1_from: null
+  stage2_from: null
+  stage3_from: null
+  eval_from: null
+
+data:
+  wsi_patch_size_px: 512
+  magnification: "20x"
+  patch_feature_dim: 768
+  roi_region_size_px: 8192
+  roi_region_grid_size: [16, 16]
+  stage3_wsi_crop_grid_size: [64, 64]
+  stage3_wsi_crop_size_px: 32768
+
+  min_tissue_ratio: 0.5
+  segmentation:
+    hsv_saturation_threshold: 8
+    median_blur_ksize: 7
+    morph_close_ksize: 7
+    min_contour_area: 256
+  tissue_grouping:
+    method: "dbscan"
+    min_patches: 16
+    eps: null
+    min_samples: null
+
+  manifests:
+    wsi_manifest_csv: "./data/metadata/wsi_manifest.csv"
+    roi_caption_pairs_jsonl: "./data/metadata/roi_caption_pairs.jsonl"
+    wsi_report_pairs_jsonl: "./data/metadata/wsi_report_pairs.jsonl"
+    splits_csv: "./data/metadata/splits.csv"
+
+model:
+  slide_encoder:
+    architecture: "ViT in feature space"
+    num_layers: 6
+    num_attention_heads: 12
+    head_dim: 64
+    embedding_dim: 768
+    mlp_hidden_dim: 3072
+    positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+    use_alibi_2d: true
+    alibi_slopes: null  # unresolved from paper text/supplement
+    dropout: 0.0
+    attention_dropout: 0.0
+
+  multimodal:
+    framework: "CoCa"
+    reconstruction_queries: 128
+    text_encoder_source: "CONCHv1.5 pretrained text encoder"
+    text_decoder_source: "CONCHv1.5 pretrained multimodal decoder"
+    text_encoder_layers: 12
+    text_decoder_layers: 12
+    text_embedding_dim: 768
+    text_hidden_dim: 3072
+
+training:
+  precision:
+    use_amp: true
+    amp_dtype: "float16"
+  grad_clip_norm: null
+  log_every_n_steps: 20
+  save_every_n_steps: 1000
+  val_every_n_steps: null
+
+  stage1_titan_v:
+    objective: "iBOT (student-teacher distillation + masked image modeling) in feature space"
+    epochs: 270
+    iterations: 91260
+    local_batch_size_per_gpu: 256
+    gradient_accumulation_steps: 1
+    effective_batch_size: 1024
+    view_sampling:
+      global_views: 2
+      global_view_grid_size: [14, 14]
+      local_views: 10
+      local_view_grid_size: [6, 6]
+    augmentations:
+      - "horizontal_flip"
+      - "vertical_flip"
+      - "feature_posterization"
+    optimizer:
+      name: "adamw"
+      learning_rate: null
+      weight_decay: null
+      betas: null
+      scheduler: null
+      warmup: null
+    ibot:
+      student_temperature: null
+      teacher_temperature: null
+      center_momentum: null
+      mask_ratio: null
+      ema_momentum: null
+
+  stage2_roi_caption_alignment:
+    objective: "CoCa contrastive + generative alignment on ROI-caption pairs"
+    num_pairs: 423122
+    local_batch_size_per_gpu: 196
+    gradient_accumulation_steps: 2
+    effective_batch_size: 3136
+    optimizer:
+      name: "adamw"
+      learning_rate: null
+      weight_decay: null
+      betas: null
+      scheduler: null
+      warmup: null
+    losses:
+      contrastive_weight: null
+      caption_weight: null
+
+  stage3_wsi_report_alignment:
+    objective: "CoCa contrastive + generative alignment on WSI-report pairs"
+    num_pairs: 182862
+    local_batch_size_per_gpu: 16
+    gradient_accumulation_steps: 2
+    effective_batch_size: 256
+    notes:
+      - "Use smaller learning rate and weight decay for vision backbone"
+      - "Use slow warm-up for vision backbone"
+    optimizer:
+      name: "adamw"
+      learning_rate: null
+      weight_decay: null
+      betas: null
+      scheduler: null
+      warmup: null
+      vision_backbone_learning_rate: null
+      vision_backbone_weight_decay: null
+    losses:
+      contrastive_weight: null
+      caption_weight: null
+
+evaluation:
+  bootstrap_samples: 1000
+
+  linear_probe:
+    method: "scikit-learn logistic regression (L-BFGS)"
+    l2_grid:
+      count: 45
+      min: 1.0e-6
+      max: 10.0
+      spacing: "log"
+    max_iter: 500
+    few_shot_or_no_val_defaults:
+      l2: 1.0
+      max_iter: 1000
+
+  knn_probe:
+    k: 20
+    distance: "euclidean"
+    preprocess:
+      - "center"
+      - "l2_normalize"
+
+  few_shot:
+    shots: [1, 2, 4, 8, 16, 32]
+    runs: 50
+
+  retrieval:
+    slide_retrieval_k: [1, 3, 5]
+    cross_modal_recall_k: [1, 3, 5, 10]
+
+  report_generation:
+    decoding: "beam_search"
+    num_beams: 5
+    num_beam_groups: 1
+    max_new_tokens: 256
+
+  survival:
+    model: "linear Cox proportional hazards"
+    package: "scikit-survival"
+
+logging:
+  level: "INFO"
+  save_json: true
+  save_csv: true
+  save_tensorboard: false
+
+notes:
+  source_of_truth:
+    - "Hyperparameters not listed above are not provided in the supplied paper text and are intentionally set to null."
+    - "Supplementary tables are required to fill null optimizer/scheduler/loss settings."

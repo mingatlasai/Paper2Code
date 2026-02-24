@@ -1,0 +1,8 @@
+Implemented the requested logic analysis in [src/data/tissue_grouping.py](/Users/mingatlas/Projects/Paper2Code/src/data/tissue_grouping.py).
+
+It is aligned to:
+- paper methodology (spatial contour grouping + `<16` patch filtering),
+- the fixed design interface for `TissueGrouper`,
+- `config.yaml` constants (`patch_size=512`, stage-1 `16x16` region context),
+- reproducibility constraints (determinism, metadata provenance, idempotent artifact writing),
+- and explicit handling of under-specified paper details as config-driven unknowns.

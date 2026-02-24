@@ -1,0 +1,7 @@
+Implemented the requested logic analysis in [scripts/run_stage2.py](/Users/mingatlas/Projects/Paper2Code/scripts/run_stage2.py).
+
+It now contains an analysis-only orchestration spec for Stage 2 that is aligned to:
+- the paper methodology (ROI-caption CoCa alignment from TITAN-V init),
+- the provided `config.yaml` values only (including null optimizer fields),
+- your design interfaces (`Registry`, `Stage2Dataset`, `CoCaModel`, `Stage2Trainer`, `BaseTrainer`),
+- required invariants, checkpoint semantics (`--init` vs `--resume`), failure modes, and reproducibility artifacts.

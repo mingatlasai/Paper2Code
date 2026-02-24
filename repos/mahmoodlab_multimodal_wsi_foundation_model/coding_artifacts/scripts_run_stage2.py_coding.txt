@@ -1,0 +1,506 @@
+## Code: scripts/run_stage2.py
+```python
+"""Stage-2 orchestration script for TITAN multimodal ROI-caption pretraining.
+
+This script is intentionally thin and only handles:
+- configuration loading/overrides,
+- deterministic/distributed runtime setup,
+- registry-driven dataset/trainer construction,
+- required stage-1 initialization checkpoint loading,
+- optional stage-2 checkpoint resume,
+- stage-2 training dispatch.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import os
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+from src.core.config_schema import (
+    ConfigLoadError,
+    ConfigValidationError,
+    ExperimentConfig,
+)
+from src.core.registry import Registry
+from src.core.utils import (
+    cleanup_distributed,
+    init_distributed,
+    safe_symlink_or_copy,
+    seed_everything,
+    seed_worker,
+    validate_repro_constants,
+)
+from src.data.collate import build_collate_fn
+
+
+def _seed_worker_entry(worker_id: int) -> None:
+    """Top-level worker seed entry to keep DataLoader picklable."""
+    raw_seed: str = os.environ.get("TITAN_SEED", str(_DEFAULT_SEED))
+    seed_value: int = int(raw_seed)
+    seed_worker(worker_id=worker_id, base_seed=seed_value)
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml/task contract.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: tuple[int, int] = (64, 64)
+
+_STAGE2_NUM_PAIRS: int = 423_122
+_STAGE2_BATCH_SIZE_PER_GPU: int = 196
+_STAGE2_GRAD_ACCUM: int = 2
+_STAGE2_EFFECTIVE_BATCH_SIZE: int = 3_136
+
+_DEFAULT_CONFIG_PATH: str = "configs/default.yaml"
+_FALLBACK_STAGE2_CONFIG_PATH: str = "configs/train/stage2_coca.yaml"
+
+_DEFAULT_NUM_WORKERS: int = 8
+_DEFAULT_PIN_MEMORY: bool = True
+_DEFAULT_SEED: int = 42
+
+
+class RunStage2Error(RuntimeError):
+    """Base exception for stage-2 orchestration failures."""
+
+
+@dataclass(frozen=True)
+class Stage2CliArgs:
+    """CLI arguments for stage-2 execution."""
+
+    config: str
+    init: str
+    resume: Optional[str]
+    output_dir: Optional[str]
+    seed: Optional[int]
+    batch_size: Optional[int]
+    grad_accum_steps: Optional[int]
+    num_workers: Optional[int]
+    mixed_precision: Optional[bool]
+    disable_mixed_precision: bool
+
+
+def _parse_args() -> Stage2CliArgs:
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="Run TITAN stage-2 (ROI-caption CoCa alignment).",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=_DEFAULT_CONFIG_PATH,
+        help="Path to experiment config YAML.",
+    )
+    parser.add_argument(
+        "--init",
+        type=str,
+        required=True,
+        help="Required stage-1 checkpoint path (titan_v.ckpt lineage).",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Optional stage-2 checkpoint path to resume training.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Override output root directory for this run.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Override deterministic seed.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override local batch size per GPU.",
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Override gradient accumulation steps.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override dataloader worker count.",
+    )
+    parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="Force-enable mixed precision.",
+    )
+    parser.add_argument(
+        "--disable-mixed-precision",
+        action="store_true",
+        help="Force-disable mixed precision.",
+    )
+
+    namespace: argparse.Namespace = parser.parse_args()
+    return Stage2CliArgs(
+        config=str(namespace.config),
+        init=str(namespace.init),
+        resume=(str(namespace.resume) if namespace.resume else None),
+        output_dir=(str(namespace.output_dir) if namespace.output_dir else None),
+        seed=(int(namespace.seed) if namespace.seed is not None else None),
+        batch_size=(int(namespace.batch_size) if namespace.batch_size is not None else None),
+        grad_accum_steps=(
+            int(namespace.grad_accum_steps) if namespace.grad_accum_steps is not None else None
+        ),
+        num_workers=(int(namespace.num_workers) if namespace.num_workers is not None else None),
+        mixed_precision=(True if bool(namespace.mixed_precision) else None),
+        disable_mixed_precision=bool(namespace.disable_mixed_precision),
+    )
+
+
+def _resolve_config_path(requested_path: str) -> Path:
+    candidate: Path = Path(requested_path).expanduser().resolve()
+    if candidate.exists() and candidate.is_file():
+        return candidate
+
+    requested_name: str = str(requested_path).strip()
+    if requested_name == _DEFAULT_CONFIG_PATH:
+        fallback: Path = Path(_FALLBACK_STAGE2_CONFIG_PATH).expanduser().resolve()
+        if fallback.exists() and fallback.is_file():
+            return fallback
+
+    raise FileNotFoundError(
+        "Config file not found. "
+        f"requested='{requested_path}', fallback='{_FALLBACK_STAGE2_CONFIG_PATH}'."
+    )
+
+
+def _load_and_override_config(args: Stage2CliArgs) -> ExperimentConfig:
+    resolved_cfg_path: Path = _resolve_config_path(args.config)
+
+    try:
+        cfg: ExperimentConfig = ExperimentConfig.from_yaml(str(resolved_cfg_path))
+    except (ConfigLoadError, ConfigValidationError) as exc:
+        raise RunStage2Error(f"Failed loading config from '{resolved_cfg_path}': {exc}") from exc
+
+    # Enforce stage/mode for this runner.
+    cfg.mode = "train_stage2"
+    cfg.stage = "stage2_roi_caption_alignment"
+
+    # CLI overrides.
+    if args.seed is not None:
+        cfg.runtime.seed = int(args.seed)
+    if args.num_workers is not None:
+        cfg.runtime.num_workers = int(args.num_workers)
+
+    if args.output_dir is not None:
+        cfg.paths.output_root = str(Path(args.output_dir).expanduser().resolve())
+
+    stage_cfg = cfg.training.stage2_roi_caption_alignment
+    if args.batch_size is not None:
+        stage_cfg.batch_size = int(args.batch_size)
+    if args.grad_accum_steps is not None:
+        stage_cfg.grad_accum_steps = int(args.grad_accum_steps)
+
+    if args.disable_mixed_precision:
+        stage_cfg.mixed_precision = False
+    elif args.mixed_precision is not None:
+        stage_cfg.mixed_precision = bool(args.mixed_precision)
+
+    # Recompute effective batch from configured stage2 hardware.
+    stage_cfg.effective_batch_size = (
+        int(stage_cfg.batch_size)
+        * int(cfg.hardware.stage2.gpus)
+        * int(stage_cfg.grad_accum_steps)
+    )
+
+    # Validate full config and paper constants after overrides.
+    try:
+        cfg.validate()
+    except ConfigValidationError as exc:
+        raise RunStage2Error(f"Configuration validation failed: {exc}") from exc
+
+    validate_repro_constants(cfg)
+    _validate_stage2_invariants(cfg)
+
+    return cfg
+
+
+def _validate_stage2_invariants(cfg: ExperimentConfig) -> None:
+    data_cfg = cfg.data
+    model_cfg = cfg.model.slide_encoder
+    multimodal_cfg = cfg.model.multimodal
+    stage_cfg = cfg.training.stage2_roi_caption_alignment
+
+    if int(data_cfg.patch_size) != _PATCH_SIZE_PX:
+        raise RunStage2Error(f"patch_size must be {_PATCH_SIZE_PX}, got {data_cfg.patch_size}.")
+    if str(data_cfg.magnification) != _MAGNIFICATION:
+        raise RunStage2Error(
+            f"magnification must be '{_MAGNIFICATION}', got '{data_cfg.magnification}'."
+        )
+    if int(data_cfg.feature_dim) != _FEATURE_DIM:
+        raise RunStage2Error(f"feature_dim must be {_FEATURE_DIM}, got {data_cfg.feature_dim}.")
+
+    if tuple(data_cfg.roi_region_grid_size) != _STAGE1_REGION_GRID:
+        raise RunStage2Error(
+            "roi_region_grid_size mismatch: "
+            f"expected {_STAGE1_REGION_GRID}, got {tuple(data_cfg.roi_region_grid_size)}"
+        )
+    if tuple(data_cfg.stage3_wsi_crop_grid_size) != _STAGE3_CROP_GRID:
+        raise RunStage2Error(
+            "stage3_wsi_crop_grid_size mismatch: "
+            f"expected {_STAGE3_CROP_GRID}, got {tuple(data_cfg.stage3_wsi_crop_grid_size)}"
+        )
+
+    if int(model_cfg.embedding_dim) != _FEATURE_DIM:
+        raise RunStage2Error(
+            "model embedding_dim must match feature_dim=768, "
+            f"got {model_cfg.embedding_dim}."
+        )
+    if int(model_cfg.num_attention_heads) * int(model_cfg.head_dim) != int(model_cfg.embedding_dim):
+        raise RunStage2Error("num_attention_heads * head_dim must equal embedding_dim.")
+
+    if int(multimodal_cfg.reconstruction_queries) != 128:
+        raise RunStage2Error(
+            "reconstruction_queries must be 128, "
+            f"got {multimodal_cfg.reconstruction_queries}."
+        )
+    if int(multimodal_cfg.text_embedding_dim) != int(model_cfg.embedding_dim):
+        raise RunStage2Error(
+            "multimodal text embedding dim must match vision embedding dim. "
+            f"text={multimodal_cfg.text_embedding_dim}, vision={model_cfg.embedding_dim}."
+        )
+    if int(multimodal_cfg.text_encoder_layers) != 12 or int(multimodal_cfg.text_decoder_layers) != 12:
+        raise RunStage2Error(
+            "text encoder/decoder layers must both be 12 for stage2.")
+
+    if int(stage_cfg.batch_size) != _STAGE2_BATCH_SIZE_PER_GPU:
+        raise RunStage2Error(
+            f"stage2 batch_size must be {_STAGE2_BATCH_SIZE_PER_GPU}, got {stage_cfg.batch_size}."
+        )
+    if int(stage_cfg.grad_accum_steps) != _STAGE2_GRAD_ACCUM:
+        raise RunStage2Error(
+            f"stage2 grad_accum_steps must be {_STAGE2_GRAD_ACCUM}, got {stage_cfg.grad_accum_steps}."
+        )
+    if int(stage_cfg.effective_batch_size) != _STAGE2_EFFECTIVE_BATCH_SIZE:
+        raise RunStage2Error(
+            "stage2 effective_batch_size must be "
+            f"{_STAGE2_EFFECTIVE_BATCH_SIZE}, got {stage_cfg.effective_batch_size}."
+        )
+
+    if int(stage_cfg.num_pairs) != _STAGE2_NUM_PAIRS:
+        raise RunStage2Error(
+            f"stage2 num_pairs must be {_STAGE2_NUM_PAIRS}, got {stage_cfg.num_pairs}."
+        )
+
+
+def _validate_stage1_init_checkpoint(path: Path, cfg: ExperimentConfig) -> None:
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Stage-1 init checkpoint not found: {path}")
+
+    try:
+        payload: Any = torch.load(path, map_location="cpu")
+    except Exception as exc:  # noqa: BLE001
+        raise RunStage2Error(f"Failed reading init checkpoint '{path}': {exc}") from exc
+
+    if not isinstance(payload, Mapping):
+        raise RunStage2Error(
+            "Init checkpoint payload must be a mapping with model weights. "
+            f"Got type={type(payload).__name__}."
+        )
+
+    has_state_dict: bool = (
+        "model_state_dict" in payload
+        or "state_dict" in payload
+        or any(isinstance(key, str) and key.endswith("weight") for key in payload.keys())
+    )
+    if not has_state_dict:
+        raise RunStage2Error(
+            "Init checkpoint does not contain recognizable state_dict fields."
+        )
+
+    # Optional strict architecture check when model_config is present.
+    model_config_obj: Any = payload.get("model_config")
+    if isinstance(model_config_obj, Mapping):
+        embed_dim_value: int = int(model_config_obj.get("embed_dim", model_config_obj.get("embedding_dim", 768)))
+        num_layers_value: int = int(model_config_obj.get("num_layers", 6))
+        num_heads_value: int = int(model_config_obj.get("num_heads", model_config_obj.get("num_attention_heads", 12)))
+        head_dim_value: int = int(model_config_obj.get("head_dim", 64))
+        mlp_dim_value: int = int(model_config_obj.get("mlp_dim", model_config_obj.get("mlp_hidden_dim", 3072)))
+
+        if embed_dim_value != int(cfg.model.slide_encoder.embedding_dim):
+            raise RunStage2Error(
+                "Init checkpoint embed dim mismatch. "
+                f"checkpoint={embed_dim_value}, config={cfg.model.slide_encoder.embedding_dim}."
+            )
+        if num_layers_value != int(cfg.model.slide_encoder.num_layers):
+            raise RunStage2Error(
+                "Init checkpoint num_layers mismatch. "
+                f"checkpoint={num_layers_value}, config={cfg.model.slide_encoder.num_layers}."
+            )
+        if num_heads_value != int(cfg.model.slide_encoder.num_attention_heads):
+            raise RunStage2Error(
+                "Init checkpoint num_attention_heads mismatch. "
+                f"checkpoint={num_heads_value}, config={cfg.model.slide_encoder.num_attention_heads}."
+            )
+        if head_dim_value != int(cfg.model.slide_encoder.head_dim):
+            raise RunStage2Error(
+                "Init checkpoint head_dim mismatch. "
+                f"checkpoint={head_dim_value}, config={cfg.model.slide_encoder.head_dim}."
+            )
+        if mlp_dim_value != int(cfg.model.slide_encoder.mlp_hidden_dim):
+            raise RunStage2Error(
+                "Init checkpoint mlp_hidden_dim mismatch. "
+                f"checkpoint={mlp_dim_value}, config={cfg.model.slide_encoder.mlp_hidden_dim}."
+            )
+
+
+def _build_train_loader(cfg: ExperimentConfig, registry: Registry, rank: int, world_size: int) -> DataLoader:
+    dataset = registry.create_dataset("stage2_dataset", cfg.data)
+    collate_fn = build_collate_fn(mode="train_stage2")
+
+    distributed: bool = bool(world_size > 1)
+    sampler: Optional[DistributedSampler] = None
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            drop_last=False,
+        )
+
+    num_workers: int = int(cfg.runtime.num_workers)
+    if num_workers < 0:
+        num_workers = _DEFAULT_NUM_WORKERS
+
+    pin_memory: bool = bool(getattr(cfg.runtime, "pin_memory", _DEFAULT_PIN_MEMORY))
+
+    generator: torch.Generator = torch.Generator()
+    generator.manual_seed(int(cfg.runtime.seed))
+
+    loader: DataLoader = DataLoader(
+        dataset=dataset,
+        batch_size=int(cfg.training.stage2_roi_caption_alignment.batch_size),
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=bool(num_workers > 0),
+        drop_last=False,
+        collate_fn=collate_fn,
+        worker_init_fn=_seed_worker_entry,
+        generator=generator,
+    )
+    return loader
+
+
+def _resolve_resume_path(resume: Optional[str]) -> Optional[Path]:
+    if resume is None:
+        return None
+    checkpoint_path: Path = Path(resume).expanduser().resolve()
+    if not checkpoint_path.exists() or not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
+def _initialize_stage2_from_stage1(trainer: Any, init_path: Path) -> None:
+    model_obj: Any = getattr(trainer, "model", None)
+    if model_obj is None:
+        raise RunStage2Error("Trainer does not expose a 'model' attribute.")
+
+    vision_obj: Any = getattr(model_obj, "vision", None)
+    if vision_obj is None:
+        raise RunStage2Error("Stage2 trainer model does not expose 'vision' encoder.")
+
+    load_pretrained_fn: Any = getattr(vision_obj, "load_pretrained", None)
+    if not callable(load_pretrained_fn):
+        raise RunStage2Error("Vision encoder does not implement load_pretrained(path).")
+
+    load_pretrained_fn(str(init_path))
+
+
+def run_stage2(args: Stage2CliArgs) -> int:
+    cfg: ExperimentConfig = _load_and_override_config(args)
+
+    # BaseTrainer reads these through environment fallbacks for TrainConfig extras.
+    os.environ["TITAN_OUTPUT_ROOT"] = str(Path(cfg.paths.output_root).expanduser().resolve())
+    os.environ["TITAN_SEED"] = str(int(cfg.runtime.seed))
+
+    seed_everything(seed=int(cfg.runtime.seed), deterministic=bool(cfg.runtime.deterministic))
+
+    distributed_enabled: bool = bool(cfg.runtime.distributed.enabled)
+    ddp_context = None
+
+    init_path: Path = Path(args.init).expanduser().resolve()
+    _validate_stage1_init_checkpoint(path=init_path, cfg=cfg)
+
+    try:
+        if distributed_enabled:
+            ddp_context = init_distributed(
+                backend=str(cfg.runtime.distributed.backend),
+                init_method=str(cfg.runtime.distributed.init_method),
+            )
+            rank: int = int(ddp_context.rank)
+            world_size: int = int(ddp_context.world_size)
+        else:
+            rank = 0
+            world_size = 1
+
+        registry: Registry = Registry(auto_register_defaults=True)
+
+        train_loader: DataLoader = _build_train_loader(
+            cfg=cfg,
+            registry=registry,
+            rank=rank,
+            world_size=world_size,
+        )
+
+        trainer = registry.create_trainer(
+            name="stage2_trainer",
+            cfg=cfg.training.stage2_roi_caption_alignment,
+        )
+
+        resume_path: Optional[Path] = _resolve_resume_path(args.resume)
+        if resume_path is not None:
+            trainer.load_checkpoint(str(resume_path))
+        else:
+            _initialize_stage2_from_stage1(trainer=trainer, init_path=init_path)
+
+        trainer.fit(train_loader=train_loader, val_loader=None)
+
+        # Ensure canonical artifact alias under configured output root.
+        final_ckpt: Path = trainer.run_dirs["checkpoints"] / cfg.artifacts.stage2_checkpoint_name
+        alias_ckpt: Path = Path(cfg.paths.output_root).expanduser().resolve() / cfg.artifacts.stage2_checkpoint_name
+        if final_ckpt.exists() and final_ckpt.is_file() and final_ckpt.resolve() != alias_ckpt.resolve():
+            safe_symlink_or_copy(src=str(final_ckpt), dst=str(alias_ckpt))
+
+        return 0
+    finally:
+        cleanup_distributed(ddp_context)
+
+
+def main() -> None:
+    args: Stage2CliArgs = _parse_args()
+    try:
+        exit_code: int = run_stage2(args)
+    except Exception as exc:  # noqa: BLE001
+        raise RunStage2Error(f"Stage-2 run failed: {exc}") from exc
+    raise SystemExit(exit_code)
+
+
+if __name__ == "__main__":
+    main()
+```

@@ -1,0 +1,184 @@
+analysis_meta:
+  target_file: "configs/eval/linear_probe.yaml"
+  purpose: "Logic analysis for linear probe evaluation pipeline (no code)"
+  paper_id: "2025_MahmoodLab_A multimodal whole-slide foundation model for pathology"
+  source_of_truth:
+    - "Provided paper excerpt"
+    - "Provided plan/design/task"
+    - "config.yaml"
+
+scope:
+  in_scope:
+    - "Linear probe evaluation of frozen slide embeddings"
+    - "Binary and multiclass classification settings"
+    - "Validation-aware hyperparameter selection and no-validation fallback"
+    - "Interface-level contracts across EmbeddingService, Evaluator, and linear_probe module"
+  out_of_scope:
+    - "Model training implementation"
+    - "Any metric or solver setting not explicitly present in config.yaml or provided design"
+
+config_binding:
+  runtime:
+    python_version: "3.9.16"
+    pytorch_version: "2.0.1"
+    cuda_version: "11.8"
+  hardware:
+    downstream_eval:
+      gpus: 1
+      gpu_type: "NVIDIA 3090 24GB"
+  data_contract:
+    patch_size_px: 512
+    magnification: "20x"
+    patch_feature_dim: 768
+  model_contract:
+    slide_embedding_dim: 768
+    slide_encoder_reference:
+      architecture: "ViT in feature space"
+      num_layers: 6
+      num_attention_heads: 12
+      head_dim: 64
+      embedding_dim: 768
+      mlp_hidden_dim: 3072
+      positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+  eval_contract:
+    method: "scikit-learn logistic regression (L-BFGS)"
+    l2_grid:
+      count: 45
+      min: 1.0e-6
+      max: 10
+      spacing: "log"
+    max_iter: 500
+    few_shot_or_no_val_defaults:
+      l2: 1
+      max_iter: 1000
+
+interface_binding:
+  required_design_interfaces:
+    - "EmbeddingService.embed_slides(slide_ids: list[str]) -> np.ndarray"
+    - "EmbeddingService.center_and_l2(x: np.ndarray, mean_vec: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]"
+    - "Evaluator.run_linear_probe(features: np.ndarray, y: np.ndarray, split: dict) -> dict"
+    - "MainApp.run_eval(eval_name: str)"
+  supporting_interfaces:
+    - "FeatureGrid.to(device: str) -> FeatureGrid"
+    - "TITANEncoder.encode_slide(grid: FeatureGrid) -> torch.Tensor"
+  constraints:
+    - "Do not introduce or call public methods outside the provided design"
+    - "Do not hardcode constants that should come from YAML config"
+    - "Use shared embedding normalization path through EmbeddingService for consistency"
+
+linear_probe_logic_analysis:
+  objective:
+    - "Measure transfer quality of frozen slide representations by fitting a linear classifier on top of slide embeddings."
+    - "Mirror paper protocol: logistic regression with L-BFGS and L2 regularization sweep over 45 log-spaced values from 1e-6 to 10."
+
+  input_requirements:
+    - "Input `features` is a 2D float array of shape [N, D] with D=768."
+    - "Input `y` is a 1D label array of length N for binary or multiclass tasks."
+    - "Input `split` provides train/val/test indices or masks and must be consistent with `splits.csv`."
+    - "Embeddings must be generated from the same frozen checkpoint used for the experiment condition (for example titan_v.ckpt or titan_final.ckpt)."
+
+  embedding_path_consistency:
+    - "All slide embeddings should be produced through EmbeddingService to avoid normalization drift across evaluations."
+    - "If centering/L2 normalization is applied for a task variant, apply fit-on-train then transform-on-val/test policy to prevent leakage."
+    - "No ad-hoc feature preprocessing in linear_probe.py outside shared evaluation policy."
+
+  hyperparameter_selection_logic:
+    with_validation_split:
+      - "Construct L2 candidate grid with 45 logarithmically spaced values between 1e-6 and 10."
+      - "For each L2 value, fit logistic regression on train split using L-BFGS with max_iter=500."
+      - "Score each candidate on validation split using task-appropriate target metric."
+      - "Select the single best L2 by validation performance and refit/evaluate according to pipeline policy."
+    without_validation_split:
+      - "Use fixed default L2=1 and max_iter=1000 exactly as specified for few-shot or no-validation settings."
+      - "Do not perform grid search when validation split is absent."
+
+  task_and_metric_mapping:
+    multiclass_classification:
+      primary_metrics:
+        - "balanced_accuracy"
+        - "weighted_f1"
+      notes:
+        - "These metrics match the paper-level multiclass reporting convention."
+    binary_classification:
+      primary_metrics:
+        - "balanced_accuracy"
+        - "auroc"
+      notes:
+        - "AUROC requires probability/score outputs from the fitted logistic model."
+    ordinal_multiclass_if_used_by_dataset:
+      primary_metrics:
+        - "balanced_accuracy"
+        - "quadratic_weighted_kappa"
+      notes:
+        - "Included for consistency with shared evaluation conventions in the project design."
+
+  split_protocol_alignment:
+    - "For datasets with predefined train/val/test splits, run a single evaluation pass using that split."
+    - "For five-fold datasets, run fold-wise training/evaluation and aggregate mean and standard deviation across folds."
+    - "For external-cohort transfer tasks, train on source-cohort training split and evaluate on target external cohort as defined by dataset protocol."
+
+  output_contract:
+    required_fields:
+      - "task_name"
+      - "encoder_checkpoint"
+      - "l2_selected"
+      - "train_size"
+      - "val_size"
+      - "test_size"
+      - "metrics"
+      - "per_class_metrics_optional"
+    artifact_targets:
+      - "metrics JSON/CSV via unified logging utilities"
+      - "fold-level records when cross-validation is active"
+
+numerical_invariants:
+  - "feature_dim == 768"
+  - "l2_grid_count == 45"
+  - "l2_grid_min == 1e-6"
+  - "l2_grid_max == 10"
+  - "default_no_val_l2 == 1"
+  - "default_no_val_max_iter == 1000"
+  - "search_max_iter == 500"
+
+failure_modes_to_prevent:
+  - "Data leakage from using validation/test data in embedding centering statistics"
+  - "Mismatch between split definitions and feature/label indexing"
+  - "Inconsistent label encoding between train and evaluation subsets"
+  - "Using wrong solver or silently falling back to non-L-BFGS settings"
+  - "Running L2 search in no-validation regime where defaults are required"
+  - "Metric misuse (for example AUROC attempted on invalid label format)"
+
+paper_method_fidelity_checks:
+  - "Linear probe uses logistic regression with L-BFGS."
+  - "Regularization search uses 45 log-spaced values from 1e-6 to 10 when validation exists."
+  - "No-validation/few-shot settings use fixed L2=1 and max_iter=1000."
+  - "Evaluation outputs balanced accuracy and weighted F1 for multiclass, balanced accuracy and AUROC for binary."
+
+dependency_binding:
+  required_packages_from_task:
+    - "numpy==1.24.4"
+    - "scikit-learn==1.2.2"
+    - "scipy==1.10.1"
+    - "pandas==2.0.3"
+    - "statsmodels==0.14.1"
+  rationale:
+    - "scikit-learn provides logistic regression (L-BFGS) and core classification metrics."
+    - "numpy/scipy support numerical grid construction and array operations."
+    - "pandas supports split/metadata alignment and result tabulation."
+    - "statsmodels is used at project level for statistical comparisons, not core fitting."
+
+unresolved_paper_details:
+  status: "intentionally unresolved unless explicitly provided in config.yaml"
+  items:
+    - "Dataset-specific decision thresholding beyond standard logistic defaults"
+    - "Any supplementary-only tie-breaking rules for selecting best L2 when scores are identical"
+  policy:
+    - "Keep behavior deterministic and config-driven"
+    - "Do not invent unprovided rules"
+
+validation_checklist:
+  - "Evaluator.run_linear_probe consumes features/labels/splits with matching sample counts"
+  - "L2 grid exactly matches 45 log-spaced points in [1e-6, 10]"
+  - "No-validation path uses L2=1, max_iter=1000"
+  - "Reported metrics align with task type (multiclass vs binary)"
+  - "Results are logged in unified artifact format for downstream statistics"

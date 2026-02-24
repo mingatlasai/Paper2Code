@@ -1,0 +1,14 @@
+Implemented. I created [main.py](/Users/mingatlas/Projects/Paper2Code/main.py) as a dedicated logic-analysis document (no implementation code), aligned to:
+
+- the paper methodology,
+- your plan/design constraints,
+- the fixed interfaces in “Data structures and interfaces,”
+- and all explicit non-null settings from `config.yaml`.
+
+It now includes:
+- CLI mode contract and dispatch logic (`prepare_data`, `train_stage1`, `train_stage2`, `train_stage3`, `eval`)
+- strict config-binding rules (including stage/view/grid/model/eval constants)
+- registry-based construction flow
+- per-mode artifact dependencies and outputs
+- fail-fast validation and reproducibility controls
+- explicit handling of unknown supplementary hyperparameters (no fabricated defaults).

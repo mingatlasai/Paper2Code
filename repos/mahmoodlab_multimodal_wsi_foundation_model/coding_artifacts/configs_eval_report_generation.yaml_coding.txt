@@ -1,0 +1,124 @@
+## Code: configs/eval/report_generation.yaml
+```yaml
+# configs/eval/report_generation.yaml
+# Report-generation evaluation configuration for TITAN multimodal model.
+# Values are bound to the provided config.yaml and project design.
+
+eval:
+  name: report_generation
+  enabled: true
+  task_type: generation
+
+  runtime:
+    python_version: "3.9.16"
+    pytorch_version: "2.0.1"
+    cuda_version: "11.8"
+    deterministic: true
+
+  hardware:
+    gpus: 1
+    gpu_type: "NVIDIA 3090 24GB"
+    num_workers: 4
+    pin_memory: true
+
+  data:
+    patch_size_px: 512
+    magnification: "20x"
+    patch_feature_dim: 768
+
+    # Stage-3 crop settings used by multimodal WSI-report alignment.
+    stage3_wsi_crop_grid_size: [64, 64]
+    stage3_wsi_crop_size_px: 32768
+
+    # Shared artifact contract used across this project.
+    artifacts:
+      features_filename: "features.h5"
+      grid_filename: "grid.pt"
+      pairs_filename: "pairs.jsonl"
+      splits_filename: "splits.csv"
+
+    # Evaluate report generation on a fixed held-out split.
+    split_policy:
+      eval_split: "test"
+      use_validation_split: false
+      use_training_split: false
+
+  model:
+    encoder_checkpoint: "titan_final.ckpt"
+    freeze_backbone: true
+
+    slide_encoder:
+      architecture: "ViT in feature space"
+      num_layers: 6
+      num_attention_heads: 12
+      head_dim: 64
+      embedding_dim: 768
+      mlp_hidden_dim: 3072
+      positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+
+    multimodal:
+      framework: "CoCa"
+      reconstruction_queries: 128
+      text_encoder_source: "CONCHv1.5 pretrained text encoder"
+      text_decoder_source: "CONCHv1.5 pretrained multimodal decoder"
+      text_encoder_layers: 12
+      text_decoder_layers: 12
+      text_embedding_dim: 768
+      text_hidden_dim: 3072
+
+  protocol:
+    method: "zero_shot_report_generation"
+
+    decoding:
+      strategy: "beam_search"
+      num_beams: 5
+      num_beam_groups: 1
+
+      # Not provided in config.yaml; explicit reproducible defaults.
+      max_new_tokens: 256
+      min_new_tokens: 1
+      do_sample: false
+      temperature: 1.0
+      top_k: 0
+      top_p: 1.0
+      repetition_penalty: 1.0
+      length_penalty: 1.0
+      early_stopping: true
+
+  preprocessing:
+    normalize_whitespace: true
+    lowercase_text: false
+    strip_text: true
+
+    # Generation metrics compare text content, not embeddings.
+    center_embeddings: false
+    l2_normalize_embeddings: false
+
+  metrics:
+    generation:
+      - "meteor"
+      - "rouge1"
+      - "bleu1"
+
+    aggregate:
+      bootstrap_samples: 1000
+      report_mean_std: true
+      compute_per_sample_scores: true
+
+  io:
+    output_dir: "./outputs/eval/report_generation"
+    predictions_filename: "report_generation_predictions.csv"
+    per_sample_metrics_filename: "report_generation_per_sample_metrics.csv"
+    summary_filename: "report_generation_summary.csv"
+    metrics_filename: "report_generation_metrics.json"
+    write_json: true
+    write_csv: true
+
+  constraints:
+    require_embedding_dim_match: true
+    required_embedding_dim: 768
+    require_stage3_multimodal_checkpoint: true
+    require_frozen_model: true
+    require_slide_report_pair_alignment: true
+    require_deterministic_eval: true
+```

@@ -1,0 +1,9 @@
+Implemented the logic analysis in [src/eval/retrieval.py](/Users/mingatlas/Projects/Paper2Code/src/eval/retrieval.py).
+
+It now documents, in paper- and config-aligned detail:
+
+- Required interfaces (`Evaluator.run_slide_retrieval`, `Evaluator.run_cross_modal_retrieval`, `EmbeddingService` usage)
+- Unimodal retrieval protocol (database-centered + L2 normalization, Euclidean ranking, `Acc@1/3/5`, `MVAcc@5`)
+- Cross-modal retrieval protocol (normalized cosine ranking, both directions, `Recall@1/3/5/10`, mean recall)
+- Split/fold handling, reproducibility constraints, and deterministic tie-handling policy requirements
+- Failure modes and unresolved supplementary-details policy without inventing missing values

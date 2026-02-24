@@ -1,0 +1,6 @@
+Implemented the logic analysis in [src/eval/survival.py](/Users/mingatlas/Projects/Paper2Code/src/eval/survival.py).
+
+It is now aligned to:
+- the paper’s survival protocol (linear Cox PH, disease-specific survival, c-index),
+- the fixed design interface (`Evaluator.run_survival(...)` and shared `EmbeddingService` usage),
+- and `config.yaml` constraints only (no invented hyperparameters).

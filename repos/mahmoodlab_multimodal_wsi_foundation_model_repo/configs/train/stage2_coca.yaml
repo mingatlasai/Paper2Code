@@ -1,0 +1,149 @@
+# configs/train/stage2_coca.yaml
+# Stage-2 TITAN multimodal training configuration (CoCa ROI-caption alignment).
+# Values are bound to the provided config.yaml; unresolved paper-only details
+# remain explicit nulls and must be set by override when available.
+
+train:
+  stage: stage2
+  name: stage2_coca
+  objective: "CoCa contrastive + generative alignment on ROI-caption pairs"
+
+  runtime:
+    python_version: "3.9.16"
+    pytorch_version: "2.0.1"
+    cuda_version: "11.8"
+    distributed_backend: "nccl"
+    mixed_precision: true
+    deterministic: true
+
+  hardware:
+    gpus: 8
+    gpu_type: "NVIDIA A100 80GB"
+    local_batch_size_per_gpu: 196
+    gradient_accumulation_steps: 2
+    effective_batch_size: 3136
+    num_workers: 8
+    pin_memory: true
+    persistent_workers: true
+
+  data:
+    num_pairs: 423122
+
+    patch_size_px: 512
+    magnification: "20x"
+    patch_feature_dim: 768
+
+    # Stage-2 ROI geometry.
+    roi_region_size_px: 8192
+    roi_region_grid_size: [16, 16]
+
+    # Shared artifact contract.
+    artifacts:
+      features_filename: "features.h5"
+      grid_filename: "grid.pt"
+      pairs_filename: "pairs.jsonl"
+      splits_filename: "splits.csv"
+
+  model:
+    architecture: "coca_multimodal"
+    framework: "CoCa"
+    variant: "titan_stage2"
+
+    vision_backbone:
+      architecture: "titan_encoder"
+      init_from_checkpoint: "titan_v.ckpt"
+      strict_load: true
+
+      encoder:
+        embed_dim: 768
+        num_layers: 6
+        num_heads: 12
+        head_dim: 64
+        mlp_dim: 3072
+        use_alibi_2d: true
+        positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+        max_tokens_train: 256
+
+      alibi_2d:
+        enabled: true
+        distance_metric: "euclidean"
+        coordinate_normalization: "divide_by_patch_size"
+        patch_size_px: 512
+
+        # Not specified in provided config.yaml / excerpted methods.
+        slopes: null
+
+    poolers:
+      contrastive_queries: 1
+      reconstruction_queries: 128
+
+    text_encoder:
+      source: "CONCHv1.5 pretrained text encoder"
+      num_layers: 12
+      embed_dim: 768
+      hidden_dim: 3072
+      pretrained: true
+
+      # Not specified in provided config.yaml.
+      tokenizer_name: null
+      vocab_size: null
+      max_length: null
+
+    text_decoder:
+      source: "CONCHv1.5 pretrained multimodal decoder"
+      num_layers: 12
+      embed_dim: 768
+      hidden_dim: 3072
+      pretrained: true
+
+      # Not specified in provided config.yaml.
+      vocab_size: null
+      max_length: null
+
+  losses:
+    use_contrastive_loss: true
+    use_captioning_loss: true
+
+    # Exact weighting is supplementary-only and not in provided config.yaml.
+    contrastive_weight: null
+    captioning_weight: null
+
+  optimization:
+    clip_grad_norm: null
+
+    optimizer:
+      name: null
+      learning_rate: null
+      weight_decay: null
+      betas: null
+      eps: null
+
+    scheduler:
+      name: null
+      warmup: null
+      min_learning_rate: null
+
+  io:
+    output_dir: "./outputs/stage2"
+    checkpoint_dir: "./outputs/stage2/checkpoints"
+    checkpoint_name: "titan_stage2.ckpt"
+    save_every_n_epochs: 1
+    keep_last_k_checkpoints: 3
+
+    resume_from_checkpoint: null
+    strict_checkpoint_load: true
+
+  logging:
+    log_every_n_steps: 20
+    write_json: true
+    write_csv: true
+    write_tensorboard: false
+
+  reproducibility:
+    seed: 42
+
+  constraints:
+    require_stage2_effective_batch_consistency: true
+    require_heads_times_head_dim_equals_embed_dim: true
+    require_vision_text_embed_dim_match: true
+    require_roi_grid_matches_token_budget: true

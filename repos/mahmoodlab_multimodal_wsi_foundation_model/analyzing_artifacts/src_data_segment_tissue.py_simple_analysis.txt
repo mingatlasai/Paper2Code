@@ -1,0 +1,7 @@
+Updated the logic analysis in [src/data/segment_tissue.py](/Users/mingatlas/Projects/Paper2Code/src/data/segment_tissue.py).
+
+It now documents:
+- Exact design-bound `TissueSegmenter` interface
+- Paper-aligned segmentation flow (`HSV S-threshold -> median blur -> morphological closing -> contour area filtering`)
+- Config alignment constraints (without inventing missing hyperparameters)
+- Determinism, coordinate-space contracts, failure modes, and downstream integration requirements for tiling/grouping.

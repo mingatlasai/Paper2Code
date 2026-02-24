@@ -1,0 +1,955 @@
+Implemented `scripts/prepare_public_data.py` as a complete, executable pipeline script.
+
+## Code: scripts/prepare_public_data.py
+```python
+"""Public-data preparation pipeline for TITAN reproduction.
+
+This script implements an idempotent artifact pipeline:
+segmentation -> tiling -> patch feature extraction -> feature grid -> grouping
+-> split manifest (+ optional text pair cache).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import torch
+import yaml
+
+from src.core.utils import ensure_dir, seed_everything, write_csv, write_json
+from src.data.build_feature_grid import FeatureGrid, FeatureGridBuilder
+from src.data.caption_report_processing import PairCacheBuilder
+from src.data.extract_patch_features import PatchFeatureExtractor
+from src.data.segment_tissue import TissueSegmenter
+from src.data.tile_wsi import WSITiler
+from src.data.tissue_grouping import TissueGrouper
+from src.data.wsi_reader import WSIReader
+
+
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+_DEFAULT_SPLIT_TRAIN: float = 0.70
+_DEFAULT_SPLIT_VAL: float = 0.10
+_DEFAULT_SPLIT_TEST: float = 0.20
+
+
+class PrepareDataError(RuntimeError):
+    """Base exception for public-data preparation failures."""
+
+
+@dataclass(frozen=True)
+class PrepareConfig:
+    """Configuration contract used by the preparation pipeline."""
+
+    config_path: str = "configs/data/public_repro.yaml"
+    wsi_root: str = "./data/wsi"
+    meta_csv: str = "./data/metadata/public_metadata.csv"
+    output_root: str = "./data/processed"
+
+    patch_size_px: int = _PATCH_SIZE_PX
+    magnification: str = _MAGNIFICATION
+    feature_dim: int = _FEATURE_DIM
+    roi_region_grid_size: Tuple[int, int] = _STAGE1_REGION_GRID
+    stage3_wsi_crop_grid_size: Tuple[int, int] = _STAGE3_CROP_GRID
+
+    features_filename: str = "features.h5"
+    grid_filename: str = "grid.pt"
+    groups_filename: str = "groups.json"
+    splits_filename: str = "splits.csv"
+    pairs_filename: str = "pairs.jsonl"
+
+    tissue_group_min_patches: int = 16
+    min_tissue_ratio: float = 0.5
+    thumbnail_max_side: int = 2048
+
+    encoder_name: str = "conch"
+    encoder_ckpt_path: str = ""
+
+    seed: int = 42
+    force_rebuild: bool = False
+    validate_only: bool = False
+
+    pairs_manifest_path: Optional[str] = None
+    pairs_stage: str = "stage2"
+    build_pairs_cache: bool = False
+
+
+@dataclass
+class SlideRecord:
+    """Canonical row from metadata."""
+
+    slide_id: str
+    wsi_path: str
+    label: str = ""
+    site: str = ""
+    patient_id: str = ""
+    split: str = ""
+    fold: str = ""
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ProcessedRecord:
+    """Per-slide prepared artifact metadata."""
+
+    slide_id: str
+    wsi_path: str
+    status: str
+    reason: str
+    features_path: str = ""
+    grid_path: str = ""
+    num_patches: int = 0
+    label: str = ""
+    site: str = ""
+    patient_id: str = ""
+    split: str = ""
+    fold: str = ""
+
+
+@dataclass
+class PipelineSummary:
+    """Run summary counters and diagnostics."""
+
+    total_rows: int = 0
+    processed: int = 0
+    skipped_existing: int = 0
+    failed: int = 0
+    empty_tissue: int = 0
+    no_tiles: int = 0
+    invalid_wsi: int = 0
+    split_rows: int = 0
+    pair_rows: int = 0
+    failures: List[Dict[str, str]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_rows": int(self.total_rows),
+            "processed": int(self.processed),
+            "skipped_existing": int(self.skipped_existing),
+            "failed": int(self.failed),
+            "empty_tissue": int(self.empty_tissue),
+            "no_tiles": int(self.no_tiles),
+            "invalid_wsi": int(self.invalid_wsi),
+            "split_rows": int(self.split_rows),
+            "pair_rows": int(self.pair_rows),
+            "failures": list(self.failures),
+        }
+
+
+class PublicDataPreparer:
+    """End-to-end public-data preparation orchestrator."""
+
+    def __init__(self, cfg: PrepareConfig) -> None:
+        self.cfg: PrepareConfig = cfg
+        self._validate_config()
+
+        self.output_root: Path = ensure_dir(self.cfg.output_root)
+        self.slides_root: Path = ensure_dir(self.output_root / "slides")
+        self.reports_root: Path = ensure_dir(self.output_root / "reports")
+
+        self.reader: WSIReader = WSIReader(backend="openslide")
+        self.segmenter: TissueSegmenter = TissueSegmenter(
+            sat_thresh=8.0,
+            min_area=256,
+        )
+        self.tiler: WSITiler = WSITiler(
+            patch_size=self.cfg.patch_size_px,
+            stride=self.cfg.patch_size_px,
+        )
+        self.extractor: PatchFeatureExtractor = PatchFeatureExtractor(
+            encoder_name=self.cfg.encoder_name,
+            ckpt_path=self.cfg.encoder_ckpt_path,
+            out_dim=self.cfg.feature_dim,
+        )
+        self.grid_builder: FeatureGridBuilder = FeatureGridBuilder(
+            patch_size=self.cfg.patch_size_px,
+        )
+        self.grouper: TissueGrouper = TissueGrouper(
+            min_patches=self.cfg.tissue_group_min_patches,
+            method="dbscan",
+        )
+
+    def run(self) -> PipelineSummary:
+        """Run pipeline and write artifacts."""
+        seed_everything(seed=self.cfg.seed, deterministic=True)
+
+        metadata: List[SlideRecord] = self._load_metadata(self.cfg.meta_csv)
+        summary: PipelineSummary = PipelineSummary(total_rows=len(metadata))
+        processed_rows: List[ProcessedRecord] = []
+        all_groups: List[Dict[str, Any]] = []
+
+        for row in metadata:
+            record, groups = self._process_single_slide(row)
+            processed_rows.append(record)
+            if groups:
+                all_groups.extend(groups)
+
+            if record.status == "processed":
+                summary.processed += 1
+            elif record.status == "skipped_existing":
+                summary.skipped_existing += 1
+            elif record.reason == "empty_tissue":
+                summary.empty_tissue += 1
+            elif record.reason == "no_tiles":
+                summary.no_tiles += 1
+                summary.failed += 1
+            elif record.reason == "invalid_wsi":
+                summary.invalid_wsi += 1
+                summary.failed += 1
+            elif record.status == "failed":
+                summary.failed += 1
+
+            if record.status == "failed":
+                summary.failures.append(
+                    {"slide_id": record.slide_id, "reason": record.reason}
+                )
+
+        groups_path: Path = self.output_root / self.cfg.groups_filename
+        self.grouper.save_groups(str(groups_path), all_groups)
+
+        splits_df: pd.DataFrame = self._build_splits_dataframe(processed_rows)
+        splits_path: Path = self.output_root / self.cfg.splits_filename
+        write_csv(splits_df, str(splits_path))
+        summary.split_rows = int(len(splits_df))
+
+        if self.cfg.build_pairs_cache and self.cfg.pairs_manifest_path:
+            pairs_path: Path = self.output_root / self.cfg.pairs_filename
+            pair_builder: PairCacheBuilder = PairCacheBuilder()
+            pair_stats = pair_builder.build_cache(
+                input_manifest_path=self.cfg.pairs_manifest_path,
+                output_jsonl_path=str(pairs_path),
+                stage=self.cfg.pairs_stage,
+                overwrite=self.cfg.force_rebuild,
+            )
+            summary.pair_rows = int(pair_stats.output_rows)
+
+        processed_csv_path: Path = self.reports_root / "prepared_slides.csv"
+        write_csv(pd.DataFrame([_asdict_processed(r) for r in processed_rows]), str(processed_csv_path))
+
+        summary_payload: Dict[str, Any] = {
+            "config": _asdict_prepare_config(self.cfg),
+            "summary": summary.to_dict(),
+            "paths": {
+                "output_root": str(self.output_root),
+                "groups": str(groups_path),
+                "splits": str(splits_path),
+                "processed_csv": str(processed_csv_path),
+            },
+            "notes": [
+                "Constants are bound to config.yaml values: patch_size=512, magnification=20x, feature_dim=768.",
+                "Supplementary paper hyperparameters remain unresolved and are not fabricated.",
+            ],
+        }
+        write_json(summary_payload, str(self.reports_root / "summary.json"))
+        return summary
+
+    def _validate_config(self) -> None:
+        if self.cfg.patch_size_px != _PATCH_SIZE_PX:
+            raise PrepareDataError(
+                f"patch_size_px must be {_PATCH_SIZE_PX}, got {self.cfg.patch_size_px}."
+            )
+        if self.cfg.magnification != _MAGNIFICATION:
+            raise PrepareDataError(
+                f"magnification must be '{_MAGNIFICATION}', got {self.cfg.magnification}."
+            )
+        if self.cfg.feature_dim != _FEATURE_DIM:
+            raise PrepareDataError(
+                f"feature_dim must be {_FEATURE_DIM}, got {self.cfg.feature_dim}."
+            )
+        if tuple(self.cfg.roi_region_grid_size) != _STAGE1_REGION_GRID:
+            raise PrepareDataError(
+                f"roi_region_grid_size must be {_STAGE1_REGION_GRID}, got {self.cfg.roi_region_grid_size}."
+            )
+        if tuple(self.cfg.stage3_wsi_crop_grid_size) != _STAGE3_CROP_GRID:
+            raise PrepareDataError(
+                "stage3_wsi_crop_grid_size must be "
+                f"{_STAGE3_CROP_GRID}, got {self.cfg.stage3_wsi_crop_grid_size}."
+            )
+        if self.cfg.tissue_group_min_patches < 1:
+            raise PrepareDataError("tissue_group_min_patches must be >= 1.")
+        if not (0.0 <= self.cfg.min_tissue_ratio <= 1.0):
+            raise PrepareDataError("min_tissue_ratio must be in [0, 1].")
+
+    def _load_metadata(self, meta_csv: str) -> List[SlideRecord]:
+        meta_path: Path = Path(meta_csv).expanduser().resolve()
+        if not meta_path.exists() or not meta_path.is_file():
+            raise FileNotFoundError(f"Metadata CSV not found: {meta_path}")
+
+        frame: pd.DataFrame = pd.read_csv(meta_path)
+        if frame.empty:
+            raise PrepareDataError(f"Metadata CSV is empty: {meta_path}")
+
+        slide_col: str = _find_first_column(frame, ("slide_id", "wsi_id", "sample_id", "id"))
+        wsi_col: str = _find_first_column(frame, ("wsi_path", "path", "slide_path", "filepath"))
+        if slide_col == "":
+            raise PrepareDataError("Metadata CSV missing slide id column.")
+        if wsi_col == "":
+            raise PrepareDataError("Metadata CSV missing WSI path column.")
+
+        label_col: str = _find_first_column(frame, ("label", "target", "class"))
+        site_col: str = _find_first_column(frame, ("site", "center", "institution"))
+        patient_col: str = _find_first_column(frame, ("patient_id", "case_id", "patient"))
+        split_col: str = _find_first_column(frame, ("split",))
+        fold_col: str = _find_first_column(frame, ("fold",))
+
+        records: List[SlideRecord] = []
+        for _, row in frame.iterrows():
+            slide_id: str = str(row[slide_col]).strip()
+            if not slide_id:
+                continue
+            raw_wsi_path: str = str(row[wsi_col]).strip()
+            if not raw_wsi_path:
+                continue
+            wsi_path: str = _resolve_maybe_relative(raw_wsi_path, meta_path.parent)
+
+            label_value: str = str(row[label_col]).strip() if label_col else ""
+            site_value: str = str(row[site_col]).strip() if site_col else ""
+            patient_value: str = str(row[patient_col]).strip() if patient_col else ""
+            split_value: str = str(row[split_col]).strip() if split_col else ""
+            fold_value: str = str(row[fold_col]).strip() if fold_col else ""
+
+            extra: Dict[str, Any] = {}
+            for col_name in frame.columns:
+                col_key: str = str(col_name)
+                if col_key in {
+                    slide_col,
+                    wsi_col,
+                    label_col,
+                    site_col,
+                    patient_col,
+                    split_col,
+                    fold_col,
+                }:
+                    continue
+                extra[col_key] = row[col_name]
+
+            records.append(
+                SlideRecord(
+                    slide_id=slide_id,
+                    wsi_path=wsi_path,
+                    label=label_value,
+                    site=site_value,
+                    patient_id=patient_value,
+                    split=split_value,
+                    fold=fold_value,
+                    extra=extra,
+                )
+            )
+
+        records.sort(key=lambda item: item.slide_id)
+        return records
+
+    def _process_single_slide(
+        self,
+        row: SlideRecord,
+    ) -> Tuple[ProcessedRecord, List[Dict[str, Any]]]:
+        slide_dir: Path = ensure_dir(self.slides_root / _safe_name(row.slide_id))
+        features_path: Path = slide_dir / self.cfg.features_filename
+        grid_path: Path = slide_dir / self.cfg.grid_filename
+
+        if (not self.cfg.force_rebuild) and _is_valid_feature_h5(str(features_path), self.cfg.feature_dim) and _is_valid_grid_pt(
+            str(grid_path), self.cfg.feature_dim
+        ):
+            return (
+                ProcessedRecord(
+                    slide_id=row.slide_id,
+                    wsi_path=row.wsi_path,
+                    status="skipped_existing",
+                    reason="existing_artifacts",
+                    features_path=str(features_path),
+                    grid_path=str(grid_path),
+                    label=row.label,
+                    site=row.site,
+                    patient_id=row.patient_id,
+                    split=row.split,
+                    fold=row.fold,
+                ),
+                [],
+            )
+
+        try:
+            if not Path(row.wsi_path).exists():
+                return (
+                    ProcessedRecord(
+                        slide_id=row.slide_id,
+                        wsi_path=row.wsi_path,
+                        status="failed",
+                        reason="invalid_wsi",
+                        label=row.label,
+                        site=row.site,
+                        patient_id=row.patient_id,
+                        split=row.split,
+                        fold=row.fold,
+                    ),
+                    [],
+                )
+
+            _ = self.reader.get_dimensions(row.wsi_path)
+            thumbnail: np.ndarray = _read_thumbnail(
+                reader=self.reader,
+                wsi_path=row.wsi_path,
+                max_side=self.cfg.thumbnail_max_side,
+            )
+
+            mask_raw: np.ndarray = self.segmenter.segment_thumbnail(thumbnail)
+            mask_processed: np.ndarray = self.segmenter.postprocess_mask(mask_raw)
+            contours: List[np.ndarray] = self.segmenter.extract_contours(mask_processed)
+            if len(contours) == 0:
+                return (
+                    ProcessedRecord(
+                        slide_id=row.slide_id,
+                        wsi_path=row.wsi_path,
+                        status="failed",
+                        reason="empty_tissue",
+                        label=row.label,
+                        site=row.site,
+                        patient_id=row.patient_id,
+                        split=row.split,
+                        fold=row.fold,
+                    ),
+                    [],
+                )
+
+            coords_list: List[Tuple[int, int]] = self.tiler.tile_from_mask(
+                wsi_path=row.wsi_path,
+                mask=mask_processed,
+            )
+            coords_list = self.tiler.filter_background(
+                coords=coords_list,
+                min_tissue_ratio=self.cfg.min_tissue_ratio,
+            )
+            if len(coords_list) == 0:
+                return (
+                    ProcessedRecord(
+                        slide_id=row.slide_id,
+                        wsi_path=row.wsi_path,
+                        status="failed",
+                        reason="no_tiles",
+                        label=row.label,
+                        site=row.site,
+                        patient_id=row.patient_id,
+                        split=row.split,
+                        fold=row.fold,
+                    ),
+                    [],
+                )
+
+            coords_np: np.ndarray = np.asarray(coords_list, dtype=np.int64)
+            feats_np: np.ndarray = self.extractor.extract_wsi(
+                coords=list(coords_list),
+                wsi_path=row.wsi_path,
+            )
+            if int(feats_np.shape[0]) != int(coords_np.shape[0]):
+                raise PrepareDataError(
+                    "Feature/coord row mismatch for slide "
+                    f"{row.slide_id}: features={feats_np.shape[0]} coords={coords_np.shape[0]}"
+                )
+            if int(feats_np.shape[1]) != int(self.cfg.feature_dim):
+                raise PrepareDataError(
+                    "Feature dim mismatch for slide "
+                    f"{row.slide_id}: got {feats_np.shape[1]}"
+                )
+            if not np.isfinite(feats_np).all():
+                raise PrepareDataError(f"Non-finite features found for slide {row.slide_id}.")
+
+            if not self.cfg.validate_only:
+                self.extractor.save_features(str(features_path), feats_np, coords_np)
+                grid_obj: FeatureGrid = self.grid_builder.build_grid(feats_np, coords_np)
+                _atomic_torch_save(
+                    {
+                        "features": grid_obj.features,
+                        "coords_xy": grid_obj.coords_xy,
+                        "valid_mask": grid_obj.valid_mask,
+                        "slide_id": row.slide_id,
+                        "meta": {
+                            "patch_size_px": self.cfg.patch_size_px,
+                            "magnification": self.cfg.magnification,
+                            "feature_dim": self.cfg.feature_dim,
+                            "num_patches": int(coords_np.shape[0]),
+                            "source_wsi_path": row.wsi_path,
+                        },
+                    },
+                    str(grid_path),
+                )
+
+            if not _is_valid_feature_h5(str(features_path), self.cfg.feature_dim):
+                raise PrepareDataError(f"Invalid features artifact written: {features_path}")
+            if not _is_valid_grid_pt(str(grid_path), self.cfg.feature_dim):
+                raise PrepareDataError(f"Invalid grid artifact written: {grid_path}")
+
+            contour_payload: List[Dict[str, Any]] = [
+                {"contour": contour, "slide_id": row.slide_id} for contour in contours
+            ]
+            grouped: List[Dict[str, Any]] = self.grouper.group_contours(contour_payload)
+            grouped = self.grouper.filter_small_groups(grouped)
+            for group_item in grouped:
+                group_item["slide_ids"] = [row.slide_id]
+                group_item["grid_path"] = str(grid_path)
+
+            processed_record: ProcessedRecord = ProcessedRecord(
+                slide_id=row.slide_id,
+                wsi_path=row.wsi_path,
+                status="processed",
+                reason="ok",
+                features_path=str(features_path),
+                grid_path=str(grid_path),
+                num_patches=int(coords_np.shape[0]),
+                label=row.label,
+                site=row.site,
+                patient_id=row.patient_id,
+                split=row.split,
+                fold=row.fold,
+            )
+            return processed_record, grouped
+        except Exception as exc:  # noqa: BLE001
+            return (
+                ProcessedRecord(
+                    slide_id=row.slide_id,
+                    wsi_path=row.wsi_path,
+                    status="failed",
+                    reason=f"exception:{type(exc).__name__}",
+                    label=row.label,
+                    site=row.site,
+                    patient_id=row.patient_id,
+                    split=row.split,
+                    fold=row.fold,
+                ),
+                [],
+            )
+
+    def _build_splits_dataframe(self, processed: Sequence[ProcessedRecord]) -> pd.DataFrame:
+        rows: List[Dict[str, Any]] = []
+        for item in processed:
+            if item.status not in {"processed", "skipped_existing"}:
+                continue
+            rows.append(_asdict_processed(item))
+
+        if len(rows) == 0:
+            return pd.DataFrame(
+                columns=[
+                    "slide_id",
+                    "split",
+                    "fold",
+                    "label",
+                    "site",
+                    "patient_id",
+                    "wsi_path",
+                    "features_path",
+                    "grid_path",
+                    "num_patches",
+                    "status",
+                    "reason",
+                ]
+            )
+
+        frame: pd.DataFrame = pd.DataFrame(rows)
+        if "split" not in frame.columns or frame["split"].fillna("").astype(str).str.strip().eq("").all():
+            frame["split"] = self._assign_split(frame)
+        else:
+            frame["split"] = frame["split"].astype(str).str.strip()
+
+        if "fold" not in frame.columns:
+            frame["fold"] = ""
+        frame["fold"] = frame["fold"].fillna("").astype(str)
+
+        ordered_columns: List[str] = [
+            "slide_id",
+            "split",
+            "fold",
+            "label",
+            "site",
+            "patient_id",
+            "wsi_path",
+            "features_path",
+            "grid_path",
+            "num_patches",
+            "status",
+            "reason",
+        ]
+        for col in ordered_columns:
+            if col not in frame.columns:
+                frame[col] = ""
+        frame = frame[ordered_columns].sort_values("slide_id").reset_index(drop=True)
+        return frame
+
+    def _assign_split(self, frame: pd.DataFrame) -> pd.Series:
+        split_values: List[str] = []
+        has_site: bool = "site" in frame.columns and not frame["site"].fillna("").astype(str).str.strip().eq("").all()
+
+        for _, row in frame.iterrows():
+            key: str
+            if has_site:
+                key = str(row.get("site", "")).strip()
+                if not key:
+                    key = str(row.get("slide_id", "")).strip()
+            else:
+                key = str(row.get("slide_id", "")).strip()
+            ratio_value: float = _stable_ratio(key=key, seed=self.cfg.seed)
+            if ratio_value < _DEFAULT_SPLIT_TRAIN:
+                split_values.append("train")
+            elif ratio_value < (_DEFAULT_SPLIT_TRAIN + _DEFAULT_SPLIT_VAL):
+                split_values.append("val")
+            else:
+                split_values.append("test")
+        return pd.Series(split_values, index=frame.index, dtype=object)
+
+
+def _read_thumbnail(reader: WSIReader, wsi_path: str, max_side: int) -> np.ndarray:
+    if max_side <= 0:
+        raise ValueError("max_side must be > 0.")
+    slide: Any = reader.open(wsi_path)
+    level_count: int = int(getattr(slide, "level_count", 1))
+    if level_count <= 0:
+        raise PrepareDataError(f"Invalid level_count for slide {wsi_path}.")
+
+    dims_l0: Tuple[int, int] = reader.get_dimensions(wsi_path)
+    max_dim: int = max(int(dims_l0[0]), int(dims_l0[1]))
+    target_downsample: float = max(1.0, float(max_dim) / float(max_side))
+
+    if hasattr(slide, "get_best_level_for_downsample"):
+        level: int = int(slide.get_best_level_for_downsample(target_downsample))
+    else:
+        level = level_count - 1
+    level = int(np.clip(level, 0, level_count - 1))
+
+    level_dims_raw: Any = getattr(slide, "level_dimensions", None)
+    if level_dims_raw is None:
+        width, height = dims_l0
+    else:
+        width = int(level_dims_raw[level][0])
+        height = int(level_dims_raw[level][1])
+
+    region: np.ndarray = reader.read_region(
+        path=wsi_path,
+        x=0,
+        y=0,
+        size=max(width, height),
+        level=level,
+    )
+    thumbnail: np.ndarray = region[:height, :width, :]
+    return thumbnail
+
+
+def _is_valid_feature_h5(path: str, feature_dim: int) -> bool:
+    try:
+        from h5py import File as H5File
+    except Exception:
+        return False
+
+    artifact_path: Path = Path(path).expanduser().resolve()
+    if not artifact_path.exists() or not artifact_path.is_file():
+        return False
+
+    try:
+        with H5File(artifact_path, "r") as h5f:
+            if "features" not in h5f or "coords" not in h5f:
+                return False
+            feats_shape: Tuple[int, ...] = tuple(h5f["features"].shape)
+            coords_shape: Tuple[int, ...] = tuple(h5f["coords"].shape)
+            if len(feats_shape) != 2 or len(coords_shape) != 2:
+                return False
+            if int(feats_shape[1]) != int(feature_dim):
+                return False
+            if int(coords_shape[1]) != 2:
+                return False
+            if int(feats_shape[0]) != int(coords_shape[0]):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _is_valid_grid_pt(path: str, feature_dim: int) -> bool:
+    artifact_path: Path = Path(path).expanduser().resolve()
+    if not artifact_path.exists() or not artifact_path.is_file():
+        return False
+    try:
+        payload: Any = torch.load(artifact_path, map_location="cpu")
+    except Exception:
+        return False
+
+    if isinstance(payload, FeatureGrid):
+        return int(payload.features.shape[-1]) == int(feature_dim)
+
+    if not isinstance(payload, Mapping):
+        return False
+
+    features_obj: Any = payload.get("features")
+    coords_obj: Any = payload.get("coords_xy", payload.get("coords"))
+    valid_obj: Any = payload.get("valid_mask", payload.get("mask"))
+    if not isinstance(features_obj, torch.Tensor):
+        return False
+    if not isinstance(coords_obj, torch.Tensor):
+        return False
+    if not isinstance(valid_obj, torch.Tensor):
+        return False
+    if features_obj.ndim != 3 or coords_obj.ndim != 3 or valid_obj.ndim != 2:
+        return False
+    if int(features_obj.shape[-1]) != int(feature_dim):
+        return False
+    if int(coords_obj.shape[-1]) != 2:
+        return False
+    if tuple(features_obj.shape[:2]) != tuple(coords_obj.shape[:2]) or tuple(features_obj.shape[:2]) != tuple(valid_obj.shape):
+        return False
+    return True
+
+
+def _atomic_torch_save(payload: Mapping[str, Any], output_path: str) -> None:
+    target_path: Path = Path(output_path).expanduser().resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd: int
+    temp_name: str
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target_path.stem}.", suffix=target_path.suffix, dir=str(target_path.parent))
+    os.close(fd)
+    temp_path: Path = Path(temp_name)
+    try:
+        torch.save(dict(payload), temp_path)
+        os.replace(temp_path, target_path)
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _safe_name(value: str) -> str:
+    raw: str = str(value).strip()
+    if not raw:
+        return "unknown"
+    safe: str = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in raw)
+    return safe[:200] if len(safe) > 200 else safe
+
+
+def _find_first_column(frame: pd.DataFrame, candidates: Sequence[str]) -> str:
+    normalized: Dict[str, str] = {str(col).strip().lower(): str(col) for col in frame.columns}
+    for candidate in candidates:
+        key: str = str(candidate).strip().lower()
+        if key in normalized:
+            return normalized[key]
+    return ""
+
+
+def _resolve_maybe_relative(path_value: str, base_dir: Path) -> str:
+    candidate: Path = Path(path_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base_dir / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    return str(candidate)
+
+
+def _stable_ratio(key: str, seed: int) -> float:
+    payload: str = f"{seed}|{key}"
+    digest: str = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    value_int: int = int(digest, 16)
+    max_int: int = int("f" * 12, 16)
+    return float(value_int) / float(max_int)
+
+
+def _asdict_prepare_config(cfg: PrepareConfig) -> Dict[str, Any]:
+    return {
+        "config_path": cfg.config_path,
+        "wsi_root": cfg.wsi_root,
+        "meta_csv": cfg.meta_csv,
+        "output_root": cfg.output_root,
+        "patch_size_px": cfg.patch_size_px,
+        "magnification": cfg.magnification,
+        "feature_dim": cfg.feature_dim,
+        "roi_region_grid_size": list(cfg.roi_region_grid_size),
+        "stage3_wsi_crop_grid_size": list(cfg.stage3_wsi_crop_grid_size),
+        "features_filename": cfg.features_filename,
+        "grid_filename": cfg.grid_filename,
+        "groups_filename": cfg.groups_filename,
+        "splits_filename": cfg.splits_filename,
+        "pairs_filename": cfg.pairs_filename,
+        "tissue_group_min_patches": cfg.tissue_group_min_patches,
+        "min_tissue_ratio": cfg.min_tissue_ratio,
+        "thumbnail_max_side": cfg.thumbnail_max_side,
+        "encoder_name": cfg.encoder_name,
+        "encoder_ckpt_path": cfg.encoder_ckpt_path,
+        "seed": cfg.seed,
+        "force_rebuild": cfg.force_rebuild,
+        "validate_only": cfg.validate_only,
+        "pairs_manifest_path": cfg.pairs_manifest_path,
+        "pairs_stage": cfg.pairs_stage,
+        "build_pairs_cache": cfg.build_pairs_cache,
+    }
+
+
+def _asdict_processed(item: ProcessedRecord) -> Dict[str, Any]:
+    return {
+        "slide_id": item.slide_id,
+        "wsi_path": item.wsi_path,
+        "status": item.status,
+        "reason": item.reason,
+        "features_path": item.features_path,
+        "grid_path": item.grid_path,
+        "num_patches": int(item.num_patches),
+        "label": item.label,
+        "site": item.site,
+        "patient_id": item.patient_id,
+        "split": item.split,
+        "fold": item.fold,
+    }
+
+
+def _load_prepare_config_from_yaml(path: str) -> PrepareConfig:
+    config_path: Path = Path(path).expanduser().resolve()
+    if not config_path.exists() or not config_path.is_file():
+        return PrepareConfig(config_path=path)
+
+    with config_path.open("r", encoding="utf-8") as handle:
+        raw: Any = yaml.safe_load(handle)
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise PrepareDataError(f"Top-level YAML must be mapping: {config_path}")
+
+    # Accept either full config.yaml shape (with `data`) or data profile shape.
+    data_block: Mapping[str, Any]
+    if "data" in raw and isinstance(raw["data"], Mapping):
+        data_block = raw["data"]
+    else:
+        data_block = raw
+
+    artifacts_block: Mapping[str, Any] = {}
+    if "artifacts" in data_block and isinstance(data_block["artifacts"], Mapping):
+        artifacts_block = data_block["artifacts"]
+
+    tissue_group_block: Mapping[str, Any] = {}
+    if "tissue_grouping" in data_block and isinstance(data_block["tissue_grouping"], Mapping):
+        tissue_group_block = data_block["tissue_grouping"]
+
+    pairs_block: Mapping[str, Any] = {}
+    if "pairs" in data_block and isinstance(data_block["pairs"], Mapping):
+        pairs_block = data_block["pairs"]
+
+    cfg = PrepareConfig(
+        config_path=str(config_path),
+        wsi_root=str(data_block.get("wsi_root", "./data/wsi")),
+        meta_csv=str(data_block.get("meta_csv", "./data/metadata/public_metadata.csv")),
+        output_root=str(
+            artifacts_block.get("root_dir", data_block.get("output_root", "./data/processed"))
+        ),
+        patch_size_px=int(data_block.get("wsi_patch_size_px", data_block.get("patch_size", _PATCH_SIZE_PX))),
+        magnification=str(data_block.get("magnification", _MAGNIFICATION)),
+        feature_dim=int(data_block.get("patch_feature_dim", data_block.get("feature_dim", _FEATURE_DIM))),
+        roi_region_grid_size=tuple(int(v) for v in data_block.get("roi_region_grid_size", _STAGE1_REGION_GRID)),
+        stage3_wsi_crop_grid_size=tuple(
+            int(v) for v in data_block.get("stage3_wsi_crop_grid_size", _STAGE3_CROP_GRID)
+        ),
+        features_filename=str(artifacts_block.get("features_filename", "features.h5")),
+        grid_filename=str(artifacts_block.get("grid_filename", "grid.pt")),
+        groups_filename=str(artifacts_block.get("groups_filename", "groups.json")),
+        splits_filename=str(artifacts_block.get("splits_filename", "splits.csv")),
+        pairs_filename=str(artifacts_block.get("pairs_filename", "pairs.jsonl")),
+        tissue_group_min_patches=int(
+            tissue_group_block.get("min_patches_per_group", tissue_group_block.get("min_patches", 16))
+        ),
+        min_tissue_ratio=float(data_block.get("min_tissue_ratio", 0.5)),
+        thumbnail_max_side=int(data_block.get("thumbnail_max_side", 2048)),
+        encoder_name=str(data_block.get("encoder_name", "conch")),
+        encoder_ckpt_path=str(data_block.get("encoder_ckpt_path", "")),
+        seed=int(raw.get("runtime", {}).get("seed", data_block.get("seed", 42))) if isinstance(raw.get("runtime", {}), Mapping) else int(data_block.get("seed", 42)),
+        force_rebuild=bool(data_block.get("force_rebuild", False)),
+        validate_only=bool(data_block.get("validate_only", False)),
+        pairs_manifest_path=(
+            str(pairs_block.get("manifest_path"))
+            if "manifest_path" in pairs_block and pairs_block.get("manifest_path") is not None
+            else None
+        ),
+        pairs_stage=str(pairs_block.get("stage", "stage2")),
+        build_pairs_cache=bool(pairs_block.get("build_cache", False)),
+    )
+    return cfg
+
+
+def _parse_args() -> argparse.Namespace:
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="Prepare public artifacts for TITAN reproduction.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="configs/data/public_repro.yaml",
+        help="Path to YAML config (full or data-profile shape).",
+    )
+    parser.add_argument("--wsi-root", type=str, default=None, help="Override WSI root directory.")
+    parser.add_argument("--meta-csv", type=str, default=None, help="Override metadata CSV path.")
+    parser.add_argument("--output-root", type=str, default=None, help="Override output root.")
+    parser.add_argument("--encoder-name", type=str, default=None, help="Patch encoder name.")
+    parser.add_argument("--encoder-ckpt-path", type=str, default=None, help="Patch encoder checkpoint.")
+    parser.add_argument("--seed", type=int, default=None, help="Deterministic seed override.")
+    parser.add_argument("--force-rebuild", action="store_true", help="Recompute artifacts even if valid.")
+    parser.add_argument("--validate-only", action="store_true", help="Validate metadata/constants only.")
+    parser.add_argument("--pairs-manifest", type=str, default=None, help="Optional stage2/3 pairs manifest path.")
+    parser.add_argument(
+        "--pairs-stage",
+        type=str,
+        default=None,
+        choices=["stage2", "stage3"],
+        help="Pairs stage for optional cache build.",
+    )
+    parser.add_argument("--build-pairs-cache", action="store_true", help="Build optional pairs cache.")
+    return parser.parse_args()
+
+
+def _apply_cli_overrides(cfg: PrepareConfig, args: argparse.Namespace) -> PrepareConfig:
+    return PrepareConfig(
+        config_path=cfg.config_path,
+        wsi_root=str(args.wsi_root) if args.wsi_root is not None else cfg.wsi_root,
+        meta_csv=str(args.meta_csv) if args.meta_csv is not None else cfg.meta_csv,
+        output_root=str(args.output_root) if args.output_root is not None else cfg.output_root,
+        patch_size_px=cfg.patch_size_px,
+        magnification=cfg.magnification,
+        feature_dim=cfg.feature_dim,
+        roi_region_grid_size=cfg.roi_region_grid_size,
+        stage3_wsi_crop_grid_size=cfg.stage3_wsi_crop_grid_size,
+        features_filename=cfg.features_filename,
+        grid_filename=cfg.grid_filename,
+        groups_filename=cfg.groups_filename,
+        splits_filename=cfg.splits_filename,
+        pairs_filename=cfg.pairs_filename,
+        tissue_group_min_patches=cfg.tissue_group_min_patches,
+        min_tissue_ratio=cfg.min_tissue_ratio,
+        thumbnail_max_side=cfg.thumbnail_max_side,
+        encoder_name=str(args.encoder_name) if args.encoder_name is not None else cfg.encoder_name,
+        encoder_ckpt_path=str(args.encoder_ckpt_path) if args.encoder_ckpt_path is not None else cfg.encoder_ckpt_path,
+        seed=int(args.seed) if args.seed is not None else cfg.seed,
+        force_rebuild=bool(args.force_rebuild or cfg.force_rebuild),
+        validate_only=bool(args.validate_only or cfg.validate_only),
+        pairs_manifest_path=(
+            str(args.pairs_manifest)
+            if args.pairs_manifest is not None
+            else cfg.pairs_manifest_path
+        ),
+        pairs_stage=str(args.pairs_stage) if args.pairs_stage is not None else cfg.pairs_stage,
+        build_pairs_cache=bool(args.build_pairs_cache or cfg.build_pairs_cache),
+    )
+
+
+def main() -> None:
+    args: argparse.Namespace = _parse_args()
+    config_from_file: PrepareConfig = _load_prepare_config_from_yaml(args.config)
+    cfg: PrepareConfig = _apply_cli_overrides(config_from_file, args)
+
+    preparer: PublicDataPreparer = PublicDataPreparer(cfg)
+    summary: PipelineSummary = preparer.run()
+    print(json.dumps(summary.to_dict(), ensure_ascii=True, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
+```

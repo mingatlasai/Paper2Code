@@ -44,3 +44,8 @@ python ../codes/3_coding.py  \
     --paper_format LaTeX \
     --output_dir ${OUTPUT_DIR} \
     --output_repo_dir ${OUTPUT_REPO_DIR} \
+
+echo "------- Environment Files -------"
+python ../codes/3.3_env_files.py \
+    --output_repo_dir ${OUTPUT_REPO_DIR} \
+    --python_version 3.10

@@ -1,0 +1,5 @@
+Implemented the requested logic analysis in:
+
+- [src/data/caption_report_processing.py](/Users/mingatlas/Projects/Paper2Code/src/data/caption_report_processing.py)
+
+It is aligned to the paper, the provided design/interfaces, task requirements, and `config.yaml`, with emphasis on stage-2/3 text processing, PHI/rewrite hooks, tokenization flow, JSONL cache contract, failure modes, and reproducibility constraints.

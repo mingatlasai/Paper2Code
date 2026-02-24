@@ -1,0 +1,458 @@
+----------------------------------------
+[Implementation approach]
+We will build a single Python package with a config-driven pipeline that supports: (1) WSI preprocessing and patch-feature extraction, (2) stage-1 TITAN-V pretraining with iBOT-style SSL in feature space, (3) stage-2/3 CoCa-style vision-language alignment, and (4) unified downstream evaluation (linear/few-shot/zero-shot/retrieval/report-generation/survival). Architecture is intentionally simple: one entrypoint, one registry-based dataset/model/trainer layer, and one reusable embedding API. Open-source stack: PyTorch, timm, open_clip, OpenSlide, CLAM-style preprocessing utilities, scikit-learn, scikit-survival, faiss, pandas, numpy, hydra, pydantic, matplotlib/seaborn.
+
+----------------------------------------
+[File list]
+- main.py
+- configs/default.yaml
+- configs/data/public_repro.yaml
+- configs/model/titan_v.yaml
+- configs/model/titan_multimodal.yaml
+- configs/train/stage1_ibot.yaml
+- configs/train/stage2_coca.yaml
+- configs/train/stage3_coca.yaml
+- configs/eval/linear_probe.yaml
+- configs/eval/few_shot.yaml
+- configs/eval/zero_shot.yaml
+- configs/eval/retrieval.yaml
+- configs/eval/report_generation.yaml
+- configs/eval/survival.yaml
+- src/core/config_schema.py
+- src/core/registry.py
+- src/core/utils.py
+- src/core/logging_utils.py
+- src/data/wsi_reader.py
+- src/data/segment_tissue.py
+- src/data/tile_wsi.py
+- src/data/extract_patch_features.py
+- src/data/build_feature_grid.py
+- src/data/tissue_grouping.py
+- src/data/caption_report_processing.py
+- src/data/datasets.py
+- src/data/collate.py
+- src/models/alibi_2d.py
+- src/models/titan_encoder.py
+- src/models/ibot_heads.py
+- src/models/coca_multimodal.py
+- src/models/text_modules.py
+- src/models/losses.py
+- src/train/base_trainer.py
+- src/train/stage1_trainer.py
+- src/train/stage2_trainer.py
+- src/train/stage3_trainer.py
+- src/eval/embed_api.py
+- src/eval/linear_probe.py
+- src/eval/knn_probe.py
+- src/eval/few_shot.py
+- src/eval/zero_shot.py
+- src/eval/retrieval.py
+- src/eval/report_generation.py
+- src/eval/survival.py
+- src/eval/statistics.py
+- src/baselines/mean_pooling.py
+- src/baselines/abmil.py
+- scripts/run_stage1.py
+- scripts/run_stage2.py
+- scripts/run_stage3.py
+- scripts/run_eval.py
+- scripts/prepare_public_data.py
+- tests/test_alibi_2d.py
+- tests/test_feature_grid.py
+- tests/test_losses.py
+- tests/test_eval_metrics.py
+
+----------------------------------------
+[Data structures and interfaces]
+```mermaid
+classDiagram
+    class MainApp {
+        +__init__(cfg_path: str) None
+        +build_components() None
+        +run() None
+        +run_stage(stage: str) None
+        +run_eval(eval_name: str) None
+    }
+
+    class ExperimentConfig {
+        +seed: int
+        +output_dir: str
+        +device: str
+        +num_workers: int
+        +from_yaml(path: str) ExperimentConfig
+        +validate() None
+    }
+
+    class DataConfig {
+        +wsi_root: str
+        +meta_csv: str
+        +patch_size: int
+        +magnification: int
+        +feature_dim: int
+        +splits_path: str
+    }
+
+    class ModelConfig {
+        +embed_dim: int
+        +num_layers: int
+        +num_heads: int
+        +mlp_dim: int
+        +use_alibi_2d: bool
+        +max_tokens_train: int
+    }
+
+    class TrainConfig {
+        +stage: str
+        +epochs: int
+        +lr: float
+        +weight_decay: float
+        +batch_size: int
+        +grad_accum_steps: int
+        +mixed_precision: bool
+    }
+
+    class Registry {
+        +register_dataset(name: str, cls: type) None
+        +register_model(name: str, cls: type) None
+        +register_trainer(name: str, cls: type) None
+        +create_dataset(name: str, cfg: DataConfig) BaseDataset
+        +create_model(name: str, cfg: ModelConfig) torch.nn.Module
+        +create_trainer(name: str, cfg: TrainConfig) BaseTrainer
+    }
+
+    class WSIReader {
+        +__init__(backend: str = "openslide") None
+        +open(path: str) Any
+        +read_region(path: str, x: int, y: int, size: int, level: int) np.ndarray
+        +get_mpp(path: str) float
+        +get_dimensions(path: str) tuple~int, int~
+    }
+
+    class TissueSegmenter {
+        +__init__(sat_thresh: float, min_area: int) None
+        +segment_thumbnail(wsi_thumb: np.ndarray) np.ndarray
+        +postprocess_mask(mask: np.ndarray) np.ndarray
+        +extract_contours(mask: np.ndarray) list
+    }
+
+    class WSITiler {
+        +__init__(patch_size: int, stride: int) None
+        +tile_from_mask(wsi_path: str, mask: np.ndarray) list~tuple~int,int~~
+        +filter_background(coords: list, min_tissue_ratio: float) list
+    }
+
+    class PatchFeatureExtractor {
+        +__init__(encoder_name: str, ckpt_path: str, out_dim: int = 768) None
+        +extract_batch(images: torch.Tensor) torch.Tensor
+        +extract_wsi(coords: list, wsi_path: str) np.ndarray
+        +save_features(out_path: str, feats: np.ndarray, coords: np.ndarray) None
+    }
+
+    class FeatureGridBuilder {
+        +__init__(patch_size: int = 512) None
+        +build_grid(feats: np.ndarray, coords: np.ndarray) FeatureGrid
+        +build_background_mask(coords: np.ndarray, shape: tuple~int,int~) np.ndarray
+        +crop_grid(grid: FeatureGrid, crop_hw: tuple~int,int~, random: bool = True) FeatureGrid
+    }
+
+    class TissueGrouper {
+        +__init__(min_patches: int = 16, method: str = "dbscan") None
+        +group_contours(contours: list) list
+        +filter_small_groups(groups: list) list
+        +save_groups(path: str, groups: list) None
+    }
+
+    class FeatureGrid {
+        +features: torch.Tensor
+        +coords_xy: torch.Tensor
+        +valid_mask: torch.Tensor
+        +slide_id: str
+        +to(device: str) FeatureGrid
+    }
+
+    class TITANEncoder {
+        +__init__(cfg: ModelConfig) None
+        +forward(grid_tokens: torch.Tensor, pos_xy: torch.Tensor, attn_mask: torch.Tensor) torch.Tensor
+        +encode_slide(grid: FeatureGrid) torch.Tensor
+        +load_pretrained(path: str) None
+        +save(path: str) None
+    }
+
+    class ALiBi2D {
+        +__init__(num_heads: int, slopes: torch.Tensor) None
+        +build_bias(coords_xy: torch.Tensor) torch.Tensor
+        +apply(attn_scores: torch.Tensor, bias: torch.Tensor) torch.Tensor
+    }
+
+    class IBOTHead {
+        +__init__(embed_dim: int, out_dim: int) None
+        +forward(tokens: torch.Tensor) torch.Tensor
+    }
+
+    class IBOTLoss {
+        +__init__(student_temp: float, teacher_temp: float, center_momentum: float) None
+        +compute(student_out: torch.Tensor, teacher_out: torch.Tensor, mask: torch.Tensor) torch.Tensor
+        +update_center(teacher_out: torch.Tensor) None
+    }
+
+    class CoCaModel {
+        +__init__(vision: TITANEncoder, text_encoder: TextEncoder, decoder: MultimodalDecoder) None
+        +forward_contrastive(batch: MultimodalBatch) dict
+        +forward_captioning(batch: MultimodalBatch) dict
+        +encode_image(grid: FeatureGrid) torch.Tensor
+        +encode_text(input_ids: torch.Tensor, attn_mask: torch.Tensor) torch.Tensor
+        +generate_report(grid: FeatureGrid, num_beams: int = 5) str
+    }
+
+    class TextEncoder {
+        +__init__(name: str, vocab_size: int, max_len: int) None
+        +forward(input_ids: torch.Tensor, attn_mask: torch.Tensor) torch.Tensor
+    }
+
+    class MultimodalDecoder {
+        +__init__(num_layers: int, embed_dim: int) None
+        +forward(image_tokens: torch.Tensor, input_ids: torch.Tensor) torch.Tensor
+        +generate(image_tokens: torch.Tensor, num_beams: int, max_new_tokens: int) torch.Tensor
+    }
+
+    class BaseDataset {
+        +__len__() int
+        +__getitem__(idx: int) dict
+    }
+
+    class Stage1Dataset {
+        +__init__(meta_csv: str, groups_path: str, crop_size: int = 16) None
+        +sample_region_crop(slide_id: str) FeatureGrid
+        +make_ibot_views(region_grid: FeatureGrid) dict
+    }
+
+    class Stage2Dataset {
+        +__init__(pairs_csv: str, tokenizer_name: str) None
+        +__getitem__(idx: int) MultimodalBatch
+    }
+
+    class Stage3Dataset {
+        +__init__(pairs_csv: str, tokenizer_name: str, crop_hw: tuple~int,int~ = (64, 64)) None
+        +__getitem__(idx: int) MultimodalBatch
+    }
+
+    class MultimodalBatch {
+        +image_grid: FeatureGrid
+        +input_ids: torch.Tensor
+        +attention_mask: torch.Tensor
+        +labels: torch.Tensor
+        +slide_id: str
+    }
+
+    class BaseTrainer {
+        +__init__(model: torch.nn.Module, cfg: TrainConfig) None
+        +fit(train_loader: DataLoader, val_loader: DataLoader | None = None) None
+        +train_step(batch: dict) dict
+        +validate_step(batch: dict) dict
+        +save_checkpoint(path: str) None
+        +load_checkpoint(path: str) None
+    }
+
+    class Stage1Trainer {
+        +__init__(model: TITANEncoder, ibot_head: IBOTHead, loss_fn: IBOTLoss, cfg: TrainConfig) None
+        +train_step(batch: dict) dict
+    }
+
+    class Stage2Trainer {
+        +__init__(model: CoCaModel, cfg: TrainConfig) None
+        +train_step(batch: MultimodalBatch) dict
+    }
+
+    class Stage3Trainer {
+        +__init__(model: CoCaModel, cfg: TrainConfig) None
+        +train_step(batch: MultimodalBatch) dict
+    }
+
+    class EmbeddingService {
+        +__init__(vision_model: TITANEncoder, text_model: TextEncoder | None = None) None
+        +embed_slides(slide_ids: list~str~) np.ndarray
+        +embed_reports(texts: list~str~) np.ndarray
+        +center_and_l2(x: np.ndarray, mean_vec: np.ndarray | None = None) tuple~np.ndarray, np.ndarray~
+    }
+
+    class Evaluator {
+        +run_linear_probe(features: np.ndarray, y: np.ndarray, split: dict) dict
+        +run_knn_probe(features: np.ndarray, y: np.ndarray, k: int = 20) dict
+        +run_few_shot(features: np.ndarray, y: np.ndarray, shots: list~int~, runs: int = 50) dict
+        +run_zero_shot(slide_emb: np.ndarray, class_text_emb: np.ndarray, y: np.ndarray) dict
+        +run_slide_retrieval(query: np.ndarray, db: np.ndarray, yq: np.ndarray, ydb: np.ndarray) dict
+        +run_cross_modal_retrieval(slide_emb: np.ndarray, report_emb: np.ndarray, labels: np.ndarray) dict
+        +run_report_generation(model: CoCaModel, dataset: BaseDataset) dict
+        +run_survival(features: np.ndarray, time: np.ndarray, event: np.ndarray, folds: list) dict
+    }
+
+    class StatsAnalyzer {
+        +bootstrap_metrics(y_true: np.ndarray, y_pred: np.ndarray, n_boot: int = 1000) dict
+        +fold_mean_std(scores: list~float~) dict
+        +fit_glmm(results_df: pd.DataFrame) Any
+        +pairwise_tests_glmm(model: Any, method: str = "tukey") pd.DataFrame
+    }
+
+    MainApp --> ExperimentConfig
+    MainApp --> Registry
+    MainApp --> BaseTrainer
+    MainApp --> Evaluator
+    Registry --> Stage1Dataset
+    Registry --> Stage2Dataset
+    Registry --> Stage3Dataset
+    Registry --> TITANEncoder
+    Registry --> CoCaModel
+    BaseTrainer --> TITANEncoder
+    Stage1Trainer --> IBOTHead
+    Stage1Trainer --> IBOTLoss
+    Stage2Trainer --> CoCaModel
+    Stage3Trainer --> CoCaModel
+    WSIReader --> TissueSegmenter
+    TissueSegmenter --> WSITiler
+    WSITiler --> PatchFeatureExtractor
+    PatchFeatureExtractor --> FeatureGridBuilder
+    FeatureGridBuilder --> FeatureGrid
+    TITANEncoder --> ALiBi2D
+    CoCaModel --> TITANEncoder
+    CoCaModel --> TextEncoder
+    CoCaModel --> MultimodalDecoder
+    Evaluator --> EmbeddingService
+    Evaluator --> StatsAnalyzer
+```
+
+----------------------------------------
+[Program call flow]
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User
+    participant M as MainApp
+    participant C as ExperimentConfig
+    participant R as Registry
+    participant DR as DataPipeline(WSIReader/Segment/Tiler/Extractor/Grid)
+    participant D1 as Stage1Dataset
+    participant D2 as Stage2Dataset
+    participant D3 as Stage3Dataset
+    participant V as TITANEncoder
+    participant I as Stage1Trainer
+    participant CM as CoCaModel
+    participant T2 as Stage2Trainer
+    participant T3 as Stage3Trainer
+    participant E as EmbeddingService
+    participant EV as Evaluator
+    participant S as StatsAnalyzer
+    participant FS as FileStore(checkpoints/artifacts)
+
+    U->>M: python main.py --config configs/default.yaml --mode train_stage1
+    M->>C: from_yaml(path)
+    C-->>M: validated cfg
+    M->>R: register/create components
+
+    rect rgb(245,245,245)
+    Note over M,DR: Data preparation CRUD
+    M->>DR: read WSI metadata (Create dataset index)
+    DR->>DR: segment tissue masks
+    DR->>DR: tile 512x512 @20x
+    DR->>DR: extract 768-d patch features
+    DR->>DR: build/save feature grids + masks
+    DR->>FS: write .h5/.pt features (Create)
+    M->>DR: build tissue groups (Create)
+    DR->>FS: persist groups.json (Create)
+    M->>DR: verify/read cached artifacts (Read)
+    DR-->>M: ready paths
+    end
+
+    rect rgb(235,245,255)
+    Note over M,I: Stage 1 TITAN-V training
+    M->>R: create_dataset(stage1)
+    R-->>M: D1
+    M->>R: create_model(titan_encoder)
+    R-->>M: V
+    M->>R: create_trainer(stage1)
+    R-->>M: I
+    M->>I: fit(D1)
+    loop each epoch/iter
+        I->>D1: __getitem__() -> region crop
+        D1-->>I: 2 global + 10 local views
+        I->>V: forward(student/teacher views)
+        V-->>I: token embeddings
+        I->>I: compute iBOT loss + EMA teacher update
+        I->>I: optimizer/scheduler step
+    end
+    I->>FS: save titan_v.ckpt (Create/Update)
+    end
+
+    U->>M: python main.py --mode train_stage2 --init titan_v.ckpt
+    rect rgb(235,255,235)
+    Note over M,T2: Stage 2 ROI-caption CoCa alignment
+    M->>R: create_dataset(stage2)
+    R-->>M: D2
+    M->>R: create_model(coca_multimodal, init=titan_v)
+    R-->>M: CM
+    M->>R: create_trainer(stage2)
+    R-->>M: T2
+    M->>T2: fit(D2)
+    loop each epoch/iter
+        T2->>D2: __getitem__() -> MultimodalBatch
+        D2-->>T2: image grid + tokenized caption
+        T2->>CM: forward_contrastive(batch)
+        CM-->>T2: contrastive logits + decoder logits
+        T2->>T2: contrastive + caption loss backward
+    end
+    T2->>FS: save titan_stage2.ckpt (Create/Update)
+    end
+
+    U->>M: python main.py --mode train_stage3 --init titan_stage2.ckpt
+    rect rgb(255,245,235)
+    Note over M,T3: Stage 3 WSI-report CoCa alignment
+    M->>R: create_dataset(stage3)
+    R-->>M: D3
+    M->>R: create_trainer(stage3)
+    R-->>M: T3
+    M->>T3: fit(D3)
+    loop each epoch/iter
+        T3->>D3: __getitem__() -> 64x64 crop + report tokens
+        T3->>CM: forward_contrastive + forward_captioning
+        CM-->>T3: losses
+        T3->>T3: low-LR vision backbone update
+    end
+    T3->>FS: save titan_final.ckpt (Create/Update)
+    end
+
+    U->>M: python main.py --mode eval --ckpt titan_final.ckpt
+    M->>E: init(vision_model, text_model)
+    M->>EV: run all selected evaluations
+
+    par Linear/kNN/Few-shot
+        EV->>E: embed_slides(train/val/test)
+        E-->>EV: normalized embeddings
+        EV->>EV: linear_probe, knn_probe, few_shot
+    and Zero-shot
+        EV->>E: embed class prompts with text encoder
+        EV->>EV: nearest class by cosine similarity
+    and Slide retrieval
+        EV->>E: embed query/database slides
+        EV->>EV: Acc@1/3/5, MVAcc@5
+    and Cross-modal retrieval
+        EV->>E: embed slides + reports
+        EV->>EV: Recall@1/3/5/10, mean recall
+    and Report generation
+        EV->>CM: generate_report(num_beams=5)
+        CM-->>EV: generated text
+        EV->>EV: METEOR/ROUGE-1/BLEU-1
+    and Survival
+        EV->>E: patient-level embedding aggregation
+        EV->>EV: Cox PH with fold protocol
+    end
+
+    EV->>S: bootstrap/fold aggregation + GLMM pairwise tests
+    S-->>EV: statistical summary
+    EV->>FS: write metrics.json + plots.csv/png (Create/Update)
+    EV-->>M: consolidated report
+    M-->>U: done
+```
+
+----------------------------------------
+[Anything UNCLEAR]
+Unclear from the paper text alone: exact Supplementary hyperparameters (optimizer betas, LR schedule details, iBOT temperatures/centering/mask ratios, ALiBi per-head slopes, stage-2/3 loss weights, warmup lengths), exact tissue-group clustering thresholds, exact prompt templates for synthetic caption/report cleaning/rewriting, and full access to internal datasets (Mass-340K, Rare-Cancer internal, several MGB cohorts). Please confirm whether we should target a public-data-only reproduction first and treat missing hyperparameters as tunable defaults in config.
+

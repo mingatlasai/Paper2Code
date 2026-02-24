@@ -1,0 +1,913 @@
+"""Unified experiment logging utilities for TITAN reproduction.
+
+This module provides a config-driven logger that writes events and metrics to:
+- console (stream + optional log file),
+- JSONL event stream,
+- canonical metrics CSV,
+- summary JSON artifacts.
+
+It is designed to keep metric schemas consistent across preprocessing, training,
+and evaluation stages.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import logging
+import os
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+try:
+    import torch
+except Exception:  # pragma: no cover - torch import may be unavailable in lightweight tests
+    torch = None  # type: ignore[assignment]
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover - tensorboard is optional
+    SummaryWriter = None  # type: ignore[assignment]
+
+from src.core.utils import ensure_dir, ensure_parent_dir, write_json
+
+
+# -----------------------------------------------------------------------------
+# Config-locked defaults from provided config.yaml and task contract.
+# -----------------------------------------------------------------------------
+_DEFAULT_PATCH_SIZE_PX: int = 512
+_DEFAULT_MAGNIFICATION: str = "20x"
+_DEFAULT_FEATURE_DIM: int = 768
+_DEFAULT_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_DEFAULT_STAGE1_GLOBAL_VIEWS: int = 2
+_DEFAULT_STAGE1_GLOBAL_GRID: Tuple[int, int] = (14, 14)
+_DEFAULT_STAGE1_LOCAL_VIEWS: int = 10
+_DEFAULT_STAGE1_LOCAL_GRID: Tuple[int, int] = (6, 6)
+_DEFAULT_STAGE3_GRID: Tuple[int, int] = (64, 64)
+
+_DEFAULT_EMBED_DIM: int = 768
+_DEFAULT_NUM_LAYERS: int = 6
+_DEFAULT_NUM_HEADS: int = 12
+_DEFAULT_HEAD_DIM: int = 64
+_DEFAULT_MLP_DIM: int = 3072
+
+_DEFAULT_BOOTSTRAP_SAMPLES: int = 1000
+_DEFAULT_FEW_SHOT_RUNS: int = 50
+
+_DEFAULT_ENCODING: str = "utf-8"
+_DEFAULT_LOG_LEVEL: str = "INFO"
+_DEFAULT_STAGE: str = "unknown"
+_DEFAULT_SPLIT: str = "train"
+_DEFAULT_SEED: int = 42
+
+_CANONICAL_CSV_HEADERS: Tuple[str, ...] = (
+    "run_id",
+    "stage",
+    "event_type",
+    "split",
+    "epoch",
+    "global_step",
+    "metric",
+    "value",
+    "timestamp_utc",
+    "seed",
+    "fold",
+    "shot",
+    "bootstrap_id",
+    "dataset",
+    "model_name",
+    "context",
+)
+
+
+PathLike = Union[str, Path]
+
+
+class LoggingError(RuntimeError):
+    """Raised when logging operations fail."""
+
+
+@dataclass(frozen=True)
+class LoggingPaths:
+    """Filesystem destinations for logger sinks."""
+
+    root_dir: Path
+    logs_dir: Path
+    metrics_dir: Path
+    tables_dir: Path
+    console_log_path: Path
+    metrics_jsonl_path: Path
+    metrics_csv_path: Path
+    summary_json_path: Path
+
+
+@dataclass(frozen=True)
+class LoggerRuntimeContext:
+    """Immutable runtime context persisted with every run."""
+
+    run_id: str
+    stage: str = _DEFAULT_STAGE
+    seed: int = _DEFAULT_SEED
+    mode: Optional[str] = None
+    config_hash: Optional[str] = None
+
+
+class ExperimentLogger:
+    """Unified logger for console, JSONL, CSV, and summary artifacts.
+
+    The logger is process-safe for single process writes and is intended to be
+    used from main-rank only in distributed settings.
+    """
+
+    def __init__(
+        self,
+        run_dir: PathLike,
+        run_id: str,
+        stage: str = _DEFAULT_STAGE,
+        seed: int = _DEFAULT_SEED,
+        level: str = _DEFAULT_LOG_LEVEL,
+        save_json: bool = True,
+        save_csv: bool = True,
+        save_tensorboard: bool = False,
+        is_main_process: bool = True,
+        mode: Optional[str] = None,
+        config_snapshot: Optional[Mapping[str, Any]] = None,
+        config_hash: Optional[str] = None,
+    ) -> None:
+        """Initialize an ExperimentLogger.
+
+        Args:
+            run_dir: Per-run output root directory.
+            run_id: Stable run identifier.
+            stage: Stage or evaluation name.
+            seed: Reproducibility seed.
+            level: Python logging level.
+            save_json: Whether to emit JSONL event sink.
+            save_csv: Whether to emit canonical CSV metric sink.
+            save_tensorboard: Whether to enable tensorboard scalar logging.
+            is_main_process: Write artifacts only if True.
+            mode: Optional runtime mode (`train_stage1`, `eval`, etc.).
+            config_snapshot: Optional config mapping persisted in run metadata.
+            config_hash: Optional precomputed hash for config snapshot.
+        """
+        if not str(run_id).strip():
+            raise ValueError("run_id must be a non-empty string.")
+
+        self._lock: threading.RLock = threading.RLock()
+        self._is_main_process: bool = bool(is_main_process)
+        self._save_json: bool = bool(save_json)
+        self._save_csv: bool = bool(save_csv)
+        self._save_tensorboard: bool = bool(save_tensorboard)
+        self._closed: bool = False
+
+        self._context: LoggerRuntimeContext = LoggerRuntimeContext(
+            run_id=str(run_id).strip(),
+            stage=str(stage).strip() if str(stage).strip() else _DEFAULT_STAGE,
+            seed=int(seed),
+            mode=(str(mode).strip() if mode is not None else None),
+            config_hash=(str(config_hash).strip() if config_hash else None),
+        )
+
+        self._paths: LoggingPaths = self._build_paths(run_dir)
+        self._python_logger: logging.Logger = self._build_python_logger(level=level)
+        self._tb_writer: Optional[Any] = self._build_tensorboard_writer()
+
+        self._event_count: int = 0
+        self._metric_count: int = 0
+        self._last_step: int = 0
+        self._start_time_utc: str = self._timestamp_utc()
+
+        if self._is_main_process:
+            self._initialize_files_if_needed()
+            self._write_run_metadata(config_snapshot=config_snapshot)
+
+    # ------------------------------------------------------------------
+    # Public constructors
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_config(
+        cls,
+        cfg: Any,
+        run_dir: Optional[PathLike] = None,
+        run_id: Optional[str] = None,
+        stage: Optional[str] = None,
+        mode: Optional[str] = None,
+        is_main_process: bool = True,
+    ) -> "ExperimentLogger":
+        """Build logger from a config-like object.
+
+        Supported config shape: pydantic ExperimentConfig or mapping with keys:
+        - paths.output_root (fallback `./outputs`)
+        - logging.level/save_json/save_csv/save_tensorboard
+        - runtime.seed
+        - stage / mode
+        """
+        cfg_map: Dict[str, Any] = cls._cfg_to_mapping(cfg)
+
+        resolved_run_id: str = run_id or cls._build_default_run_id(
+            stage=stage or str(cfg_map.get("stage", _DEFAULT_STAGE)),
+            mode=mode or str(cfg_map.get("mode", "")),
+        )
+
+        paths_map: Mapping[str, Any] = cls._safe_mapping(cfg_map.get("paths", {}))
+        default_output_root: str = str(paths_map.get("output_root", "./outputs"))
+        resolved_run_dir: PathLike = run_dir or str(Path(default_output_root) / "runs" / resolved_run_id)
+
+        logging_map: Mapping[str, Any] = cls._safe_mapping(cfg_map.get("logging", {}))
+        runtime_map: Mapping[str, Any] = cls._safe_mapping(cfg_map.get("runtime", {}))
+
+        resolved_stage: str = str(stage or cfg_map.get("stage", _DEFAULT_STAGE))
+        resolved_mode: Optional[str] = mode or (str(cfg_map.get("mode")) if cfg_map.get("mode") is not None else None)
+
+        return cls(
+            run_dir=resolved_run_dir,
+            run_id=resolved_run_id,
+            stage=resolved_stage,
+            seed=int(runtime_map.get("seed", _DEFAULT_SEED)),
+            level=str(logging_map.get("level", _DEFAULT_LOG_LEVEL)),
+            save_json=bool(logging_map.get("save_json", True)),
+            save_csv=bool(logging_map.get("save_csv", True)),
+            save_tensorboard=bool(logging_map.get("save_tensorboard", False)),
+            is_main_process=is_main_process,
+            mode=resolved_mode,
+            config_snapshot=cfg_map,
+            config_hash=cls._extract_config_hash(cfg_map),
+        )
+
+    # ------------------------------------------------------------------
+    # Public event API
+    # ------------------------------------------------------------------
+    def info(self, message: str, context: Optional[Mapping[str, Any]] = None) -> None:
+        """Log an informational event."""
+        self.log_event(event_type="info", message=message, level="INFO", context=context)
+
+    def warning(self, message: str, context: Optional[Mapping[str, Any]] = None) -> None:
+        """Log a warning event."""
+        self.log_event(event_type="warning", message=message, level="WARNING", context=context)
+
+    def error(self, message: str, context: Optional[Mapping[str, Any]] = None) -> None:
+        """Log an error event."""
+        self.log_event(event_type="error", message=message, level="ERROR", context=context)
+
+    def log_event(
+        self,
+        event_type: str,
+        message: str,
+        level: str = "INFO",
+        context: Optional[Mapping[str, Any]] = None,
+        split: Optional[str] = None,
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+        dataset: Optional[str] = None,
+        model_name: Optional[str] = None,
+        fold: Optional[int] = None,
+        shot: Optional[int] = None,
+        bootstrap_id: Optional[int] = None,
+    ) -> None:
+        """Log a structured event row to active sinks."""
+        if self._closed:
+            raise LoggingError("Cannot log event after logger is closed.")
+
+        clean_event_type: str = str(event_type).strip() or "event"
+        clean_message: str = str(message).strip()
+        if not clean_message:
+            raise ValueError("message must be a non-empty string.")
+
+        record: Dict[str, Any] = self._build_base_record(
+            event_type=clean_event_type,
+            split=split,
+            epoch=epoch,
+            global_step=global_step,
+            dataset=dataset,
+            model_name=model_name,
+            fold=fold,
+            shot=shot,
+            bootstrap_id=bootstrap_id,
+            metric=None,
+            value=None,
+            context={"message": clean_message, **self._safe_mapping(context)},
+        )
+
+        with self._lock:
+            self._event_count += 1
+            if global_step is not None:
+                self._last_step = max(self._last_step, int(global_step))
+            self._emit_python_log(level=level, message=clean_message, context=context)
+            self._write_record(record)
+
+    def log_metrics(
+        self,
+        metrics: Mapping[str, Any],
+        split: str = _DEFAULT_SPLIT,
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+        dataset: Optional[str] = None,
+        model_name: Optional[str] = None,
+        fold: Optional[int] = None,
+        shot: Optional[int] = None,
+        bootstrap_id: Optional[int] = None,
+        context: Optional[Mapping[str, Any]] = None,
+        event_type: str = "metric",
+        tensorboard_prefix: Optional[str] = None,
+    ) -> None:
+        """Log one or more scalar metrics using canonical schema."""
+        if self._closed:
+            raise LoggingError("Cannot log metrics after logger is closed.")
+        if not isinstance(metrics, Mapping):
+            raise TypeError("metrics must be a mapping from metric name to scalar.")
+
+        clean_split: str = str(split).strip() if str(split).strip() else _DEFAULT_SPLIT
+        base_context: Dict[str, Any] = dict(self._safe_mapping(context))
+
+        with self._lock:
+            for raw_name, raw_value in metrics.items():
+                metric_name: str = self._canonical_metric_name(str(raw_name), split=clean_split)
+                metric_value: Optional[float] = self._coerce_scalar(raw_value)
+
+                record: Dict[str, Any] = self._build_base_record(
+                    event_type=event_type,
+                    split=clean_split,
+                    epoch=epoch,
+                    global_step=global_step,
+                    dataset=dataset,
+                    model_name=model_name,
+                    fold=fold,
+                    shot=shot,
+                    bootstrap_id=bootstrap_id,
+                    metric=metric_name,
+                    value=metric_value,
+                    context=base_context,
+                )
+
+                self._metric_count += 1
+                if global_step is not None:
+                    self._last_step = max(self._last_step, int(global_step))
+
+                self._write_record(record)
+                self._emit_tensorboard_scalar(
+                    metric_name=metric_name,
+                    metric_value=metric_value,
+                    step=global_step,
+                    prefix=tensorboard_prefix,
+                )
+
+            self._emit_python_log(
+                level="INFO",
+                message=f"Logged {len(metrics)} metric(s) for split='{clean_split}'.",
+                context={"epoch": epoch, "global_step": global_step, "dataset": dataset},
+            )
+
+    def log_checkpoint(
+        self,
+        checkpoint_path: PathLike,
+        epoch: Optional[int] = None,
+        global_step: Optional[int] = None,
+        is_best: bool = False,
+        context: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        """Log a checkpoint save event."""
+        record_context: Dict[str, Any] = {
+            "checkpoint_path": str(Path(checkpoint_path).expanduser()),
+            "is_best": bool(is_best),
+        }
+        record_context.update(self._safe_mapping(context))
+        self.log_event(
+            event_type="checkpoint",
+            message=f"Checkpoint saved: {record_context['checkpoint_path']}",
+            level="INFO",
+            context=record_context,
+            split="train",
+            epoch=epoch,
+            global_step=global_step,
+        )
+
+    def log_resume(
+        self,
+        resumed: bool,
+        checkpoint_path: Optional[PathLike],
+        start_epoch: int,
+        global_step: int,
+        optimizer_restored: bool,
+        scaler_restored: bool,
+    ) -> None:
+        """Log checkpoint resume metadata for auditability."""
+        message: str = "Resumed from checkpoint." if resumed else "Started without checkpoint resume."
+        self.log_event(
+            event_type="resume",
+            message=message,
+            level="INFO",
+            context={
+                "resumed": bool(resumed),
+                "checkpoint_path": (str(Path(checkpoint_path).expanduser()) if checkpoint_path else None),
+                "start_epoch": int(start_epoch),
+                "global_step": int(global_step),
+                "optimizer_restored": bool(optimizer_restored),
+                "scaler_restored": bool(scaler_restored),
+            },
+            split="train",
+            epoch=start_epoch,
+            global_step=global_step,
+        )
+
+    # ------------------------------------------------------------------
+    # Public artifact API
+    # ------------------------------------------------------------------
+    def export_table(
+        self,
+        name: str,
+        data: Union[pd.DataFrame, Sequence[Mapping[str, Any]]],
+        index: bool = False,
+    ) -> Path:
+        """Export a normalized table to `metrics/tables/{name}.csv`."""
+        if self._closed:
+            raise LoggingError("Cannot export table after logger is closed.")
+        if not str(name).strip():
+            raise ValueError("name must be a non-empty string.")
+
+        safe_name: str = str(name).strip().replace(" ", "_")
+        out_path: Path = ensure_parent_dir(self._paths.tables_dir / f"{safe_name}.csv")
+
+        if isinstance(data, pd.DataFrame):
+            frame: pd.DataFrame = data.copy()
+        else:
+            frame = pd.DataFrame([dict(item) for item in data])
+
+        frame.to_csv(out_path, index=index)
+        self.info(f"Exported table: {out_path}")
+        return out_path
+
+    def summarize(
+        self,
+        group_by: Optional[Sequence[str]] = None,
+        include_events: bool = False,
+        metric_filter_prefixes: Optional[Sequence[str]] = None,
+        save: bool = True,
+    ) -> Dict[str, Any]:
+        """Create and optionally persist summary statistics from metrics CSV.
+
+        Returns:
+            A summary dictionary with per-group mean/std/min/max/count.
+        """
+        if self._closed:
+            raise LoggingError("Cannot summarize after logger is closed.")
+
+        if not self._paths.metrics_csv_path.exists():
+            summary_empty: Dict[str, Any] = self._base_summary_payload(rows=0)
+            if save and self._is_main_process:
+                write_json(summary_empty, self._paths.summary_json_path)
+            return summary_empty
+
+        frame: pd.DataFrame = pd.read_csv(self._paths.metrics_csv_path)
+        if frame.empty:
+            summary_empty = self._base_summary_payload(rows=0)
+            if save and self._is_main_process:
+                write_json(summary_empty, self._paths.summary_json_path)
+            return summary_empty
+
+        filtered: pd.DataFrame = frame.copy()
+        if not include_events:
+            filtered = filtered[filtered["metric"].notna()]
+
+        if metric_filter_prefixes:
+            prefixes: Tuple[str, ...] = tuple(str(item) for item in metric_filter_prefixes)
+            metric_series: pd.Series = filtered["metric"].fillna("")
+            mask: pd.Series = metric_series.apply(lambda value: value.startswith(prefixes))
+            filtered = filtered[mask]
+
+        if filtered.empty:
+            summary_empty = self._base_summary_payload(rows=0)
+            if save and self._is_main_process:
+                write_json(summary_empty, self._paths.summary_json_path)
+            return summary_empty
+
+        numeric: pd.DataFrame = filtered[pd.to_numeric(filtered["value"], errors="coerce").notna()].copy()
+        numeric["value"] = pd.to_numeric(numeric["value"], errors="coerce")
+
+        effective_group_by: List[str] = list(group_by) if group_by else ["metric", "split", "dataset"]
+        effective_group_by = [column for column in effective_group_by if column in numeric.columns]
+        if not effective_group_by:
+            effective_group_by = ["metric"]
+
+        grouped = numeric.groupby(effective_group_by, dropna=False)["value"].agg(["count", "mean", "std", "min", "max"])
+        grouped = grouped.reset_index()
+
+        summary_payload: Dict[str, Any] = self._base_summary_payload(rows=int(len(filtered)))
+        summary_payload["aggregation"] = {
+            "group_by": effective_group_by,
+            "num_groups": int(len(grouped)),
+            "records": grouped.to_dict(orient="records"),
+        }
+
+        if save and self._is_main_process:
+            write_json(summary_payload, self._paths.summary_json_path)
+
+        return summary_payload
+
+    def write_summary(
+        self,
+        extra: Optional[Mapping[str, Any]] = None,
+        save: bool = True,
+    ) -> Dict[str, Any]:
+        """Write a concise terminal summary artifact for the run."""
+        payload: Dict[str, Any] = self._base_summary_payload(rows=self._metric_count + self._event_count)
+        payload["lifecycle"] = {
+            "events_logged": int(self._event_count),
+            "metrics_logged": int(self._metric_count),
+            "last_global_step": int(self._last_step),
+            "closed": bool(self._closed),
+        }
+        if extra:
+            payload["extra"] = self._to_serializable(dict(extra))
+
+        if save and self._is_main_process:
+            write_json(payload, self._paths.summary_json_path)
+
+        return payload
+
+    def flush(self) -> None:
+        """Flush sink handlers."""
+        with self._lock:
+            for handler in list(self._python_logger.handlers):
+                try:
+                    handler.flush()
+                except Exception:
+                    continue
+            if self._tb_writer is not None:
+                self._tb_writer.flush()
+
+    def close(self, write_final_summary: bool = True) -> None:
+        """Flush and close all sinks."""
+        if self._closed:
+            return
+
+        with self._lock:
+            if write_final_summary and self._is_main_process:
+                self.write_summary(save=True)
+
+            self.flush()
+
+            if self._tb_writer is not None:
+                self._tb_writer.close()
+                self._tb_writer = None
+
+            for handler in list(self._python_logger.handlers):
+                self._python_logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    continue
+
+            self._closed = True
+
+    # ------------------------------------------------------------------
+    # Convenience accessors
+    # ------------------------------------------------------------------
+    @property
+    def paths(self) -> LoggingPaths:
+        """Return logger sink paths."""
+        return self._paths
+
+    @property
+    def context(self) -> LoggerRuntimeContext:
+        """Return immutable runtime context."""
+        return self._context
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _build_paths(self, run_dir: PathLike) -> LoggingPaths:
+        root_dir: Path = ensure_dir(run_dir)
+        logs_dir: Path = ensure_dir(root_dir / "logs")
+        metrics_dir: Path = ensure_dir(root_dir / "metrics")
+        tables_dir: Path = ensure_dir(metrics_dir / "tables")
+
+        return LoggingPaths(
+            root_dir=root_dir,
+            logs_dir=logs_dir,
+            metrics_dir=metrics_dir,
+            tables_dir=tables_dir,
+            console_log_path=logs_dir / "console.log",
+            metrics_jsonl_path=logs_dir / "metrics.jsonl",
+            metrics_csv_path=metrics_dir / "metrics.csv",
+            summary_json_path=metrics_dir / "summary.json",
+        )
+
+    def _build_python_logger(self, level: str) -> logging.Logger:
+        logger_name: str = f"titan_logger.{self._context.run_id}.{os.getpid()}"
+        logger: logging.Logger = logging.getLogger(logger_name)
+        logger.setLevel(self._resolve_log_level(level))
+        logger.propagate = False
+
+        formatter: logging.Formatter = logging.Formatter(
+            fmt="%(asctime)s | %(levelname)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        stream_handler: logging.Handler = logging.StreamHandler()
+        stream_handler.setLevel(self._resolve_log_level(level))
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+        if self._is_main_process:
+            file_handler: logging.Handler = logging.FileHandler(self._paths.console_log_path, encoding=_DEFAULT_ENCODING)
+            file_handler.setLevel(self._resolve_log_level(level))
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+        return logger
+
+    def _build_tensorboard_writer(self) -> Optional[Any]:
+        if not self._save_tensorboard or not self._is_main_process:
+            return None
+        if SummaryWriter is None:
+            self._emit_python_log(
+                level="WARNING",
+                message="TensorBoard writer requested but unavailable; continuing without TensorBoard sink.",
+                context=None,
+            )
+            return None
+
+        tb_dir: Path = ensure_dir(self._paths.logs_dir / "tensorboard")
+        return SummaryWriter(log_dir=str(tb_dir))
+
+    def _initialize_files_if_needed(self) -> None:
+        if self._save_json and not self._paths.metrics_jsonl_path.exists():
+            ensure_parent_dir(self._paths.metrics_jsonl_path)
+            self._paths.metrics_jsonl_path.touch()
+
+        if self._save_csv and not self._paths.metrics_csv_path.exists():
+            ensure_parent_dir(self._paths.metrics_csv_path)
+            with self._paths.metrics_csv_path.open("w", newline="", encoding=_DEFAULT_ENCODING) as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(_CANONICAL_CSV_HEADERS))
+                writer.writeheader()
+
+    def _write_run_metadata(self, config_snapshot: Optional[Mapping[str, Any]]) -> None:
+        metadata: Dict[str, Any] = {
+            "run_id": self._context.run_id,
+            "stage": self._context.stage,
+            "mode": self._context.mode,
+            "seed": self._context.seed,
+            "config_hash": self._context.config_hash,
+            "start_time_utc": self._start_time_utc,
+            "paths": {
+                "root_dir": str(self._paths.root_dir),
+                "logs_dir": str(self._paths.logs_dir),
+                "metrics_dir": str(self._paths.metrics_dir),
+                "tables_dir": str(self._paths.tables_dir),
+            },
+            "paper_constants": {
+                "patch_size_px": _DEFAULT_PATCH_SIZE_PX,
+                "magnification": _DEFAULT_MAGNIFICATION,
+                "patch_feature_dim": _DEFAULT_FEATURE_DIM,
+                "stage1_region_grid": list(_DEFAULT_STAGE1_REGION_GRID),
+                "stage1_global_views": _DEFAULT_STAGE1_GLOBAL_VIEWS,
+                "stage1_global_grid": list(_DEFAULT_STAGE1_GLOBAL_GRID),
+                "stage1_local_views": _DEFAULT_STAGE1_LOCAL_VIEWS,
+                "stage1_local_grid": list(_DEFAULT_STAGE1_LOCAL_GRID),
+                "stage3_grid": list(_DEFAULT_STAGE3_GRID),
+                "embed_dim": _DEFAULT_EMBED_DIM,
+                "num_layers": _DEFAULT_NUM_LAYERS,
+                "num_heads": _DEFAULT_NUM_HEADS,
+                "head_dim": _DEFAULT_HEAD_DIM,
+                "mlp_dim": _DEFAULT_MLP_DIM,
+                "bootstrap_samples": _DEFAULT_BOOTSTRAP_SAMPLES,
+                "few_shot_runs": _DEFAULT_FEW_SHOT_RUNS,
+            },
+            "config_snapshot": self._to_serializable(dict(config_snapshot)) if config_snapshot is not None else None,
+        }
+        write_json(metadata, self._paths.logs_dir / "run_metadata.json")
+
+    def _build_base_record(
+        self,
+        event_type: str,
+        split: Optional[str],
+        epoch: Optional[int],
+        global_step: Optional[int],
+        dataset: Optional[str],
+        model_name: Optional[str],
+        fold: Optional[int],
+        shot: Optional[int],
+        bootstrap_id: Optional[int],
+        metric: Optional[str],
+        value: Optional[float],
+        context: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        return {
+            "run_id": self._context.run_id,
+            "stage": self._context.stage,
+            "event_type": str(event_type),
+            "split": str(split).strip() if split else _DEFAULT_SPLIT,
+            "epoch": int(epoch) if epoch is not None else None,
+            "global_step": int(global_step) if global_step is not None else None,
+            "metric": metric,
+            "value": value,
+            "timestamp_utc": self._timestamp_utc(),
+            "seed": int(self._context.seed),
+            "fold": int(fold) if fold is not None else None,
+            "shot": int(shot) if shot is not None else None,
+            "bootstrap_id": int(bootstrap_id) if bootstrap_id is not None else None,
+            "dataset": str(dataset) if dataset is not None else None,
+            "model_name": str(model_name) if model_name is not None else None,
+            "context": json.dumps(self._to_serializable(self._safe_mapping(context)), ensure_ascii=True, sort_keys=True),
+        }
+
+    def _write_record(self, record: Mapping[str, Any]) -> None:
+        if not self._is_main_process:
+            return
+
+        payload: Dict[str, Any] = dict(record)
+
+        if self._save_json:
+            with self._paths.metrics_jsonl_path.open("a", encoding=_DEFAULT_ENCODING) as handle:
+                handle.write(json.dumps(self._to_serializable(payload), ensure_ascii=True, sort_keys=True))
+                handle.write("\n")
+
+        if self._save_csv:
+            with self._paths.metrics_csv_path.open("a", newline="", encoding=_DEFAULT_ENCODING) as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(_CANONICAL_CSV_HEADERS))
+                writer.writerow(self._csv_row_from_record(payload))
+
+    def _csv_row_from_record(self, record: Mapping[str, Any]) -> Dict[str, Any]:
+        row: Dict[str, Any] = {}
+        for key in _CANONICAL_CSV_HEADERS:
+            row[key] = record.get(key)
+        return row
+
+    def _emit_python_log(
+        self,
+        level: str,
+        message: str,
+        context: Optional[Mapping[str, Any]],
+    ) -> None:
+        clean_level: int = self._resolve_log_level(level)
+        if context:
+            rendered_context: str = json.dumps(self._to_serializable(dict(context)), ensure_ascii=True, sort_keys=True)
+            full_message: str = f"{message} | context={rendered_context}"
+        else:
+            full_message = message
+        self._python_logger.log(clean_level, full_message)
+
+    def _emit_tensorboard_scalar(
+        self,
+        metric_name: str,
+        metric_value: Optional[float],
+        step: Optional[int],
+        prefix: Optional[str],
+    ) -> None:
+        if self._tb_writer is None:
+            return
+        if metric_value is None:
+            return
+
+        clean_tag: str = f"{prefix}/{metric_name}" if prefix else metric_name
+        clean_step: int = int(step) if step is not None else self._last_step
+        self._tb_writer.add_scalar(clean_tag, float(metric_value), clean_step)
+
+    def _base_summary_payload(self, rows: int) -> Dict[str, Any]:
+        return {
+            "run_id": self._context.run_id,
+            "stage": self._context.stage,
+            "mode": self._context.mode,
+            "seed": int(self._context.seed),
+            "config_hash": self._context.config_hash,
+            "start_time_utc": self._start_time_utc,
+            "end_time_utc": self._timestamp_utc(),
+            "num_rows": int(rows),
+            "expected_protocol": {
+                "bootstrap_samples": _DEFAULT_BOOTSTRAP_SAMPLES,
+                "few_shot_runs": _DEFAULT_FEW_SHOT_RUNS,
+            },
+        }
+
+    @staticmethod
+    def _timestamp_utc() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _resolve_log_level(level: str) -> int:
+        clean_level: str = str(level).upper().strip()
+        return getattr(logging, clean_level, logging.INFO)
+
+    @staticmethod
+    def _safe_mapping(value: Any) -> Mapping[str, Any]:
+        if isinstance(value, Mapping):
+            return value
+        return {}
+
+    @staticmethod
+    def _coerce_scalar(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+
+        if isinstance(value, (bool, np.bool_)):
+            return float(bool(value))
+
+        if torch is not None and isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise TypeError("Metric tensor values must be scalar (numel == 1).")
+            return float(value.detach().cpu().item())
+
+        if isinstance(value, np.ndarray):
+            if value.size != 1:
+                raise TypeError("Metric ndarray values must be scalar (size == 1).")
+            return float(value.reshape(-1)[0])
+
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return float(value)
+
+        raise TypeError(f"Unsupported metric scalar type: {type(value).__name__}")
+
+    @staticmethod
+    def _canonical_metric_name(metric: str, split: str) -> str:
+        clean_metric: str = str(metric).strip()
+        clean_split: str = str(split).strip() if str(split).strip() else _DEFAULT_SPLIT
+
+        if "/" in clean_metric:
+            return clean_metric
+
+        return f"{clean_split}/{clean_metric}"
+
+    @staticmethod
+    def _to_serializable(obj: Any) -> Any:
+        if obj is None or isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, datetime):
+            return obj.astimezone(timezone.utc).isoformat()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if torch is not None and isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().tolist()
+        if isinstance(obj, Mapping):
+            return {str(k): ExperimentLogger._to_serializable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, set)):
+            return [ExperimentLogger._to_serializable(v) for v in obj]
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
+            return ExperimentLogger._to_serializable(obj.model_dump())
+        if hasattr(obj, "dict") and callable(obj.dict):
+            return ExperimentLogger._to_serializable(obj.dict())
+        if hasattr(obj, "__dict__"):
+            return ExperimentLogger._to_serializable(vars(obj))
+        return str(obj)
+
+    @staticmethod
+    def _cfg_to_mapping(cfg: Any) -> Dict[str, Any]:
+        if cfg is None:
+            return {}
+        if isinstance(cfg, dict):
+            return dict(cfg)
+        if hasattr(cfg, "model_dump") and callable(cfg.model_dump):
+            payload: Any = cfg.model_dump()
+            if isinstance(payload, dict):
+                return dict(payload)
+        if hasattr(cfg, "dict") and callable(cfg.dict):
+            payload = cfg.dict()
+            if isinstance(payload, dict):
+                return dict(payload)
+        if hasattr(cfg, "__dict__"):
+            payload = vars(cfg)
+            if isinstance(payload, dict):
+                return dict(payload)
+        raise TypeError("Unsupported cfg type for conversion to mapping.")
+
+    @staticmethod
+    def _extract_config_hash(cfg_map: Mapping[str, Any]) -> Optional[str]:
+        # Preserve externally computed hash when available.
+        direct_hash: Any = cfg_map.get("config_hash")
+        if isinstance(direct_hash, str) and direct_hash.strip():
+            return direct_hash.strip()
+
+        notes_map: Mapping[str, Any] = ExperimentLogger._safe_mapping(cfg_map.get("notes", {}))
+        maybe_hash: Any = notes_map.get("config_hash")
+        if isinstance(maybe_hash, str) and maybe_hash.strip():
+            return maybe_hash.strip()
+
+        return None
+
+    @staticmethod
+    def _build_default_run_id(stage: str, mode: str) -> str:
+        stage_token: str = str(stage).strip() if str(stage).strip() else _DEFAULT_STAGE
+        mode_token: str = str(mode).strip() if str(mode).strip() else "run"
+        ts: str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"{stage_token}_{mode_token}_{ts}"
+
+
+__all__ = [
+    "LoggingError",
+    "LoggingPaths",
+    "LoggerRuntimeContext",
+    "ExperimentLogger",
+]

@@ -1,0 +1,624 @@
+"""Top-level CLI entrypoint for TITAN reproduction workflows.
+
+This module provides a single config-driven dispatcher over five modes:
+- prepare_data
+- train_stage1
+- train_stage2
+- train_stage3
+- eval
+
+Design goals:
+- Keep orchestration in one place with strict, fail-fast validation.
+- Reuse stage/eval runners from ``scripts/*`` without re-implementing logic.
+- Bind all critical constants and defaults to the provided config schema.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from time import perf_counter
+from typing import Any, Dict, List, Optional, Sequence
+
+from scripts.prepare_public_data import PrepareConfig, PublicDataPreparer
+from scripts.run_eval import EvalCliArgs, EvalOrchestrator
+from scripts.run_stage1 import Stage1CliArgs, run_stage1
+from scripts.run_stage2 import Stage2CliArgs, run_stage2
+from scripts.run_stage3 import Stage3CliArgs, run_stage3
+from src.core.config_schema import (
+    ConfigLoadError,
+    ConfigValidationError,
+    ExperimentConfig,
+)
+from src.core.registry import Registry
+from src.core.utils import (
+    collect_runtime_metadata,
+    config_hash,
+    ensure_dir,
+    seed_everything,
+    validate_repro_constants,
+    write_json,
+)
+
+
+# -----------------------------------------------------------------------------
+# Config-locked defaults/constants from project contract.
+# -----------------------------------------------------------------------------
+_DEFAULT_CONFIG_PRIMARY: str = "config.yaml"
+_DEFAULT_CONFIG_FALLBACK: str = "configs/default.yaml"
+
+_ALLOWED_MODES: tuple[str, ...] = (
+    "prepare_data",
+    "train_stage1",
+    "train_stage2",
+    "train_stage3",
+    "eval",
+)
+
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+_STAGE1_REGION_GRID: tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: tuple[int, int] = (64, 64)
+
+
+class MainAppError(RuntimeError):
+    """Base exception for top-level main orchestration failures."""
+
+
+class MainAppConfigError(MainAppError):
+    """Raised when loading or validating configuration fails."""
+
+
+class MainAppDependencyError(MainAppError):
+    """Raised when required input artifacts are missing."""
+
+
+@dataclass(frozen=True)
+class CliArgs:
+    """CLI argument contract for main entrypoint."""
+
+    mode: str
+    config: str
+    output_dir: Optional[str]
+    seed: Optional[int]
+
+    init_ckpt: Optional[str]
+    resume: Optional[str]
+    ckpt: Optional[str]
+
+    tasks: str
+    metadata_csv: Optional[str]
+    bootstrap_n: Optional[int]
+    few_shot_runs: Optional[int]
+    strict_task_fail: bool
+    save_embeddings: bool
+
+    batch_size: Optional[int]
+    epochs: Optional[int]
+    grad_accum_steps: Optional[int]
+    num_workers: Optional[int]
+    mixed_precision: bool
+    disable_mixed_precision: bool
+
+    wsi_root: Optional[str]
+    meta_csv: Optional[str]
+    encoder_name: Optional[str]
+    encoder_ckpt_path: Optional[str]
+    force_rebuild: bool
+    validate_only: bool
+
+
+@dataclass(frozen=True)
+class RunSummary:
+    """Serializable run summary written by main entrypoint."""
+
+    status: str
+    mode: str
+    config_path: str
+    elapsed_sec: float
+    output_root: str
+    artifacts: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert summary to a JSON-serializable mapping."""
+        return {
+            "status": str(self.status),
+            "mode": str(self.mode),
+            "config_path": str(self.config_path),
+            "elapsed_sec": float(self.elapsed_sec),
+            "output_root": str(self.output_root),
+            "artifacts": dict(self.artifacts),
+        }
+
+
+class MainApp:
+    """Single-entry orchestrator for TITAN reproduction modes."""
+
+    def __init__(self, cfg_path: str) -> None:
+        resolved_cfg_path: Path = self._resolve_config_path(cfg_path)
+        self.config_path: Path = resolved_cfg_path
+
+        try:
+            cfg: ExperimentConfig = ExperimentConfig.from_yaml(str(resolved_cfg_path))
+        except (ConfigLoadError, ConfigValidationError) as exc:
+            raise MainAppConfigError(f"Failed loading config '{resolved_cfg_path}': {exc}") from exc
+
+        cfg.validate()
+        validate_repro_constants(cfg)
+
+        self.cfg: ExperimentConfig = cfg
+        self.registry: Registry = Registry(auto_register_defaults=True)
+
+    def run(self, args: CliArgs) -> RunSummary:
+        """Run one mode and return run summary."""
+        mode: str = str(args.mode).strip().lower()
+        if mode not in _ALLOWED_MODES:
+            raise MainAppError(f"Unsupported mode '{mode}'. Allowed values: {list(_ALLOWED_MODES)}")
+
+        self._apply_main_overrides(args)
+        self._validate_main_invariants(self.cfg)
+
+        seed_everything(
+            seed=int(self.cfg.runtime.seed),
+            deterministic=bool(self.cfg.runtime.deterministic),
+        )
+
+        run_start: float = perf_counter()
+
+        artifacts: Dict[str, Any]
+        if mode == "prepare_data":
+            artifacts = self._run_prepare_data(args)
+        elif mode == "train_stage1":
+            artifacts = self._run_train_stage1(args)
+        elif mode == "train_stage2":
+            artifacts = self._run_train_stage2(args)
+        elif mode == "train_stage3":
+            artifacts = self._run_train_stage3(args)
+        elif mode == "eval":
+            artifacts = self._run_eval(args)
+        else:
+            raise MainAppError(f"Unhandled mode '{mode}'.")
+
+        elapsed_sec: float = perf_counter() - run_start
+        summary: RunSummary = RunSummary(
+            status="success",
+            mode=mode,
+            config_path=str(self.config_path),
+            elapsed_sec=elapsed_sec,
+            output_root=str(Path(self.cfg.paths.output_root).expanduser().resolve()),
+            artifacts=artifacts,
+        )
+
+        self._write_main_summary(summary=summary, mode=mode)
+        return summary
+
+    def _run_prepare_data(self, args: CliArgs) -> Dict[str, Any]:
+        data_cfg = self.cfg.data
+        prepare_cfg: PrepareConfig = PrepareConfig(
+            config_path=str(self.config_path),
+            wsi_root=str(args.wsi_root) if args.wsi_root is not None else str(data_cfg.wsi_root),
+            meta_csv=str(args.meta_csv) if args.meta_csv is not None else str(data_cfg.meta_csv),
+            output_root=str(Path(self.cfg.paths.data_root).expanduser().resolve() / "processed"),
+            patch_size_px=int(data_cfg.patch_size),
+            magnification=str(data_cfg.magnification),
+            feature_dim=int(data_cfg.feature_dim),
+            roi_region_grid_size=tuple(int(v) for v in data_cfg.roi_region_grid_size),
+            stage3_wsi_crop_grid_size=tuple(int(v) for v in data_cfg.stage3_wsi_crop_grid_size),
+            features_filename=str(self.cfg.artifacts.features_h5_name),
+            grid_filename=str(self.cfg.artifacts.feature_grid_name),
+            groups_filename=str(self.cfg.artifacts.tissue_groups_name),
+            splits_filename=str(self.cfg.artifacts.splits_csv_name),
+            pairs_filename=str(self.cfg.artifacts.pairs_jsonl_name),
+            tissue_group_min_patches=int(data_cfg.tissue_grouping.min_patches),
+            min_tissue_ratio=float(data_cfg.min_tissue_ratio),
+            thumbnail_max_side=2048,
+            encoder_name=str(args.encoder_name) if args.encoder_name is not None else "conch",
+            encoder_ckpt_path=(
+                str(args.encoder_ckpt_path) if args.encoder_ckpt_path is not None else ""
+            ),
+            seed=int(self.cfg.runtime.seed),
+            force_rebuild=bool(args.force_rebuild),
+            validate_only=bool(args.validate_only),
+            pairs_manifest_path=str(data_cfg.manifests.roi_caption_pairs_jsonl),
+            pairs_stage="stage2",
+            build_pairs_cache=False,
+        )
+
+        summary_obj = PublicDataPreparer(cfg=prepare_cfg).run()
+        processed_root: Path = Path(prepare_cfg.output_root).expanduser().resolve()
+        return {
+            "processed_root": str(processed_root),
+            "summary": summary_obj.to_dict(),
+            "groups_path": str(processed_root / prepare_cfg.groups_filename),
+            "splits_path": str(processed_root / prepare_cfg.splits_filename),
+        }
+
+    def _run_train_stage1(self, args: CliArgs) -> Dict[str, Any]:
+        stage_args: Stage1CliArgs = Stage1CliArgs(
+            config=str(self.config_path),
+            resume=args.resume,
+            output_dir=args.output_dir,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            num_workers=args.num_workers,
+            mixed_precision=(True if args.mixed_precision else None),
+            disable_mixed_precision=bool(args.disable_mixed_precision),
+        )
+        exit_code: int = run_stage1(stage_args)
+        if exit_code != 0:
+            raise MainAppError(f"train_stage1 failed with exit_code={exit_code}.")
+
+        output_root: Path = Path(self.cfg.paths.output_root).expanduser().resolve()
+        return {
+            "exit_code": int(exit_code),
+            "checkpoint": str(output_root / self.cfg.artifacts.stage1_checkpoint_name),
+        }
+
+    def _run_train_stage2(self, args: CliArgs) -> Dict[str, Any]:
+        init_ckpt: Path = self._resolve_required_checkpoint(
+            explicit=args.init_ckpt,
+            config_default=self.cfg.init_checkpoints.stage2_from,
+            fallback_names=(self.cfg.artifacts.stage1_checkpoint_name,),
+            stage_name="train_stage2",
+        )
+
+        stage_args: Stage2CliArgs = Stage2CliArgs(
+            config=str(self.config_path),
+            init=str(init_ckpt),
+            resume=args.resume,
+            output_dir=args.output_dir,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            grad_accum_steps=args.grad_accum_steps,
+            num_workers=args.num_workers,
+            mixed_precision=(True if args.mixed_precision else None),
+            disable_mixed_precision=bool(args.disable_mixed_precision),
+        )
+        exit_code: int = run_stage2(stage_args)
+        if exit_code != 0:
+            raise MainAppError(f"train_stage2 failed with exit_code={exit_code}.")
+
+        output_root: Path = Path(self.cfg.paths.output_root).expanduser().resolve()
+        return {
+            "exit_code": int(exit_code),
+            "init_checkpoint": str(init_ckpt),
+            "checkpoint": str(output_root / self.cfg.artifacts.stage2_checkpoint_name),
+        }
+
+    def _run_train_stage3(self, args: CliArgs) -> Dict[str, Any]:
+        init_ckpt: Path = self._resolve_required_checkpoint(
+            explicit=args.init_ckpt,
+            config_default=self.cfg.init_checkpoints.stage3_from,
+            fallback_names=(self.cfg.artifacts.stage2_checkpoint_name,),
+            stage_name="train_stage3",
+        )
+
+        stage_args: Stage3CliArgs = Stage3CliArgs(
+            config=str(self.config_path),
+            init=str(init_ckpt),
+            resume=args.resume,
+            output_dir=args.output_dir,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            grad_accum_steps=args.grad_accum_steps,
+            num_workers=args.num_workers,
+            mixed_precision=(True if args.mixed_precision else None),
+            disable_mixed_precision=bool(args.disable_mixed_precision),
+        )
+        exit_code: int = run_stage3(stage_args)
+        if exit_code != 0:
+            raise MainAppError(f"train_stage3 failed with exit_code={exit_code}.")
+
+        output_root: Path = Path(self.cfg.paths.output_root).expanduser().resolve()
+        return {
+            "exit_code": int(exit_code),
+            "init_checkpoint": str(init_ckpt),
+            "checkpoint": str(output_root / self.cfg.artifacts.stage3_checkpoint_name),
+        }
+
+    def _run_eval(self, args: CliArgs) -> Dict[str, Any]:
+        eval_ckpt: Optional[str] = args.ckpt
+        if eval_ckpt is None:
+            if self.cfg.init_checkpoints.eval_from:
+                eval_ckpt = str(self.cfg.init_checkpoints.eval_from)
+            else:
+                # Optional pre-resolution for a clearer error message.
+                candidate: Optional[Path] = self._resolve_optional_checkpoint(
+                    fallback_names=(
+                        self.cfg.artifacts.stage3_checkpoint_name,
+                        self.cfg.artifacts.stage2_checkpoint_name,
+                        self.cfg.artifacts.stage1_checkpoint_name,
+                    )
+                )
+                eval_ckpt = str(candidate) if candidate is not None else None
+
+        eval_args: EvalCliArgs = EvalCliArgs(
+            config=str(self.config_path),
+            ckpt=eval_ckpt,
+            tasks=str(args.tasks),
+            metadata_csv=args.metadata_csv,
+            output_dir=args.output_dir,
+            seed=args.seed,
+            bootstrap_n=args.bootstrap_n,
+            few_shot_runs=args.few_shot_runs,
+            strict_task_fail=bool(args.strict_task_fail),
+            save_embeddings=bool(args.save_embeddings),
+        )
+
+        orchestrator: EvalOrchestrator = EvalOrchestrator(args=eval_args)
+        payload: Dict[str, Any] = orchestrator.run()
+        return {
+            "checkpoint": eval_ckpt,
+            "eval_report": str(orchestrator.eval_output_dir / "eval_report.json"),
+            "tasks_completed": payload.get("tasks_completed", []),
+            "tasks_failed": payload.get("tasks_failed", []),
+        }
+
+    def _apply_main_overrides(self, args: CliArgs) -> None:
+        if args.seed is not None:
+            self.cfg.runtime.seed = int(args.seed)
+
+        if args.num_workers is not None:
+            self.cfg.runtime.num_workers = int(args.num_workers)
+
+        if args.output_dir is not None and str(args.output_dir).strip() != "":
+            out_root: Path = Path(args.output_dir).expanduser().resolve()
+            self.cfg.paths.output_root = str(out_root)
+            self.cfg.paths.logs_root = str(out_root / "logs")
+            self.cfg.paths.checkpoints_root = str(out_root / "checkpoints")
+            self.cfg.paths.artifacts_root = str(out_root / "artifacts")
+
+        self.cfg.validate()
+        validate_repro_constants(self.cfg)
+
+    def _validate_main_invariants(self, cfg: ExperimentConfig) -> None:
+        if int(cfg.data.patch_size) != _PATCH_SIZE_PX:
+            raise MainAppConfigError(
+                f"data.patch_size must be {_PATCH_SIZE_PX}, got {cfg.data.patch_size}."
+            )
+        if str(cfg.data.magnification) != _MAGNIFICATION:
+            raise MainAppConfigError(
+                f"data.magnification must be '{_MAGNIFICATION}', got '{cfg.data.magnification}'."
+            )
+        if int(cfg.data.feature_dim) != _FEATURE_DIM:
+            raise MainAppConfigError(
+                f"data.feature_dim must be {_FEATURE_DIM}, got {cfg.data.feature_dim}."
+            )
+        if tuple(cfg.data.roi_region_grid_size) != _Stage1_REGION_GRID:
+            raise MainAppConfigError(
+                "data.roi_region_grid_size mismatch: "
+                f"expected {_STAGE1_REGION_GRID}, got {tuple(cfg.data.roi_region_grid_size)}"
+            )
+        if tuple(cfg.data.stage3_wsi_crop_grid_size) != _STAGE3_CROP_GRID:
+            raise MainAppConfigError(
+                "data.stage3_wsi_crop_grid_size mismatch: "
+                f"expected {_STAGE3_CROP_GRID}, got {tuple(cfg.data.stage3_wsi_crop_grid_size)}"
+            )
+
+    def _resolve_required_checkpoint(
+        self,
+        explicit: Optional[str],
+        config_default: Optional[str],
+        fallback_names: Sequence[str],
+        stage_name: str,
+    ) -> Path:
+        if explicit is not None and str(explicit).strip() != "":
+            explicit_path: Path = Path(explicit).expanduser().resolve()
+            if explicit_path.exists() and explicit_path.is_file():
+                return explicit_path
+            raise MainAppDependencyError(
+                f"{stage_name}: explicit checkpoint not found: {explicit_path}"
+            )
+
+        if config_default is not None and str(config_default).strip() != "":
+            cfg_path: Path = Path(config_default).expanduser().resolve()
+            if cfg_path.exists() and cfg_path.is_file():
+                return cfg_path
+
+        resolved_optional: Optional[Path] = self._resolve_optional_checkpoint(fallback_names=fallback_names)
+        if resolved_optional is not None:
+            return resolved_optional
+
+        searched_paths: List[str] = self._candidate_checkpoint_strings(fallback_names)
+        raise MainAppDependencyError(
+            f"{stage_name}: unable to resolve required init checkpoint. Searched: {searched_paths}"
+        )
+
+    def _resolve_optional_checkpoint(self, fallback_names: Sequence[str]) -> Optional[Path]:
+        for candidate in self._candidate_checkpoints(fallback_names):
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
+
+    def _candidate_checkpoints(self, names: Sequence[str]) -> List[Path]:
+        names_list: List[str] = [str(name).strip() for name in names if str(name).strip()]
+        checkpoints_root: Path = Path(self.cfg.paths.checkpoints_root).expanduser().resolve()
+        output_root: Path = Path(self.cfg.paths.output_root).expanduser().resolve()
+        candidates: List[Path] = []
+        for filename in names_list:
+            candidates.append(checkpoints_root / filename)
+            candidates.append(output_root / filename)
+        return candidates
+
+    def _candidate_checkpoint_strings(self, names: Sequence[str]) -> List[str]:
+        return [str(path) for path in self._candidate_checkpoints(names)]
+
+    def _write_main_summary(self, summary: RunSummary, mode: str) -> None:
+        output_root: Path = ensure_dir(self.cfg.paths.output_root)
+        run_dir: Path = ensure_dir(output_root / "main_runs")
+
+        timestamp: str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        payload: Dict[str, Any] = {
+            "summary": summary.to_dict(),
+            "runtime_metadata": collect_runtime_metadata(),
+            "config_hash": config_hash(self.cfg),
+            "mode": str(mode),
+            "config_snapshot": self.cfg.model_dump(),
+        }
+        write_json(payload, run_dir / f"{mode}_{timestamp}.json")
+
+    @staticmethod
+    def _resolve_config_path(requested_path: str) -> Path:
+        cleaned: str = str(requested_path).strip()
+        if cleaned:
+            candidate: Path = Path(cleaned).expanduser().resolve()
+            if candidate.exists() and candidate.is_file():
+                return candidate
+            raise MainAppConfigError(f"Config file not found: {candidate}")
+
+        primary: Path = Path(_DEFAULT_CONFIG_PRIMARY).expanduser().resolve()
+        if primary.exists() and primary.is_file():
+            return primary
+
+        fallback: Path = Path(_DEFAULT_CONFIG_FALLBACK).expanduser().resolve()
+        if fallback.exists() and fallback.is_file():
+            return fallback
+
+        raise MainAppConfigError(
+            "No config file found. Expected either "
+            f"'{_DEFAULT_CONFIG_PRIMARY}' or '{_DEFAULT_CONFIG_FALLBACK}'."
+        )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="Main dispatcher for TITAN reproduction pipeline.",
+    )
+
+    parser.add_argument(
+        "--mode",
+        type=str,
+        required=True,
+        choices=list(_ALLOWED_MODES),
+        help="Execution mode.",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=_DEFAULT_CONFIG_PRIMARY,
+        help=(
+            "Config path. Defaults to 'config.yaml'; if missing, "
+            f"falls back to '{_DEFAULT_CONFIG_FALLBACK}'."
+        ),
+    )
+
+    parser.add_argument("--output-dir", type=str, default=None, help="Override output root.")
+    parser.add_argument("--seed", type=int, default=None, help="Override runtime seed.")
+
+    parser.add_argument("--init-ckpt", type=str, default=None, help="Stage init checkpoint path.")
+    parser.add_argument("--resume", type=str, default=None, help="Resume checkpoint path.")
+    parser.add_argument("--ckpt", type=str, default=None, help="Evaluation checkpoint path.")
+
+    parser.add_argument("--tasks", type=str, default="all", help="Eval tasks list for eval mode.")
+    parser.add_argument("--metadata-csv", type=str, default=None, help="Eval metadata CSV override.")
+    parser.add_argument("--bootstrap-n", type=int, default=None, help="Eval bootstrap override.")
+    parser.add_argument("--few-shot-runs", type=int, default=None, help="Eval few-shot runs override.")
+    parser.add_argument(
+        "--strict-task-fail",
+        action="store_true",
+        help="Fail eval mode on first task error.",
+    )
+    parser.add_argument(
+        "--save-embeddings",
+        action="store_true",
+        help="Persist eval slide embeddings.",
+    )
+
+    parser.add_argument("--batch-size", type=int, default=None, help="Train batch size override.")
+    parser.add_argument("--epochs", type=int, default=None, help="Stage1 epochs override.")
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Train grad accumulation override.",
+    )
+    parser.add_argument("--num-workers", type=int, default=None, help="DataLoader worker override.")
+    parser.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        help="Force-enable mixed precision in train modes.",
+    )
+    parser.add_argument(
+        "--disable-mixed-precision",
+        action="store_true",
+        help="Force-disable mixed precision in train modes.",
+    )
+
+    parser.add_argument("--wsi-root", type=str, default=None, help="prepare_data WSI root override.")
+    parser.add_argument("--meta-csv", type=str, default=None, help="prepare_data metadata CSV override.")
+    parser.add_argument("--encoder-name", type=str, default=None, help="prepare_data encoder name.")
+    parser.add_argument(
+        "--encoder-ckpt-path",
+        type=str,
+        default=None,
+        help="prepare_data patch encoder checkpoint path.",
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="prepare_data: recompute artifacts even when existing.",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="prepare_data: validate and skip writing artifacts.",
+    )
+
+    return parser
+
+
+def _parse_args() -> CliArgs:
+    namespace: argparse.Namespace = _build_parser().parse_args()
+    return CliArgs(
+        mode=str(namespace.mode),
+        config=str(namespace.config),
+        output_dir=(str(namespace.output_dir) if namespace.output_dir else None),
+        seed=(int(namespace.seed) if namespace.seed is not None else None),
+        init_ckpt=(str(namespace.init_ckpt) if namespace.init_ckpt else None),
+        resume=(str(namespace.resume) if namespace.resume else None),
+        ckpt=(str(namespace.ckpt) if namespace.ckpt else None),
+        tasks=str(namespace.tasks),
+        metadata_csv=(str(namespace.metadata_csv) if namespace.metadata_csv else None),
+        bootstrap_n=(int(namespace.bootstrap_n) if namespace.bootstrap_n is not None else None),
+        few_shot_runs=(
+            int(namespace.few_shot_runs) if namespace.few_shot_runs is not None else None
+        ),
+        strict_task_fail=bool(namespace.strict_task_fail),
+        save_embeddings=bool(namespace.save_embeddings),
+        batch_size=(int(namespace.batch_size) if namespace.batch_size is not None else None),
+        epochs=(int(namespace.epochs) if namespace.epochs is not None else None),
+        grad_accum_steps=(
+            int(namespace.grad_accum_steps) if namespace.grad_accum_steps is not None else None
+        ),
+        num_workers=(int(namespace.num_workers) if namespace.num_workers is not None else None),
+        mixed_precision=bool(namespace.mixed_precision),
+        disable_mixed_precision=bool(namespace.disable_mixed_precision),
+        wsi_root=(str(namespace.wsi_root) if namespace.wsi_root else None),
+        meta_csv=(str(namespace.meta_csv) if namespace.meta_csv else None),
+        encoder_name=(str(namespace.encoder_name) if namespace.encoder_name else None),
+        encoder_ckpt_path=(
+            str(namespace.encoder_ckpt_path) if namespace.encoder_ckpt_path else None
+        ),
+        force_rebuild=bool(namespace.force_rebuild),
+        validate_only=bool(namespace.validate_only),
+    )
+
+
+def main() -> None:
+    args: CliArgs = _parse_args()
+
+    try:
+        app: MainApp = MainApp(cfg_path=str(args.config))
+        summary: RunSummary = app.run(args=args)
+    except Exception as exc:  # noqa: BLE001
+        raise MainAppError(f"Main run failed: {exc}") from exc
+
+    print(summary.to_dict())
+
+
+if __name__ == "__main__":
+    main()

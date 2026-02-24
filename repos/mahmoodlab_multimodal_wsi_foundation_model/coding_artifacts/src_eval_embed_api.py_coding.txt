@@ -1,0 +1,798 @@
+## Code: src/eval/embed_api.py
+```python
+"""Shared embedding service for TITAN evaluation pipelines.
+
+This module implements the design-locked `EmbeddingService` interface:
+- EmbeddingService.__init__(vision_model: TITANEncoder, text_model: TextEncoder | None = None)
+- EmbeddingService.embed_slides(slide_ids: list[str]) -> np.ndarray
+- EmbeddingService.embed_reports(texts: list[str]) -> np.ndarray
+- EmbeddingService.center_and_l2(x: np.ndarray, mean_vec: np.ndarray | None = None)
+  -> tuple[np.ndarray, np.ndarray]
+
+The implementation is deterministic, fail-fast on invalid contracts, and bound to
+project constants from `config.yaml`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+try:
+    import h5py
+except Exception:  # pragma: no cover - optional dependency at import-time
+    h5py = None  # type: ignore[assignment]
+
+import numpy as np
+import pandas as pd
+import torch
+
+from src.data.build_feature_grid import FeatureGrid
+from src.data.caption_report_processing import TokenizerFactory
+from src.models.text_modules import TextEncoder
+from src.models.titan_encoder import TITANEncoder
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+_DEFAULT_TEXT_MAX_LEN: int = 256
+_DEFAULT_TEXT_TOKENIZER: str = "CONCHv1.5 pretrained text encoder"
+_DEFAULT_TOKENIZER_VOCAB_SIZE: int = 32_768
+
+_DEFAULT_EPS: float = 1.0e-12
+_DEFAULT_BATCH_SIZE: int = 64
+_DEFAULT_DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+_DEFAULT_SPLITS_CSV: str = "./data/metadata/splits.csv"
+_DEFAULT_WSI_MANIFEST_CSV: str = "./data/metadata/wsi_manifest.csv"
+_DEFAULT_PROCESSED_SLIDES_CSV: str = "./data/processed/reports/prepared_slides.csv"
+
+# Candidate columns for slide-id -> grid artifact resolution.
+_ID_COLUMNS: Tuple[str, ...] = (
+    "slide_id",
+    "wsi_id",
+    "sample_id",
+    "id",
+)
+_PATH_COLUMNS: Tuple[str, ...] = (
+    "grid_path",
+    "image_grid_path",
+    "artifact_path",
+    "grid",
+    "path",
+)
+_FEATURES_COLUMNS: Tuple[str, ...] = (
+    "features_path",
+    "features_h5",
+    "h5_path",
+)
+
+
+class EmbeddingServiceError(RuntimeError):
+    """Base exception for embedding service failures."""
+
+
+class EmbeddingServiceSchemaError(EmbeddingServiceError):
+    """Raised when input/output schema contracts are violated."""
+
+
+@dataclass(frozen=True)
+class _ResolvedSlide:
+    """Resolved slide descriptor."""
+
+    slide_id: str
+    grid_path: str
+
+
+class EmbeddingService:
+    """Unified embedding interface for slide/text/report evaluation."""
+
+    def __init__(self, vision_model: TITANEncoder, text_model: TextEncoder | None = None) -> None:
+        """Initialize embedding service.
+
+        Args:
+            vision_model: TITAN slide encoder.
+            text_model: Optional text encoder for report/text embeddings.
+        """
+        if not isinstance(vision_model, TITANEncoder):
+            raise TypeError(
+                f"vision_model must be TITANEncoder, got {type(vision_model).__name__}."
+            )
+        if text_model is not None and not isinstance(text_model, TextEncoder):
+            raise TypeError(
+                f"text_model must be TextEncoder or None, got {type(text_model).__name__}."
+            )
+
+        self.vision_model: TITANEncoder = vision_model
+        self.text_model: TextEncoder | None = text_model
+
+        self.device: torch.device = torch.device(_DEFAULT_DEVICE)
+
+        self.vision_model = self.vision_model.to(self.device)
+        self.vision_model.eval()
+        for parameter in self.vision_model.parameters():
+            parameter.requires_grad = False
+
+        if self.text_model is not None:
+            self.text_model = self.text_model.to(self.device)
+            self.text_model.eval()
+            for parameter in self.text_model.parameters():
+                parameter.requires_grad = False
+
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.feature_dim: int = _FEATURE_DIM
+        self.stage1_region_grid: Tuple[int, int] = _STAGE1_REGION_GRID
+        self.stage3_crop_grid: Tuple[int, int] = _STAGE3_CROP_GRID
+
+        self._batch_size: int = self._resolve_batch_size()
+        self._slide_lookup: Dict[str, str] = self._build_slide_lookup()
+
+        # Use deterministic tokenizer compatible with TextEncoder expectations.
+        self._tokenizer = TokenizerFactory.create(
+            tokenizer_name=_DEFAULT_TEXT_TOKENIZER,
+            vocab_size=_DEFAULT_TOKENIZER_VOCAB_SIZE,
+            max_length=_DEFAULT_TEXT_MAX_LEN,
+        )
+
+    def embed_slides(self, slide_ids: list[str]) -> np.ndarray:
+        """Embed slides into fixed-width vectors.
+
+        Args:
+            slide_ids: List of slide identifiers or direct artifact paths.
+
+        Returns:
+            Dense array with shape [N, 768], preserving input ordering.
+        """
+        self._validate_slide_ids(slide_ids)
+
+        resolved_slides: List[_ResolvedSlide] = [
+            self._resolve_slide_id(slide_id=value) for value in slide_ids
+        ]
+
+        embeddings: List[np.ndarray] = []
+        with torch.inference_mode():
+            for resolved in resolved_slides:
+                grid: FeatureGrid = self._load_feature_grid(path=resolved.grid_path, slide_id=resolved.slide_id)
+                embedding_t: torch.Tensor = self.vision_model.encode_slide(grid.to(str(self.device)))
+                if embedding_t.ndim != 1:
+                    raise EmbeddingServiceSchemaError(
+                        "Vision encoder output must be rank-1 for encode_slide. "
+                        f"Got shape={tuple(embedding_t.shape)} for slide_id={resolved.slide_id}."
+                    )
+                if int(embedding_t.shape[0]) != self.feature_dim:
+                    raise EmbeddingServiceSchemaError(
+                        f"Vision embedding dim must be {self.feature_dim}, got {int(embedding_t.shape[0])} "
+                        f"for slide_id={resolved.slide_id}."
+                    )
+
+                embedding_np: np.ndarray = embedding_t.detach().cpu().numpy().astype(np.float32, copy=False)
+                if not np.isfinite(embedding_np).all():
+                    raise EmbeddingServiceSchemaError(
+                        f"Non-finite slide embedding produced for slide_id={resolved.slide_id}."
+                    )
+                embeddings.append(embedding_np)
+
+        stacked: np.ndarray = np.stack(embeddings, axis=0)
+        if stacked.shape != (len(slide_ids), self.feature_dim):
+            raise EmbeddingServiceSchemaError(
+                "Slide embedding stack shape mismatch. "
+                f"Expected {(len(slide_ids), self.feature_dim)}, got {tuple(stacked.shape)}."
+            )
+        return stacked
+
+    def embed_reports(self, texts: list[str]) -> np.ndarray:
+        """Embed report/text strings into fixed-width vectors.
+
+        Args:
+            texts: List of report/text strings.
+
+        Returns:
+            Dense array with shape [N, 768], preserving input ordering.
+        """
+        if self.text_model is None:
+            raise EmbeddingServiceError(
+                "embed_reports requires text_model, but text_model is None. "
+                "Use a multimodal checkpoint/model for text embeddings."
+            )
+        self._validate_texts(texts)
+
+        input_ids_batch: List[List[int]] = []
+        attention_mask_batch: List[List[int]] = []
+        for text in texts:
+            encoded = self._tokenizer.encode(text)
+            input_ids_batch.append([int(v) for v in encoded.token_ids])
+            attention_mask_batch.append([int(v) for v in encoded.attention_mask])
+
+        embeddings_chunks: List[np.ndarray] = []
+        with torch.inference_mode():
+            for start in range(0, len(texts), self._batch_size):
+                end: int = min(start + self._batch_size, len(texts))
+
+                ids_slice: List[List[int]] = input_ids_batch[start:end]
+                mask_slice: List[List[int]] = attention_mask_batch[start:end]
+
+                input_ids_t, attention_mask_t = self._pad_token_batch(ids_slice, mask_slice)
+                input_ids_t = input_ids_t.to(device=self.device, dtype=torch.long, non_blocking=True)
+                attention_mask_t = attention_mask_t.to(device=self.device, dtype=torch.long, non_blocking=True)
+
+                embeddings_t: torch.Tensor = self.text_model(
+                    input_ids=input_ids_t,
+                    attn_mask=attention_mask_t,
+                )
+                if embeddings_t.ndim != 2:
+                    raise EmbeddingServiceSchemaError(
+                        "Text encoder output must be rank-2 [B,D]. "
+                        f"Got shape={tuple(embeddings_t.shape)}."
+                    )
+                if int(embeddings_t.shape[1]) != self.feature_dim:
+                    raise EmbeddingServiceSchemaError(
+                        f"Text embedding dim must be {self.feature_dim}, "
+                        f"got {int(embeddings_t.shape[1])}."
+                    )
+
+                embeddings_np: np.ndarray = embeddings_t.detach().cpu().numpy().astype(np.float32, copy=False)
+                if not np.isfinite(embeddings_np).all():
+                    raise EmbeddingServiceSchemaError("Non-finite text embedding(s) produced.")
+                embeddings_chunks.append(embeddings_np)
+
+        stacked: np.ndarray = np.concatenate(embeddings_chunks, axis=0)
+        if stacked.shape != (len(texts), self.feature_dim):
+            raise EmbeddingServiceSchemaError(
+                "Text embedding stack shape mismatch. "
+                f"Expected {(len(texts), self.feature_dim)}, got {tuple(stacked.shape)}."
+            )
+        return stacked
+
+    def center_and_l2(
+        self,
+        x: np.ndarray,
+        mean_vec: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Center vectors and apply row-wise L2 normalization.
+
+        Args:
+            x: Input embeddings with shape [N, D].
+            mean_vec: Optional precomputed centroid [D].
+
+        Returns:
+            Tuple of `(x_norm, used_mean_vec)`.
+        """
+        if not isinstance(x, np.ndarray):
+            raise TypeError(f"x must be np.ndarray, got {type(x).__name__}.")
+        if x.ndim != 2:
+            raise EmbeddingServiceSchemaError(
+                f"x must have shape [N,D], got {tuple(x.shape)}."
+            )
+        if int(x.shape[0]) <= 0:
+            raise EmbeddingServiceSchemaError("x must contain at least one row.")
+        if int(x.shape[1]) != self.feature_dim:
+            raise EmbeddingServiceSchemaError(
+                f"x second dimension must be {self.feature_dim}, got {int(x.shape[1])}."
+            )
+
+        x_f32: np.ndarray = np.asarray(x, dtype=np.float32)
+        if not np.isfinite(x_f32).all():
+            raise EmbeddingServiceSchemaError("x contains NaN/Inf values.")
+
+        used_mean: np.ndarray
+        if mean_vec is None:
+            used_mean = np.mean(x_f32, axis=0, dtype=np.float64).astype(np.float32, copy=False)
+        else:
+            if not isinstance(mean_vec, np.ndarray):
+                raise TypeError(
+                    f"mean_vec must be np.ndarray when provided, got {type(mean_vec).__name__}."
+                )
+            if mean_vec.ndim != 1 or int(mean_vec.shape[0]) != self.feature_dim:
+                raise EmbeddingServiceSchemaError(
+                    "mean_vec must have shape [D]. "
+                    f"Expected ({self.feature_dim},), got {tuple(mean_vec.shape)}."
+                )
+            used_mean = np.asarray(mean_vec, dtype=np.float32)
+            if not np.isfinite(used_mean).all():
+                raise EmbeddingServiceSchemaError("mean_vec contains NaN/Inf values.")
+
+        centered: np.ndarray = x_f32 - used_mean.reshape(1, -1)
+        row_norms: np.ndarray = np.linalg.norm(centered, ord=2, axis=1, keepdims=True)
+        row_norms = np.maximum(row_norms, float(_DEFAULT_EPS)).astype(np.float32, copy=False)
+        normalized: np.ndarray = centered / row_norms
+
+        if not np.isfinite(normalized).all():
+            raise EmbeddingServiceSchemaError("center_and_l2 produced NaN/Inf values.")
+
+        return normalized.astype(np.float32, copy=False), used_mean.astype(np.float32, copy=False)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _resolve_batch_size(self) -> int:
+        raw_value: str = os.environ.get("TITAN_EMBED_BATCH_SIZE", str(_DEFAULT_BATCH_SIZE))
+        try:
+            batch_size: int = int(raw_value)
+        except ValueError:
+            batch_size = _DEFAULT_BATCH_SIZE
+        if batch_size <= 0:
+            batch_size = _DEFAULT_BATCH_SIZE
+        return batch_size
+
+    def _build_slide_lookup(self) -> Dict[str, str]:
+        """Build slide_id -> grid_path lookup from known manifests.
+
+        This is best-effort; direct path slide_ids remain supported even when the
+        lookup is empty.
+        """
+        manifest_candidates: List[Path] = []
+
+        env_splits: str = os.environ.get("TITAN_SPLITS_CSV", "").strip()
+        if env_splits:
+            manifest_candidates.append(Path(env_splits).expanduser().resolve())
+        manifest_candidates.append(Path(_DEFAULT_SPLITS_CSV).expanduser().resolve())
+
+        env_manifest: str = os.environ.get("TITAN_WSI_MANIFEST_CSV", "").strip()
+        if env_manifest:
+            manifest_candidates.append(Path(env_manifest).expanduser().resolve())
+        manifest_candidates.append(Path(_DEFAULT_WSI_MANIFEST_CSV).expanduser().resolve())
+
+        manifest_candidates.append(Path(_DEFAULT_PROCESSED_SLIDES_CSV).expanduser().resolve())
+
+        lookup: Dict[str, str] = {}
+        for manifest_path in manifest_candidates:
+            if not manifest_path.exists() or not manifest_path.is_file():
+                continue
+            try:
+                frame: pd.DataFrame = pd.read_csv(manifest_path)
+            except Exception:
+                continue
+            if frame.empty:
+                continue
+
+            id_col: str = _find_first_column(frame, _ID_COLUMNS)
+            path_col: str = _find_first_column(frame, _PATH_COLUMNS)
+            features_col: str = _find_first_column(frame, _FEATURES_COLUMNS)
+
+            if id_col == "":
+                continue
+            if path_col == "" and features_col == "":
+                continue
+
+            base_dir: Path = manifest_path.parent
+            for _, row in frame.iterrows():
+                raw_slide_id: Any = row.get(id_col)
+                if raw_slide_id is None:
+                    continue
+                slide_id: str = str(raw_slide_id).strip()
+                if not slide_id:
+                    continue
+
+                candidate_path: Optional[str] = None
+
+                if path_col != "":
+                    raw_path: Any = row.get(path_col)
+                    if raw_path is not None and str(raw_path).strip():
+                        candidate_path = _resolve_maybe_relative(
+                            str(raw_path).strip(), base_dir
+                        )
+
+                if candidate_path is None and features_col != "":
+                    raw_features: Any = row.get(features_col)
+                    if raw_features is not None and str(raw_features).strip():
+                        candidate_path = _resolve_maybe_relative(
+                            str(raw_features).strip(), base_dir
+                        )
+
+                if candidate_path is None:
+                    continue
+
+                # If path points to directory, resolve common artifact names.
+                resolved_artifact: Optional[str] = _resolve_grid_artifact_path(candidate_path)
+                if resolved_artifact is None:
+                    continue
+
+                lookup[slide_id] = resolved_artifact
+
+        return lookup
+
+    def _resolve_slide_id(self, slide_id: str) -> _ResolvedSlide:
+        if not isinstance(slide_id, str):
+            raise TypeError(f"slide_id must be str, got {type(slide_id).__name__}.")
+        normalized_id: str = slide_id.strip()
+        if not normalized_id:
+            raise EmbeddingServiceSchemaError("slide_id cannot be empty.")
+
+        # Direct path mode (supports both absolute/relative).
+        direct_path: Path = Path(normalized_id).expanduser().resolve()
+        if direct_path.exists():
+            resolved = _resolve_grid_artifact_path(str(direct_path))
+            if resolved is not None:
+                return _ResolvedSlide(slide_id=normalized_id, grid_path=resolved)
+
+        # Lookup mode.
+        if normalized_id in self._slide_lookup:
+            return _ResolvedSlide(slide_id=normalized_id, grid_path=self._slide_lookup[normalized_id])
+
+        raise EmbeddingServiceError(
+            "Unable to resolve slide_id to a grid artifact path. "
+            f"slide_id='{normalized_id}'. Provide a direct artifact path or ensure manifests include this id."
+        )
+
+    def _load_feature_grid(self, path: str, slide_id: str) -> FeatureGrid:
+        resolved_path: Path = Path(path).expanduser().resolve()
+        if not resolved_path.exists() or not resolved_path.is_file():
+            raise FileNotFoundError(f"Grid artifact not found: {resolved_path}")
+
+        suffix: str = resolved_path.suffix.lower()
+        if suffix in {".pt", ".pth"}:
+            return self._load_feature_grid_pt(resolved_path, slide_id)
+        if suffix in {".h5", ".hdf5"}:
+            return self._load_feature_grid_h5(resolved_path, slide_id)
+
+        raise EmbeddingServiceError(
+            f"Unsupported grid artifact extension '{suffix}' for path: {resolved_path}"
+        )
+
+    def _load_feature_grid_pt(self, path: Path, slide_id: str) -> FeatureGrid:
+        try:
+            payload: Any = torch.load(path, map_location="cpu")
+        except Exception as exc:
+            raise EmbeddingServiceError(f"Failed reading PT artifact: {path}") from exc
+
+        if isinstance(payload, FeatureGrid):
+            grid: FeatureGrid = payload
+            return self._validate_feature_grid(_set_slide_id_if_missing(grid, slide_id))
+
+        if not isinstance(payload, Mapping):
+            raise EmbeddingServiceError(
+                f"PT artifact must be FeatureGrid or mapping, got {type(payload).__name__} at {path}"
+            )
+
+        features_obj: Any = payload.get("features")
+        coords_obj: Any = payload.get("coords_xy", payload.get("coords"))
+        valid_obj: Any = payload.get("valid_mask", payload.get("mask"))
+
+        if features_obj is None or coords_obj is None:
+            raise EmbeddingServiceError(
+                f"PT artifact missing required keys 'features' and 'coords_xy/coords': {path}"
+            )
+
+        features_t: torch.Tensor = _to_tensor_float32(features_obj)
+        coords_t: torch.Tensor = _to_tensor_int64(coords_obj)
+
+        if features_t.ndim == 2:
+            # Sparse format [N,D] + [N,2] -> dense grid.
+            if coords_t.ndim != 2:
+                raise EmbeddingServiceError(
+                    f"Sparse PT coords must be rank-2, got {tuple(coords_t.shape)} at {path}"
+                )
+            features_np: np.ndarray = features_t.numpy().astype(np.float32, copy=False)
+            coords_np: np.ndarray = coords_t.numpy().astype(np.int64, copy=False)
+            grid: FeatureGrid = self._build_dense_grid_from_sparse(
+                features_np=features_np,
+                coords_np=coords_np,
+                slide_id=slide_id,
+            )
+            return self._validate_feature_grid(grid)
+
+        if features_t.ndim != 3 or coords_t.ndim != 3:
+            raise EmbeddingServiceError(
+                "Dense PT format requires features [H,W,D] and coords [H,W,2]. "
+                f"Got features={tuple(features_t.shape)}, coords={tuple(coords_t.shape)} at {path}"
+            )
+
+        if valid_obj is None:
+            valid_t: torch.Tensor = torch.ones(
+                (features_t.shape[0], features_t.shape[1]), dtype=torch.bool
+            )
+        else:
+            valid_t = _to_tensor_bool(valid_obj)
+
+        grid = FeatureGrid(
+            features=features_t,
+            coords_xy=coords_t,
+            valid_mask=valid_t,
+            slide_id=slide_id,
+        )
+        return self._validate_feature_grid(grid)
+
+    def _load_feature_grid_h5(self, path: Path, slide_id: str) -> FeatureGrid:
+        if h5py is None:
+            raise EmbeddingServiceError(
+                "h5py is required for .h5 artifacts but is not available."
+            )
+
+        try:
+            with h5py.File(path, "r") as h5f:
+                if "features" not in h5f or "coords" not in h5f:
+                    raise EmbeddingServiceError(
+                        f"H5 artifact must contain 'features' and 'coords': {path}"
+                    )
+                features_np: np.ndarray = np.asarray(h5f["features"], dtype=np.float32)
+                coords_np: np.ndarray = np.asarray(h5f["coords"], dtype=np.int64)
+        except EmbeddingServiceError:
+            raise
+        except Exception as exc:
+            raise EmbeddingServiceError(f"Failed reading H5 artifact: {path}") from exc
+
+        if features_np.ndim != 2 or coords_np.ndim != 2:
+            raise EmbeddingServiceError(
+                "H5 artifact must store sparse arrays [N,D] and [N,2]. "
+                f"Got features={features_np.shape}, coords={coords_np.shape} at {path}"
+            )
+
+        grid: FeatureGrid = self._build_dense_grid_from_sparse(
+            features_np=features_np,
+            coords_np=coords_np,
+            slide_id=slide_id,
+        )
+        return self._validate_feature_grid(grid)
+
+    def _build_dense_grid_from_sparse(
+        self,
+        features_np: np.ndarray,
+        coords_np: np.ndarray,
+        slide_id: str,
+    ) -> FeatureGrid:
+        if features_np.ndim != 2:
+            raise EmbeddingServiceSchemaError(
+                f"Sparse features must be rank-2 [N,D], got {tuple(features_np.shape)}."
+            )
+        if coords_np.ndim != 2:
+            raise EmbeddingServiceSchemaError(
+                f"Sparse coords must be rank-2 [N,2], got {tuple(coords_np.shape)}."
+            )
+        if int(features_np.shape[0]) != int(coords_np.shape[0]):
+            raise EmbeddingServiceSchemaError(
+                "Sparse features/coords row count mismatch. "
+                f"features={features_np.shape[0]}, coords={coords_np.shape[0]}"
+            )
+        if int(features_np.shape[1]) != self.feature_dim:
+            raise EmbeddingServiceSchemaError(
+                f"Sparse feature dim must be {self.feature_dim}, got {features_np.shape[1]}."
+            )
+        if int(coords_np.shape[1]) != 2:
+            raise EmbeddingServiceSchemaError(
+                f"Sparse coords second dim must be 2, got {coords_np.shape[1]}."
+            )
+        if int(features_np.shape[0]) == 0:
+            raise EmbeddingServiceSchemaError("Sparse feature set is empty.")
+        if not np.isfinite(features_np).all():
+            raise EmbeddingServiceSchemaError("Sparse features contain NaN/Inf.")
+
+        gx: np.ndarray = coords_np[:, 0] // self.patch_size_px
+        gy: np.ndarray = coords_np[:, 1] // self.patch_size_px
+
+        min_gx: int = int(gx.min())
+        max_gx: int = int(gx.max())
+        min_gy: int = int(gy.min())
+        max_gy: int = int(gy.max())
+
+        width: int = max_gx - min_gx + 1
+        height: int = max_gy - min_gy + 1
+        if width <= 0 or height <= 0:
+            raise EmbeddingServiceSchemaError(
+                f"Invalid dense grid shape from sparse coords: H={height}, W={width}."
+            )
+
+        features_grid: np.ndarray = np.zeros((height, width, self.feature_dim), dtype=np.float32)
+        valid_mask: np.ndarray = np.zeros((height, width), dtype=np.bool_)
+
+        x_axis: np.ndarray = (
+            np.arange(width, dtype=np.int64).reshape(1, width) + np.int64(min_gx)
+        ) * np.int64(self.patch_size_px)
+        y_axis: np.ndarray = (
+            np.arange(height, dtype=np.int64).reshape(height, 1) + np.int64(min_gy)
+        ) * np.int64(self.patch_size_px)
+
+        coords_grid: np.ndarray = np.zeros((height, width, 2), dtype=np.int64)
+        coords_grid[:, :, 0] = np.broadcast_to(x_axis, (height, width))
+        coords_grid[:, :, 1] = np.broadcast_to(y_axis, (height, width))
+
+        local_x: np.ndarray = (gx - min_gx).astype(np.int64, copy=False)
+        local_y: np.ndarray = (gy - min_gy).astype(np.int64, copy=False)
+
+        flat_indices: np.ndarray = local_y * np.int64(width) + local_x
+        if np.unique(flat_indices).shape[0] != flat_indices.shape[0]:
+            raise EmbeddingServiceSchemaError(
+                "Duplicate sparse coordinates detected while building dense grid."
+            )
+
+        features_grid[local_y, local_x, :] = features_np
+        valid_mask[local_y, local_x] = True
+
+        grid: FeatureGrid = FeatureGrid(
+            features=torch.from_numpy(features_grid),
+            coords_xy=torch.from_numpy(coords_grid),
+            valid_mask=torch.from_numpy(valid_mask),
+            slide_id=str(slide_id),
+        )
+        return grid
+
+    def _validate_feature_grid(self, grid: FeatureGrid) -> FeatureGrid:
+        if not isinstance(grid, FeatureGrid):
+            raise EmbeddingServiceSchemaError(
+                f"Expected FeatureGrid, got {type(grid).__name__}."
+            )
+        if int(grid.features.shape[-1]) != self.feature_dim:
+            raise EmbeddingServiceSchemaError(
+                f"FeatureGrid feature dim must be {self.feature_dim}, got {int(grid.features.shape[-1])}."
+            )
+        if grid.features.ndim != 3:
+            raise EmbeddingServiceSchemaError(
+                f"FeatureGrid.features must be rank-3 [H,W,D], got {tuple(grid.features.shape)}."
+            )
+        if grid.coords_xy.ndim != 3 or int(grid.coords_xy.shape[-1]) != 2:
+            raise EmbeddingServiceSchemaError(
+                f"FeatureGrid.coords_xy must be [H,W,2], got {tuple(grid.coords_xy.shape)}."
+            )
+        if grid.valid_mask.ndim != 2:
+            raise EmbeddingServiceSchemaError(
+                f"FeatureGrid.valid_mask must be [H,W], got {tuple(grid.valid_mask.shape)}."
+            )
+        if tuple(grid.features.shape[:2]) != tuple(grid.coords_xy.shape[:2]) or tuple(grid.features.shape[:2]) != tuple(grid.valid_mask.shape):
+            raise EmbeddingServiceSchemaError(
+                "FeatureGrid spatial shapes must align across features/coords/mask. "
+                f"Got features={tuple(grid.features.shape)}, coords={tuple(grid.coords_xy.shape)}, "
+                f"mask={tuple(grid.valid_mask.shape)}."
+            )
+        if not torch.isfinite(grid.features).all():
+            raise EmbeddingServiceSchemaError("FeatureGrid.features contain NaN/Inf.")
+        return grid
+
+    @staticmethod
+    def _validate_slide_ids(slide_ids: list[str]) -> None:
+        if not isinstance(slide_ids, list):
+            raise TypeError(f"slide_ids must be list[str], got {type(slide_ids).__name__}.")
+        if len(slide_ids) == 0:
+            raise EmbeddingServiceSchemaError("slide_ids cannot be empty.")
+        for index, slide_id in enumerate(slide_ids):
+            if not isinstance(slide_id, str):
+                raise TypeError(
+                    f"slide_ids[{index}] must be str, got {type(slide_id).__name__}."
+                )
+            if not slide_id.strip():
+                raise EmbeddingServiceSchemaError(f"slide_ids[{index}] cannot be empty.")
+
+    @staticmethod
+    def _validate_texts(texts: list[str]) -> None:
+        if not isinstance(texts, list):
+            raise TypeError(f"texts must be list[str], got {type(texts).__name__}.")
+        if len(texts) == 0:
+            raise EmbeddingServiceSchemaError("texts cannot be empty.")
+        for index, text in enumerate(texts):
+            if not isinstance(text, str):
+                raise TypeError(f"texts[{index}] must be str, got {type(text).__name__}.")
+
+    @staticmethod
+    def _pad_token_batch(
+        token_ids_list: Sequence[Sequence[int]],
+        attention_masks_list: Sequence[Sequence[int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if len(token_ids_list) == 0:
+            raise EmbeddingServiceSchemaError("Cannot pad empty token batch.")
+        if len(token_ids_list) != len(attention_masks_list):
+            raise EmbeddingServiceSchemaError(
+                "token_ids_list and attention_masks_list must have the same length."
+            )
+
+        max_len: int = 0
+        for idx, (ids, mask) in enumerate(zip(token_ids_list, attention_masks_list)):
+            if len(ids) != len(mask):
+                raise EmbeddingServiceSchemaError(
+                    f"Token/mask length mismatch at index {idx}: {len(ids)} vs {len(mask)}."
+                )
+            if len(ids) <= 0:
+                raise EmbeddingServiceSchemaError(f"Token sequence at index {idx} is empty.")
+            max_len = max(max_len, int(len(ids)))
+
+        batch_size: int = len(token_ids_list)
+        input_ids_t: torch.Tensor = torch.full(
+            (batch_size, max_len),
+            fill_value=0,
+            dtype=torch.long,
+        )
+        attention_mask_t: torch.Tensor = torch.zeros((batch_size, max_len), dtype=torch.long)
+
+        for row_index, (ids, mask) in enumerate(zip(token_ids_list, attention_masks_list)):
+            seq_len: int = len(ids)
+            input_ids_t[row_index, :seq_len] = torch.tensor(ids, dtype=torch.long)
+            attention_mask_t[row_index, :seq_len] = torch.tensor(mask, dtype=torch.long)
+
+        return input_ids_t, attention_mask_t
+
+
+def _find_first_column(frame: pd.DataFrame, candidates: Sequence[str]) -> str:
+    normalized_columns: Dict[str, str] = {
+        str(column).strip().lower(): str(column) for column in frame.columns
+    }
+    for candidate in candidates:
+        key: str = str(candidate).strip().lower()
+        if key in normalized_columns:
+            return normalized_columns[key]
+    return ""
+
+
+def _resolve_maybe_relative(path_value: str, base_dir: Path) -> str:
+    candidate: Path = Path(path_value).expanduser()
+    if not candidate.is_absolute():
+        candidate = (base_dir / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    return str(candidate)
+
+
+def _resolve_grid_artifact_path(path_value: str) -> Optional[str]:
+    """Resolve candidate path to a loadable grid artifact file.
+
+    Accepted:
+    - direct file path to .pt/.pth/.h5/.hdf5
+    - directory containing common artifact names:
+      - grid.pt, grid.pth, features.h5, features.hdf5
+    """
+    path_obj: Path = Path(path_value).expanduser().resolve()
+    if not path_obj.exists():
+        return None
+
+    if path_obj.is_file():
+        suffix: str = path_obj.suffix.lower()
+        if suffix in {".pt", ".pth", ".h5", ".hdf5"}:
+            return str(path_obj)
+        return None
+
+    if path_obj.is_dir():
+        for filename in ("grid.pt", "grid.pth", "features.h5", "features.hdf5"):
+            candidate: Path = path_obj / filename
+            if candidate.exists() and candidate.is_file():
+                return str(candidate.resolve())
+
+    return None
+
+
+def _to_tensor_float32(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().to(dtype=torch.float32)
+    array: np.ndarray = np.asarray(value, dtype=np.float32)
+    return torch.from_numpy(array)
+
+
+def _to_tensor_int64(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().to(dtype=torch.int64)
+    array: np.ndarray = np.asarray(value, dtype=np.int64)
+    return torch.from_numpy(array)
+
+
+def _to_tensor_bool(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().to(dtype=torch.bool)
+    array: np.ndarray = np.asarray(value)
+    if array.dtype != np.bool_:
+        array = array.astype(np.bool_)
+    return torch.from_numpy(array)
+
+
+def _set_slide_id_if_missing(grid: FeatureGrid, slide_id: str) -> FeatureGrid:
+    if grid.slide_id:
+        return grid
+    return FeatureGrid(
+        features=grid.features,
+        coords_xy=grid.coords_xy,
+        valid_mask=grid.valid_mask,
+        slide_id=str(slide_id),
+    )
+
+
+__all__ = [
+    "EmbeddingServiceError",
+    "EmbeddingServiceSchemaError",
+    "EmbeddingService",
+]
+```

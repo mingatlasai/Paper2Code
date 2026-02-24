@@ -1,0 +1,10 @@
+Implemented the requested logic analysis in [tests/test_losses.py](/Users/mingatlas/Projects/Paper2Code/tests/test_losses.py).
+
+It now contains a structured, paper/config-aligned test plan for:
+- iBOT loss (`IBOTLoss`) contracts and edge cases,
+- contrastive loss symmetry and mismatch behavior,
+- caption CE padding/shape correctness,
+- stage-2/3 weighted loss composition (including null-weight policy),
+- AMP safety, determinism, and logging-key expectations.
+
+No executable tests were added yet, only the analysis content as requested.

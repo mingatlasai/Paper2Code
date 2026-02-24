@@ -1,0 +1,1090 @@
+"""Text processing and pair-cache utilities for TITAN stage-2/3 pipelines.
+
+This module implements the data-text pipeline described in the design:
+- cleaning and normalization,
+- optional PHI stripping hook,
+- optional rewriting hook,
+- tokenization,
+- deterministic JSONL pair-cache build/load.
+
+It is intentionally config-aligned and does not invent unavailable paper
+hyperparameters.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import unicodedata
+
+import numpy as np
+import pandas as pd
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_SIZE_PX: int = 8192
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_WSI_CROP_GRID: Tuple[int, int] = (64, 64)
+_STAGE3_WSI_CROP_SIZE_PX: int = 32768
+
+_STAGE2_EXPECTED_PAIRS: int = 423_122
+_STAGE3_EXPECTED_PAIRS: int = 182_862
+
+_DEFAULT_TOKENIZER_NAME: str = "CONCHv1.5 pretrained text encoder"
+_DEFAULT_MAX_TEXT_LENGTH: int = 256
+_DEFAULT_MIN_TEXT_LENGTH: int = 1
+_DEFAULT_ENCODING: str = "utf-8"
+
+_ALLOWED_STAGES: Tuple[str, ...] = ("stage2", "stage3")
+_ALLOWED_TEXT_SOURCES: Tuple[str, ...] = (
+    "synthetic_caption",
+    "clinical_report",
+    "unknown",
+)
+
+# Invariant keys for persisted pair records.
+_PAIR_SCHEMA_KEYS: Tuple[str, ...] = (
+    "pair_id",
+    "stage",
+    "slide_id",
+    "grid_path",
+    "text",
+    "text_source",
+    "meta",
+    "token_ids",
+    "attention_mask",
+)
+
+
+class CaptionReportProcessingError(RuntimeError):
+    """Base exception for caption/report processing failures."""
+
+
+class PairSchemaError(CaptionReportProcessingError):
+    """Raised when pair artifacts violate schema contracts."""
+
+
+class PairBuildError(CaptionReportProcessingError):
+    """Raised when pair-cache construction fails."""
+
+
+@dataclass(frozen=True)
+class TokenizedText:
+    """Tokenized text payload.
+
+    Attributes:
+        token_ids: Token ids with optional BOS/EOS and truncation.
+        attention_mask: Binary mask aligned with ``token_ids``.
+        length: Number of non-padding tokens in this standalone encoding.
+    """
+
+    token_ids: List[int]
+    attention_mask: List[int]
+    length: int
+
+
+class TextNormalizer:
+    """Deterministic text normalizer for clinical captions/reports.
+
+    The normalization order is deterministic and stable:
+    1. Unicode normalization (NFKC)
+    2. Control character removal
+    3. Newline/tab collapse into spaces
+    4. Multi-space collapse
+    5. Optional lower-casing
+    6. Optional punctuation spacing cleanup
+    """
+
+    def __init__(
+        self,
+        lowercase: bool = False,
+        strip: bool = True,
+        normalize_unicode: bool = True,
+        collapse_whitespace: bool = True,
+        clean_punctuation_spacing: bool = True,
+    ) -> None:
+        self.lowercase: bool = bool(lowercase)
+        self.strip: bool = bool(strip)
+        self.normalize_unicode: bool = bool(normalize_unicode)
+        self.collapse_whitespace: bool = bool(collapse_whitespace)
+        self.clean_punctuation_spacing: bool = bool(clean_punctuation_spacing)
+
+        self._control_pattern: re.Pattern[str] = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+        self._ws_pattern: re.Pattern[str] = re.compile(r"\s+")
+        self._punct_pattern: re.Pattern[str] = re.compile(r"\s+([,.;:!?])")
+
+    def normalize(self, text: str) -> str:
+        """Normalize a text string.
+
+        Args:
+            text: Raw input text.
+
+        Returns:
+            Cleaned text string.
+        """
+        if not isinstance(text, str):
+            text = str(text)
+
+        cleaned: str = text
+        if self.normalize_unicode:
+            cleaned = unicodedata.normalize("NFKC", cleaned)
+
+        cleaned = self._control_pattern.sub(" ", cleaned)
+        cleaned = cleaned.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+        if self.collapse_whitespace:
+            cleaned = self._ws_pattern.sub(" ", cleaned)
+
+        if self.clean_punctuation_spacing:
+            cleaned = self._punct_pattern.sub(r"\1", cleaned)
+
+        if self.lowercase:
+            cleaned = cleaned.lower()
+
+        if self.strip:
+            cleaned = cleaned.strip()
+
+        return cleaned
+
+
+class BasePHIStripperHook:
+    """Base callable interface for PHI stripping."""
+
+    def __call__(self, text: str, context: Optional[Mapping[str, Any]] = None) -> str:
+        raise NotImplementedError
+
+
+class NoOpPHIStripperHook(BasePHIStripperHook):
+    """Default PHI stripper hook that does nothing."""
+
+    def __call__(self, text: str, context: Optional[Mapping[str, Any]] = None) -> str:
+        return text
+
+
+class RegexPHIStripperHook(BasePHIStripperHook):
+    """Conservative regex-based PHI scrubber.
+
+    This is a practical fallback for public reproductions and is intentionally
+    conservative to avoid over-deleting diagnostic text.
+    """
+
+    def __init__(
+        self,
+        replacement: str = "[REDACTED]",
+        enable_email: bool = True,
+        enable_phone: bool = True,
+        enable_mrn_like: bool = True,
+        enable_date_like: bool = False,
+    ) -> None:
+        self.replacement: str = str(replacement)
+        self.enable_email: bool = bool(enable_email)
+        self.enable_phone: bool = bool(enable_phone)
+        self.enable_mrn_like: bool = bool(enable_mrn_like)
+        self.enable_date_like: bool = bool(enable_date_like)
+
+        self._patterns: List[re.Pattern[str]] = []
+        if self.enable_email:
+            self._patterns.append(re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"))
+        if self.enable_phone:
+            self._patterns.append(re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b"))
+        if self.enable_mrn_like:
+            self._patterns.append(re.compile(r"\b(?:MRN|Accession|Case)\s*[:#-]?\s*[A-Za-z0-9-]{5,}\b", flags=re.IGNORECASE))
+        if self.enable_date_like:
+            self._patterns.append(re.compile(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})\b"))
+
+    def __call__(self, text: str, context: Optional[Mapping[str, Any]] = None) -> str:
+        sanitized: str = text
+        for pattern in self._patterns:
+            sanitized = pattern.sub(self.replacement, sanitized)
+        return sanitized
+
+
+class BaseRewriteHook:
+    """Base callable interface for optional text rewriting."""
+
+    def __call__(self, text: str, context: Optional[Mapping[str, Any]] = None) -> str:
+        raise NotImplementedError
+
+
+class NoOpRewriteHook(BaseRewriteHook):
+    """Default rewriting hook that returns text unchanged."""
+
+    def __call__(self, text: str, context: Optional[Mapping[str, Any]] = None) -> str:
+        return text
+
+
+class DeterministicTokenizer:
+    """Dependency-free tokenizer with deterministic hashing-based vocabulary.
+
+    This tokenizer is used as a robust fallback to keep data preparation usable
+    without external tokenizer packages. It provides stable token ids for a
+    given input string and vocabulary size.
+    """
+
+    def __init__(
+        self,
+        name: str = _DEFAULT_TOKENIZER_NAME,
+        vocab_size: int = 32_768,
+        max_length: int = _DEFAULT_MAX_TEXT_LENGTH,
+        add_bos: bool = True,
+        add_eos: bool = True,
+        lowercase: bool = False,
+    ) -> None:
+        if vocab_size <= 8:
+            raise ValueError("vocab_size must be > 8.")
+        if max_length <= 0:
+            raise ValueError("max_length must be > 0.")
+
+        self.name: str = str(name)
+        self.vocab_size: int = int(vocab_size)
+        self.max_length: int = int(max_length)
+        self.add_bos: bool = bool(add_bos)
+        self.add_eos: bool = bool(add_eos)
+        self.lowercase: bool = bool(lowercase)
+
+        # Reserved ids.
+        self.pad_token_id: int = 0
+        self.unk_token_id: int = 1
+        self.bos_token_id: int = 2
+        self.eos_token_id: int = 3
+        self._offset: int = 4
+
+        self._token_pattern: re.Pattern[str] = re.compile(r"[A-Za-z0-9]+|[^\w\s]", flags=re.UNICODE)
+
+    def tokenize(self, text: str) -> List[str]:
+        """Split a text into deterministic word/punctuation tokens."""
+        value: str = text.lower() if self.lowercase else text
+        return self._token_pattern.findall(value)
+
+    def encode(self, text: str, max_length: Optional[int] = None) -> TokenizedText:
+        """Encode text into fixed-length token ids with truncation.
+
+        Args:
+            text: Input text.
+            max_length: Optional override for sequence length cap.
+
+        Returns:
+            TokenizedText with unpadded sequence and attention mask.
+        """
+        if not isinstance(text, str):
+            text = str(text)
+
+        cap: int = int(max_length) if max_length is not None else self.max_length
+        if cap <= 0:
+            raise ValueError("max_length must be > 0.")
+
+        tokens: List[str] = self.tokenize(text)
+        token_ids: List[int] = []
+
+        if self.add_bos:
+            token_ids.append(self.bos_token_id)
+
+        available: int = cap
+        if self.add_bos:
+            available -= 1
+        if self.add_eos:
+            available -= 1
+        available = max(0, available)
+
+        for token in tokens[:available]:
+            token_ids.append(self._token_to_id(token))
+
+        if self.add_eos and len(token_ids) < cap:
+            token_ids.append(self.eos_token_id)
+
+        token_ids = token_ids[:cap]
+        attention_mask: List[int] = [1] * len(token_ids)
+
+        return TokenizedText(token_ids=token_ids, attention_mask=attention_mask, length=len(token_ids))
+
+    def _token_to_id(self, token: str) -> int:
+        if not token:
+            return self.unk_token_id
+        digest: str = hashlib.sha1(token.encode(_DEFAULT_ENCODING)).hexdigest()
+        raw: int = int(digest[:12], 16)
+        range_size: int = self.vocab_size - self._offset
+        return self._offset + (raw % range_size)
+
+
+class TokenizerFactory:
+    """Tokenizer factory used by pair-cache building and dataset preprocessing."""
+
+    @staticmethod
+    def create(
+        tokenizer_name: str = _DEFAULT_TOKENIZER_NAME,
+        vocab_size: int = 32_768,
+        max_length: int = _DEFAULT_MAX_TEXT_LENGTH,
+        lowercase: bool = False,
+    ) -> DeterministicTokenizer:
+        """Create a deterministic tokenizer.
+
+        The current implementation is intentionally dependency-free and stable.
+        """
+        return DeterministicTokenizer(
+            name=tokenizer_name,
+            vocab_size=vocab_size,
+            max_length=max_length,
+            add_bos=True,
+            add_eos=True,
+            lowercase=lowercase,
+        )
+
+
+@dataclass(frozen=True)
+class PairRecord:
+    """Standardized stage-2/3 training pair record."""
+
+    pair_id: str
+    stage: str
+    slide_id: str
+    grid_path: str
+    text: str
+    text_source: str
+    meta: Dict[str, Any] = field(default_factory=dict)
+    token_ids: Optional[List[int]] = None
+    attention_mask: Optional[List[int]] = None
+
+
+@dataclass
+class PairCacheStats:
+    """Statistics for pair-cache build/load operations."""
+
+    stage: str
+    input_rows: int = 0
+    output_rows: int = 0
+    dropped_rows: int = 0
+    dropped_missing_text: int = 0
+    dropped_missing_slide_id: int = 0
+    dropped_missing_grid_path: int = 0
+    dropped_invalid_stage: int = 0
+    dropped_invalid_grid_path: int = 0
+    expected_pairs: Optional[int] = None
+
+    token_length_min: int = 0
+    token_length_median: float = 0.0
+    token_length_p95: float = 0.0
+    token_length_max: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return stats as serializable dictionary."""
+        return dict(asdict(self))
+
+
+class PairCacheBuilder:
+    """Build and load cached JSONL text pairs for stage-2/3.
+
+    The builder supports CSV and JSONL manifests and writes deterministic JSONL
+    pair artifacts compatible with downstream datasets.
+    """
+
+    def __init__(
+        self,
+        tokenizer_name: str = _DEFAULT_TOKENIZER_NAME,
+        tokenizer_vocab_size: int = 32_768,
+        tokenizer_max_length: int = _DEFAULT_MAX_TEXT_LENGTH,
+        pretokenize: bool = True,
+        min_text_length: int = _DEFAULT_MIN_TEXT_LENGTH,
+        normalizer: Optional[TextNormalizer] = None,
+        phi_stripper_hook: Optional[BasePHIStripperHook] = None,
+        rewrite_hook: Optional[BaseRewriteHook] = None,
+        drop_empty_text: bool = True,
+        validate_grid_paths: bool = False,
+        strict_expected_count: bool = False,
+    ) -> None:
+        if tokenizer_vocab_size <= 8:
+            raise ValueError("tokenizer_vocab_size must be > 8.")
+        if tokenizer_max_length <= 0:
+            raise ValueError("tokenizer_max_length must be > 0.")
+        if min_text_length <= 0:
+            raise ValueError("min_text_length must be > 0.")
+
+        self.tokenizer_name: str = str(tokenizer_name)
+        self.tokenizer_vocab_size: int = int(tokenizer_vocab_size)
+        self.tokenizer_max_length: int = int(tokenizer_max_length)
+        self.pretokenize: bool = bool(pretokenize)
+        self.min_text_length: int = int(min_text_length)
+        self.drop_empty_text: bool = bool(drop_empty_text)
+        self.validate_grid_paths: bool = bool(validate_grid_paths)
+        self.strict_expected_count: bool = bool(strict_expected_count)
+
+        self.normalizer: TextNormalizer = normalizer or TextNormalizer()
+        self.phi_stripper_hook: BasePHIStripperHook = phi_stripper_hook or NoOpPHIStripperHook()
+        self.rewrite_hook: BaseRewriteHook = rewrite_hook or NoOpRewriteHook()
+
+        self.tokenizer: DeterministicTokenizer = TokenizerFactory.create(
+            tokenizer_name=self.tokenizer_name,
+            vocab_size=self.tokenizer_vocab_size,
+            max_length=self.tokenizer_max_length,
+            lowercase=False,
+        )
+
+    def build_cache(
+        self,
+        input_manifest_path: str,
+        output_jsonl_path: str,
+        stage: str,
+        overwrite: bool = False,
+    ) -> PairCacheStats:
+        """Build pair-cache JSONL from an input manifest.
+
+        Args:
+            input_manifest_path: CSV or JSONL input manifest path.
+            output_jsonl_path: Output JSONL pair-cache path.
+            stage: ``"stage2"`` or ``"stage3"``.
+            overwrite: Whether to overwrite an existing output file.
+
+        Returns:
+            PairCacheStats for the build.
+        """
+        resolved_stage: str = self._normalize_stage(stage)
+        input_path: Path = Path(input_manifest_path).expanduser().resolve()
+        output_path: Path = Path(output_jsonl_path).expanduser().resolve()
+
+        if not input_path.exists() or not input_path.is_file():
+            raise FileNotFoundError(f"Input manifest does not exist: {input_path}")
+
+        if output_path.exists() and not overwrite:
+            # Fast load path with validation.
+            records: List[PairRecord] = self.load_pairs(path=str(output_path), stage=resolved_stage)
+            stats: PairCacheStats = PairCacheStats(
+                stage=resolved_stage,
+                input_rows=len(records),
+                output_rows=len(records),
+                dropped_rows=0,
+                expected_pairs=self._expected_pairs_for_stage(resolved_stage),
+            )
+            self._finalize_stats(stats=stats, records=records)
+            return stats
+
+        rows: List[Dict[str, Any]] = self._read_manifest(path=input_path)
+        stats = PairCacheStats(
+            stage=resolved_stage,
+            input_rows=len(rows),
+            expected_pairs=self._expected_pairs_for_stage(resolved_stage),
+        )
+
+        built_records: List[PairRecord] = []
+        for row in rows:
+            record: Optional[PairRecord] = self._build_pair_record_from_row(
+                row=row,
+                stage=resolved_stage,
+                stats=stats,
+            )
+            if record is not None:
+                built_records.append(record)
+
+        built_records.sort(key=lambda rec: (rec.stage, rec.slide_id, rec.pair_id))
+
+        stats.output_rows = len(built_records)
+        stats.dropped_rows = stats.input_rows - stats.output_rows
+
+        self._write_jsonl_atomic(output_path=output_path, records=built_records)
+        self._write_stats_sidecar(output_path=output_path, stats=stats, records=built_records)
+        self._validate_expected_count(stats=stats)
+
+        return stats
+
+    def load_pairs(self, path: str, stage: Optional[str] = None) -> List[PairRecord]:
+        """Load and validate pair records from JSONL.
+
+        Args:
+            path: JSONL path.
+            stage: Optional stage filter (``stage2``/``stage3``).
+
+        Returns:
+            List of validated PairRecord entries.
+        """
+        jsonl_path: Path = Path(path).expanduser().resolve()
+        if not jsonl_path.exists() or not jsonl_path.is_file():
+            raise FileNotFoundError(f"Pair JSONL not found: {jsonl_path}")
+
+        stage_filter: Optional[str] = self._normalize_stage(stage) if stage is not None else None
+
+        loaded: List[PairRecord] = []
+        with jsonl_path.open("r", encoding=_DEFAULT_ENCODING) as handle:
+            for line_no, line in enumerate(handle, start=1):
+                payload_line: str = line.strip()
+                if not payload_line:
+                    continue
+                try:
+                    payload: Any = json.loads(payload_line)
+                except json.JSONDecodeError as exc:
+                    raise PairSchemaError(f"Invalid JSON at {jsonl_path}:{line_no}") from exc
+
+                if not isinstance(payload, Mapping):
+                    raise PairSchemaError(
+                        f"JSONL record at {jsonl_path}:{line_no} must be an object, got {type(payload).__name__}."
+                    )
+
+                record: PairRecord = self._pair_record_from_payload(payload)
+                if stage_filter is not None and record.stage != stage_filter:
+                    continue
+                loaded.append(record)
+
+        loaded.sort(key=lambda rec: (rec.stage, rec.slide_id, rec.pair_id))
+        return loaded
+
+    def build_cache_from_dataframe(
+        self,
+        frame: pd.DataFrame,
+        output_jsonl_path: str,
+        stage: str,
+        overwrite: bool = False,
+    ) -> PairCacheStats:
+        """Build a pair cache directly from an in-memory DataFrame."""
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(f"frame must be pandas.DataFrame, got {type(frame).__name__}.")
+
+        resolved_stage: str = self._normalize_stage(stage)
+        output_path: Path = Path(output_jsonl_path).expanduser().resolve()
+
+        if output_path.exists() and not overwrite:
+            records = self.load_pairs(path=str(output_path), stage=resolved_stage)
+            stats = PairCacheStats(
+                stage=resolved_stage,
+                input_rows=len(records),
+                output_rows=len(records),
+                dropped_rows=0,
+                expected_pairs=self._expected_pairs_for_stage(resolved_stage),
+            )
+            self._finalize_stats(stats=stats, records=records)
+            return stats
+
+        rows: List[Dict[str, Any]] = frame.to_dict(orient="records")
+        stats = PairCacheStats(
+            stage=resolved_stage,
+            input_rows=len(rows),
+            expected_pairs=self._expected_pairs_for_stage(resolved_stage),
+        )
+
+        built_records: List[PairRecord] = []
+        for row in rows:
+            record = self._build_pair_record_from_row(row=row, stage=resolved_stage, stats=stats)
+            if record is not None:
+                built_records.append(record)
+
+        built_records.sort(key=lambda rec: (rec.stage, rec.slide_id, rec.pair_id))
+
+        stats.output_rows = len(built_records)
+        stats.dropped_rows = stats.input_rows - stats.output_rows
+
+        self._write_jsonl_atomic(output_path=output_path, records=built_records)
+        self._write_stats_sidecar(output_path=output_path, stats=stats, records=built_records)
+        self._validate_expected_count(stats=stats)
+
+        return stats
+
+    # ------------------------------------------------------------------
+    # Internal processing
+    # ------------------------------------------------------------------
+    def _build_pair_record_from_row(
+        self,
+        row: Mapping[str, Any],
+        stage: str,
+        stats: PairCacheStats,
+    ) -> Optional[PairRecord]:
+        resolved_stage: str = self._normalize_stage(stage)
+
+        slide_id: str = self._extract_slide_id(row)
+        if not slide_id:
+            stats.dropped_missing_slide_id += 1
+            return None
+
+        grid_path: str = self._extract_grid_path(row)
+        if not grid_path:
+            stats.dropped_missing_grid_path += 1
+            return None
+
+        if self.validate_grid_paths and (not Path(grid_path).expanduser().exists()):
+            stats.dropped_invalid_grid_path += 1
+            return None
+
+        raw_text: str = self._extract_text(row=row, stage=resolved_stage)
+        text_source: str = self._extract_text_source(row=row, stage=resolved_stage)
+
+        cleaned_text: str = self._process_text(raw_text=raw_text, row=row)
+        if len(cleaned_text) < self.min_text_length:
+            stats.dropped_missing_text += 1
+            if self.drop_empty_text:
+                return None
+
+        token_ids: Optional[List[int]] = None
+        attention_mask: Optional[List[int]] = None
+        if self.pretokenize:
+            tokenized: TokenizedText = self.tokenizer.encode(cleaned_text)
+            token_ids = tokenized.token_ids
+            attention_mask = tokenized.attention_mask
+
+        pair_id: str = self._build_pair_id(
+            stage=resolved_stage,
+            slide_id=slide_id,
+            grid_path=grid_path,
+            text=cleaned_text,
+            row=row,
+        )
+
+        meta: Dict[str, Any] = self._build_meta(row=row, stage=resolved_stage)
+
+        return PairRecord(
+            pair_id=pair_id,
+            stage=resolved_stage,
+            slide_id=slide_id,
+            grid_path=str(Path(grid_path).expanduser()),
+            text=cleaned_text,
+            text_source=text_source,
+            meta=meta,
+            token_ids=token_ids,
+            attention_mask=attention_mask,
+        )
+
+    def _process_text(self, raw_text: str, row: Mapping[str, Any]) -> str:
+        context: Dict[str, Any] = {"stage": row.get("stage"), "slide_id": row.get("slide_id")}
+
+        normalized: str = self.normalizer.normalize(raw_text)
+        stripped: str = self.phi_stripper_hook(normalized, context=context)
+        rewritten: str = self.rewrite_hook(stripped, context=context)
+        finalized: str = self.normalizer.normalize(rewritten)
+
+        return finalized
+
+    def _extract_text(self, row: Mapping[str, Any], stage: str) -> str:
+        if stage == "stage2":
+            candidate_keys: Tuple[str, ...] = (
+                "caption",
+                "text",
+                "description",
+                "roi_caption",
+            )
+        elif stage == "stage3":
+            candidate_keys = (
+                "report",
+                "text",
+                "clinical_report",
+                "wsi_report",
+            )
+        else:
+            raise PairSchemaError(f"Unsupported stage while extracting text: {stage}")
+
+        for key in candidate_keys:
+            if key in row and row[key] is not None:
+                return str(row[key])
+
+        return ""
+
+    def _extract_slide_id(self, row: Mapping[str, Any]) -> str:
+        for key in ("slide_id", "sample_id", "id", "wsi_id"):
+            if key in row and row[key] is not None:
+                value: str = str(row[key]).strip()
+                if value:
+                    return value
+        return ""
+
+    def _extract_grid_path(self, row: Mapping[str, Any]) -> str:
+        for key in ("grid_path", "image_grid_path", "grid", "artifact_path"):
+            if key in row and row[key] is not None:
+                value: str = str(row[key]).strip()
+                if value:
+                    return value
+        return ""
+
+    def _extract_text_source(self, row: Mapping[str, Any], stage: str) -> str:
+        source_value: str = ""
+        if "text_source" in row and row["text_source"] is not None:
+            source_value = str(row["text_source"]).strip().lower()
+
+        if not source_value:
+            source_value = "synthetic_caption" if stage == "stage2" else "clinical_report"
+
+        if source_value not in _ALLOWED_TEXT_SOURCES:
+            source_value = "unknown"
+
+        return source_value
+
+    def _build_pair_id(
+        self,
+        stage: str,
+        slide_id: str,
+        grid_path: str,
+        text: str,
+        row: Mapping[str, Any],
+    ) -> str:
+        if "pair_id" in row and row["pair_id"] is not None and str(row["pair_id"]).strip():
+            return str(row["pair_id"]).strip()
+
+        base: str = "|".join(
+            [
+                stage,
+                slide_id,
+                str(Path(grid_path).expanduser()),
+                text,
+            ]
+        )
+        digest: str = hashlib.sha1(base.encode(_DEFAULT_ENCODING)).hexdigest()[:16]
+        return f"{stage}_{digest}"
+
+    def _build_meta(self, row: Mapping[str, Any], stage: str) -> Dict[str, Any]:
+        exclude_keys: set[str] = {
+            "pair_id",
+            "stage",
+            "slide_id",
+            "sample_id",
+            "id",
+            "wsi_id",
+            "grid_path",
+            "image_grid_path",
+            "grid",
+            "artifact_path",
+            "caption",
+            "description",
+            "roi_caption",
+            "report",
+            "clinical_report",
+            "wsi_report",
+            "text",
+            "text_source",
+            "token_ids",
+            "attention_mask",
+            "meta",
+        }
+
+        meta: Dict[str, Any] = {
+            "stage": stage,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "patch_size_px": _PATCH_SIZE_PX,
+            "magnification": _MAGNIFICATION,
+            "feature_dim": _FEATURE_DIM,
+            "roi_region_size_px": _STAGE1_REGION_SIZE_PX,
+            "roi_region_grid_size": list(_STAGE1_REGION_GRID),
+            "stage3_wsi_crop_grid_size": list(_STAGE3_WSI_CROP_GRID),
+            "stage3_wsi_crop_size_px": _STAGE3_WSI_CROP_SIZE_PX,
+        }
+
+        if "meta" in row and isinstance(row["meta"], Mapping):
+            for key, value in row["meta"].items():
+                meta[str(key)] = self._to_json_serializable(value)
+
+        for key, value in row.items():
+            if key in exclude_keys:
+                continue
+            meta[str(key)] = self._to_json_serializable(value)
+
+        return meta
+
+    def _pair_record_from_payload(self, payload: Mapping[str, Any]) -> PairRecord:
+        for required_key in _PAIR_SCHEMA_KEYS:
+            if required_key not in payload:
+                raise PairSchemaError(f"Pair record missing required key '{required_key}'.")
+
+        stage_value: str = self._normalize_stage(str(payload["stage"]))
+
+        token_ids_value: Optional[List[int]]
+        if payload["token_ids"] is None:
+            token_ids_value = None
+        else:
+            token_ids_value = [int(item) for item in list(payload["token_ids"])]
+
+        attention_mask_value: Optional[List[int]]
+        if payload["attention_mask"] is None:
+            attention_mask_value = None
+        else:
+            attention_mask_value = [int(item) for item in list(payload["attention_mask"])]
+
+        if (token_ids_value is None) != (attention_mask_value is None):
+            raise PairSchemaError("token_ids and attention_mask must both be null or both be present.")
+
+        if token_ids_value is not None and attention_mask_value is not None:
+            if len(token_ids_value) != len(attention_mask_value):
+                raise PairSchemaError("token_ids and attention_mask length mismatch.")
+
+        text_source_value: str = str(payload["text_source"]).strip().lower()
+        if text_source_value not in _ALLOWED_TEXT_SOURCES:
+            text_source_value = "unknown"
+
+        meta_value: Dict[str, Any]
+        if isinstance(payload["meta"], Mapping):
+            meta_value = {str(k): self._to_json_serializable(v) for k, v in payload["meta"].items()}
+        else:
+            raise PairSchemaError("meta field must be a JSON object.")
+
+        slide_id: str = str(payload["slide_id"]).strip()
+        grid_path: str = str(payload["grid_path"]).strip()
+        text: str = str(payload["text"])
+        pair_id: str = str(payload["pair_id"]).strip()
+
+        if not slide_id:
+            raise PairSchemaError("slide_id cannot be empty.")
+        if not grid_path:
+            raise PairSchemaError("grid_path cannot be empty.")
+        if not pair_id:
+            raise PairSchemaError("pair_id cannot be empty.")
+
+        return PairRecord(
+            pair_id=pair_id,
+            stage=stage_value,
+            slide_id=slide_id,
+            grid_path=grid_path,
+            text=text,
+            text_source=text_source_value,
+            meta=meta_value,
+            token_ids=token_ids_value,
+            attention_mask=attention_mask_value,
+        )
+
+    def _read_manifest(self, path: Path) -> List[Dict[str, Any]]:
+        suffix: str = path.suffix.lower()
+        if suffix in {".csv", ".tsv"}:
+            separator: str = "\t" if suffix == ".tsv" else ","
+            frame: pd.DataFrame = pd.read_csv(path, sep=separator)
+            return frame.to_dict(orient="records")
+
+        if suffix in {".jsonl", ".json"}:
+            rows: List[Dict[str, Any]] = []
+            with path.open("r", encoding=_DEFAULT_ENCODING) as handle:
+                for line_no, line in enumerate(handle, start=1):
+                    payload_line: str = line.strip()
+                    if not payload_line:
+                        continue
+                    try:
+                        payload: Any = json.loads(payload_line)
+                    except json.JSONDecodeError as exc:
+                        raise PairBuildError(f"Invalid JSON at {path}:{line_no}") from exc
+                    if not isinstance(payload, Mapping):
+                        raise PairBuildError(
+                            f"Manifest row at {path}:{line_no} must be JSON object, got {type(payload).__name__}."
+                        )
+                    rows.append({str(k): v for k, v in payload.items()})
+            return rows
+
+        raise PairBuildError(f"Unsupported manifest extension '{suffix}' for path {path}.")
+
+    def _write_jsonl_atomic(self, output_path: Path, records: Sequence[PairRecord]) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        fd: int
+        temp_file: str
+        fd, temp_file = tempfile.mkstemp(
+            prefix=f".{output_path.stem}.",
+            suffix=".jsonl",
+            dir=str(output_path.parent),
+        )
+        os.close(fd)
+        temp_path: Path = Path(temp_file)
+
+        try:
+            with temp_path.open("w", encoding=_DEFAULT_ENCODING) as handle:
+                for record in records:
+                    payload: Dict[str, Any] = {
+                        "pair_id": record.pair_id,
+                        "stage": record.stage,
+                        "slide_id": record.slide_id,
+                        "grid_path": record.grid_path,
+                        "text": record.text,
+                        "text_source": record.text_source,
+                        "meta": self._to_json_serializable(record.meta),
+                        "token_ids": record.token_ids,
+                        "attention_mask": record.attention_mask,
+                    }
+                    handle.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+                    handle.write("\n")
+
+            os.replace(temp_path, output_path)
+        except Exception as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            raise PairBuildError(f"Failed writing pair cache to {output_path}") from exc
+
+    def _write_stats_sidecar(
+        self,
+        output_path: Path,
+        stats: PairCacheStats,
+        records: Sequence[PairRecord],
+    ) -> None:
+        self._finalize_stats(stats=stats, records=records)
+
+        sidecar_path: Path = output_path.with_suffix(output_path.suffix + ".stats.json")
+        payload: Dict[str, Any] = {
+            "format_version": 1,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "tokenizer": {
+                "name": self.tokenizer.name,
+                "vocab_size": self.tokenizer.vocab_size,
+                "max_length": self.tokenizer.max_length,
+                "add_bos": self.tokenizer.add_bos,
+                "add_eos": self.tokenizer.add_eos,
+            },
+            "normalization": {
+                "drop_empty_text": self.drop_empty_text,
+                "min_text_length": self.min_text_length,
+                "validate_grid_paths": self.validate_grid_paths,
+            },
+            "paper_constants": {
+                "patch_size_px": _PATCH_SIZE_PX,
+                "magnification": _MAGNIFICATION,
+                "feature_dim": _FEATURE_DIM,
+                "stage2_expected_pairs": _STAGE2_EXPECTED_PAIRS,
+                "stage3_expected_pairs": _STAGE3_EXPECTED_PAIRS,
+                "roi_region_size_px": _STAGE1_REGION_SIZE_PX,
+                "roi_region_grid_size": list(_STAGE1_REGION_GRID),
+                "stage3_wsi_crop_grid_size": list(_STAGE3_WSI_CROP_GRID),
+                "stage3_wsi_crop_size_px": _STAGE3_WSI_CROP_SIZE_PX,
+            },
+            "stats": stats.to_dict(),
+        }
+
+        self._write_json_atomic(sidecar_path, payload)
+
+    def _write_json_atomic(self, path: Path, payload: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_file = tempfile.mkstemp(
+            prefix=f".{path.stem}.",
+            suffix=".json",
+            dir=str(path.parent),
+        )
+        os.close(fd)
+        temp_path: Path = Path(temp_file)
+
+        rendered: str = json.dumps(self._to_json_serializable(dict(payload)), ensure_ascii=True, sort_keys=True, indent=2)
+
+        try:
+            with temp_path.open("w", encoding=_DEFAULT_ENCODING) as handle:
+                handle.write(rendered)
+                handle.write("\n")
+            os.replace(temp_path, path)
+        except Exception as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            raise PairBuildError(f"Failed writing JSON sidecar {path}") from exc
+
+    def _finalize_stats(self, stats: PairCacheStats, records: Sequence[PairRecord]) -> None:
+        lengths: List[int] = [len(rec.token_ids) for rec in records if rec.token_ids is not None]
+        if lengths:
+            length_array: np.ndarray = np.asarray(lengths, dtype=np.int64)
+            stats.token_length_min = int(np.min(length_array))
+            stats.token_length_median = float(np.median(length_array))
+            stats.token_length_p95 = float(np.percentile(length_array, 95.0))
+            stats.token_length_max = int(np.max(length_array))
+        else:
+            stats.token_length_min = 0
+            stats.token_length_median = 0.0
+            stats.token_length_p95 = 0.0
+            stats.token_length_max = 0
+
+    def _validate_expected_count(self, stats: PairCacheStats) -> None:
+        expected: Optional[int] = stats.expected_pairs
+        if expected is None:
+            return
+
+        if self.strict_expected_count and stats.output_rows != expected:
+            raise PairBuildError(
+                "Output pair count does not match expected count for stage "
+                f"{stats.stage}: expected={expected}, got={stats.output_rows}."
+            )
+
+    def _normalize_stage(self, stage: str) -> str:
+        value: str = str(stage).strip().lower()
+        aliases: Dict[str, str] = {
+            "stage2": "stage2",
+            "stage_2": "stage2",
+            "stage2_roi_caption_alignment": "stage2",
+            "roi_caption": "stage2",
+            "stage3": "stage3",
+            "stage_3": "stage3",
+            "stage3_wsi_report_alignment": "stage3",
+            "wsi_report": "stage3",
+        }
+        normalized: Optional[str] = aliases.get(value)
+        if normalized is None or normalized not in _ALLOWED_STAGES:
+            raise PairSchemaError(f"Unsupported stage '{stage}'. Allowed: {_ALLOWED_STAGES}")
+        return normalized
+
+    def _expected_pairs_for_stage(self, stage: str) -> Optional[int]:
+        if stage == "stage2":
+            return _STAGE2_EXPECTED_PAIRS
+        if stage == "stage3":
+            return _STAGE3_EXPECTED_PAIRS
+        return None
+
+    @staticmethod
+    def _to_json_serializable(value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            return float(value)
+        if isinstance(value, Mapping):
+            return {str(k): PairCacheBuilder._to_json_serializable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [PairCacheBuilder._to_json_serializable(item) for item in value]
+        return str(value)
+
+
+def load_pair_cache(path: str, stage: Optional[str] = None) -> List[PairRecord]:
+    """Convenience function to load pair records from JSONL cache."""
+    builder: PairCacheBuilder = PairCacheBuilder(pretokenize=False)
+    return builder.load_pairs(path=path, stage=stage)
+
+
+def build_pair_cache(
+    input_manifest_path: str,
+    output_jsonl_path: str,
+    stage: str,
+    overwrite: bool = False,
+    tokenizer_name: str = _DEFAULT_TOKENIZER_NAME,
+    tokenizer_vocab_size: int = 32_768,
+    tokenizer_max_length: int = _DEFAULT_MAX_TEXT_LENGTH,
+    pretokenize: bool = True,
+    validate_grid_paths: bool = False,
+) -> PairCacheStats:
+    """Convenience function to build pair JSONL cache from manifest."""
+    builder: PairCacheBuilder = PairCacheBuilder(
+        tokenizer_name=tokenizer_name,
+        tokenizer_vocab_size=tokenizer_vocab_size,
+        tokenizer_max_length=tokenizer_max_length,
+        pretokenize=pretokenize,
+        validate_grid_paths=validate_grid_paths,
+    )
+    return builder.build_cache(
+        input_manifest_path=input_manifest_path,
+        output_jsonl_path=output_jsonl_path,
+        stage=stage,
+        overwrite=overwrite,
+    )
+
+
+__all__ = [
+    "CaptionReportProcessingError",
+    "PairSchemaError",
+    "PairBuildError",
+    "TokenizedText",
+    "TextNormalizer",
+    "BasePHIStripperHook",
+    "NoOpPHIStripperHook",
+    "RegexPHIStripperHook",
+    "BaseRewriteHook",
+    "NoOpRewriteHook",
+    "DeterministicTokenizer",
+    "TokenizerFactory",
+    "PairRecord",
+    "PairCacheStats",
+    "PairCacheBuilder",
+    "load_pair_cache",
+    "build_pair_cache",
+]

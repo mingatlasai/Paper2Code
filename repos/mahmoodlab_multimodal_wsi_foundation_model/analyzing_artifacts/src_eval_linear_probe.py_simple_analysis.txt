@@ -1,0 +1,8 @@
+Implemented the requested logic analysis in [src/eval/linear_probe.py](/Users/mingatlas/Projects/Paper2Code/src/eval/linear_probe.py).
+
+It is now a structured, paper-aligned analysis docstring that:
+- follows the design interface (`Evaluator.run_linear_probe`, `EmbeddingService.center_and_l2`)
+- binds strictly to `config.yaml` values (L-BFGS, 45-point log L2 grid `1e-6..10`, `max_iter` rules)
+- defines binary/multiclass metric behavior
+- specifies validation vs no-validation selection logic
+- lists failure modes, reproducibility constraints, and artifact expectations without introducing unprovided hyperparameters.

@@ -1,0 +1,13 @@
+Implemented the requested logic analysis in [scripts/run_stage1.py](/Users/mingatlas/Projects/Paper2Code/scripts/run_stage1.py).
+
+It now contains a structured, paper-aligned orchestration spec for Stage-1 (`TITAN V`) covering:
+- config binding to `config.yaml`,
+- thin orchestrator scope and interface constraints,
+- CLI override and merge policy,
+- registry wiring,
+- checkpoint resume semantics,
+- stage invariants and failure handling,
+- artifact/logging expectations,
+- paper-fidelity guardrails.
+
+No executable code was added yet, per your instruction.

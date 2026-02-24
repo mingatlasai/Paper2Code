@@ -1,0 +1,52 @@
+# configs/model/titan_v.yaml
+# TITAN-V (stage-1 vision-only) model configuration.
+# Source-of-truth values are taken from the provided config.yaml.
+
+model:
+  name: titan_v
+  variant: vision_only
+  architecture: titan_encoder
+
+  input:
+    patch_feature_dim: 768
+    patch_size_px: 512
+    magnification: "20x"
+    coordinate_unit_px: 512
+
+  encoder:
+    embed_dim: 768
+    num_layers: 6
+    num_heads: 12
+    head_dim: 64
+    mlp_dim: 3072
+    use_alibi_2d: true
+    positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+
+    # Train-short/test-long token budgets derived from provided crop geometry.
+    max_tokens_train: 256   # 16 x 16
+    max_tokens_eval: 4096   # 64 x 64
+
+  alibi_2d:
+    enabled: true
+    distance_metric: euclidean
+    coordinate_normalization: divide_by_patch_size
+    patch_size_px: 512
+
+    # Supplementary-detail not provided in paper excerpt/config.yaml.
+    slopes: null
+
+  stage1_view_policy:
+    region_grid_size: [16, 16]
+    global_views: 2
+    global_view_grid_size: [14, 14]
+    local_views: 10
+    local_view_grid_size: [6, 6]
+
+  checkpoint:
+    init_checkpoint: null
+    save_name: titan_v.ckpt
+    strict_load: true
+
+  constraints:
+    require_embed_dim_equals_patch_feature_dim: true
+    require_heads_times_head_dim_equals_embed_dim: true

@@ -1,0 +1,5 @@
+Added the Stage-3 logic analysis to:
+
+- [src/train/stage3_trainer.py](/Users/mingatlas/Projects/Paper2Code/src/train/stage3_trainer.py)
+
+It is aligned to the paper/design/task/config constraints, preserves the exact public interface (`__init__`, `train_step`), uses only provided config values, and explicitly keeps unspecified hyperparameters as unresolved/config-driven.

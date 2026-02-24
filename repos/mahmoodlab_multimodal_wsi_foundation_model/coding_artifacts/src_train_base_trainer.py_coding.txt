@@ -1,0 +1,866 @@
+## Code: src/train/base_trainer.py
+```python
+"""Base training loop engine for TITAN reproduction.
+
+This module provides a reusable trainer foundation with:
+- automatic mixed precision (AMP),
+- gradient accumulation,
+- distributed-safe metric reduction,
+- checkpoint save/load,
+- optional early stopping,
+- unified metric logging.
+
+Design-locked public interface:
+- BaseTrainer.__init__(model: torch.nn.Module, cfg: TrainConfig) -> None
+- BaseTrainer.fit(train_loader: DataLoader, val_loader: DataLoader | None = None) -> None
+- BaseTrainer.train_step(batch: dict) -> dict
+- BaseTrainer.validate_step(batch: dict) -> dict
+- BaseTrainer.save_checkpoint(path: str) -> None
+- BaseTrainer.load_checkpoint(path: str) -> None
+"""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+import os
+import time
+from typing import Any, Dict, Iterator, Mapping, Optional
+
+import torch
+import torch.distributed as dist
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
+
+from src.core.config_schema import TrainConfig
+from src.core.logging_utils import ExperimentLogger
+from src.core.utils import (
+    build_checkpoint_state,
+    ensure_dir,
+    load_checkpoint as load_checkpoint_file,
+    move_to_device,
+    prepare_run_dirs,
+    save_checkpoint as save_checkpoint_file,
+    to_numpy,
+)
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml and shared task contract.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID = (16, 16)
+_STAGE1_GLOBAL_VIEWS: int = 2
+_STAGE1_GLOBAL_GRID = (14, 14)
+_STAGE1_LOCAL_VIEWS: int = 10
+_STAGE1_LOCAL_GRID = (6, 6)
+_STAGE3_CROP_GRID = (64, 64)
+
+_STAGE1_CHECKPOINT_NAME: str = "titan_v.ckpt"
+_STAGE2_CHECKPOINT_NAME: str = "titan_stage2.ckpt"
+_STAGE3_CHECKPOINT_NAME: str = "titan_final.ckpt"
+
+_DEFAULT_DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
+_DEFAULT_OUTPUT_ROOT: str = "./outputs"
+_DEFAULT_LOG_EVERY_N_STEPS: int = 20
+_DEFAULT_SAVE_EVERY_N_STEPS: int = 1000
+_DEFAULT_MAX_GRAD_NORM: Optional[float] = None
+_DEFAULT_SEED: int = 42
+_DEFAULT_EARLY_STOP_MODE: str = "max"
+_DEFAULT_EARLY_STOP_PATIENCE: Optional[int] = None
+_DEFAULT_MONITOR_METRIC: str = "val/loss"
+_DEFAULT_RUN_ID_PREFIX: str = "trainer"
+
+
+class BaseTrainerError(RuntimeError):
+    """Base exception for trainer failures."""
+
+
+class TrainerConfigError(BaseTrainerError):
+    """Raised for invalid trainer configuration."""
+
+
+class TrainerStateError(BaseTrainerError):
+    """Raised when trainer runtime state is invalid."""
+
+
+@dataclass(frozen=True)
+class EarlyStoppingState:
+    """Tracks best monitored metric and patience progress."""
+
+    monitor: str
+    mode: str
+    best_value: Optional[float]
+    patience: Optional[int]
+    bad_epochs: int
+
+
+class BaseTrainer:
+    """Common loop engine for TITAN stage trainers."""
+
+    def __init__(self, model: torch.nn.Module, cfg: TrainConfig) -> None:
+        """Initialize base trainer.
+
+        Args:
+            model: Trainable torch module.
+            cfg: Stage-resolved training config.
+        """
+        if not isinstance(model, torch.nn.Module):
+            raise TrainerConfigError(f"model must be torch.nn.Module, got {type(model).__name__}.")
+        if not isinstance(cfg, TrainConfig):
+            raise TrainerConfigError(f"cfg must be TrainConfig, got {type(cfg).__name__}.")
+
+        self.model: torch.nn.Module = model
+        self.cfg: TrainConfig = cfg
+
+        self.stage: str = str(cfg.stage)
+        self.epochs: int = int(cfg.epochs)
+        self.batch_size: int = int(cfg.batch_size)
+        self.grad_accum_steps: int = int(cfg.grad_accum_steps)
+        self.effective_batch_size: int = int(cfg.effective_batch_size)
+        self.lr: Optional[float] = None if cfg.lr is None else float(cfg.lr)
+        self.weight_decay: Optional[float] = None if cfg.weight_decay is None else float(cfg.weight_decay)
+        self.mixed_precision: bool = bool(cfg.mixed_precision)
+
+        self._validate_basic_cfg()
+
+        self.device: torch.device = self._resolve_device()
+        self.model.to(self.device)
+
+        self.rank: int = int(os.environ.get("RANK", "0"))
+        self.local_rank: int = int(os.environ.get("LOCAL_RANK", "0"))
+        self.world_size: int = int(os.environ.get("WORLD_SIZE", "1"))
+        self.is_distributed: bool = bool(dist.is_available() and dist.is_initialized() and self.world_size > 1)
+        self.is_main_process: bool = bool(self.rank == 0)
+
+        self.optimizer: Optional[torch.optim.Optimizer] = None
+        self.scheduler: Optional[Any] = None
+
+        scaler_enabled: bool = bool(self.mixed_precision and self.device.type == "cuda")
+        self.scaler: Optional[GradScaler] = GradScaler(enabled=scaler_enabled)
+
+        self.current_epoch: int = 0
+        self.global_step: int = 0
+        self.micro_step: int = 0
+
+        self.max_grad_norm: Optional[float] = self._resolve_optional_float(
+            getattr(cfg, "grad_clip_norm", _DEFAULT_MAX_GRAD_NORM)
+        )
+        self.log_every_n_steps: int = self._resolve_positive_int(
+            getattr(cfg, "log_every_n_steps", _DEFAULT_LOG_EVERY_N_STEPS),
+            fallback=_DEFAULT_LOG_EVERY_N_STEPS,
+        )
+        self.save_every_n_steps: int = self._resolve_positive_int(
+            getattr(cfg, "save_every_n_steps", _DEFAULT_SAVE_EVERY_N_STEPS),
+            fallback=_DEFAULT_SAVE_EVERY_N_STEPS,
+        )
+        val_every_candidate: Any = getattr(cfg, "val_every_n_steps", None)
+        self.val_every_n_steps: Optional[int] = (
+            None
+            if val_every_candidate is None
+            else self._resolve_positive_int(val_every_candidate, fallback=_DEFAULT_LOG_EVERY_N_STEPS)
+        )
+
+        self.seed: int = self._resolve_seed()
+        self.output_root: Path = ensure_dir(self._resolve_output_root())
+        self.run_dirs: Dict[str, Path] = prepare_run_dirs(output_dir=self.output_root, stage=self.stage)
+
+        run_id: str = self._build_run_id(prefix=_DEFAULT_RUN_ID_PREFIX)
+        self.logger: ExperimentLogger = ExperimentLogger(
+            run_dir=self.run_dirs["root"],
+            run_id=run_id,
+            stage=self.stage,
+            seed=self.seed,
+            level="INFO",
+            save_json=True,
+            save_csv=True,
+            save_tensorboard=False,
+            is_main_process=self.is_main_process,
+            mode=f"train_{self.stage}",
+            config_snapshot=self._config_snapshot(),
+            config_hash=None,
+        )
+
+        self.early_stopping: EarlyStoppingState = EarlyStoppingState(
+            monitor=str(getattr(cfg, "monitor_metric", _DEFAULT_MONITOR_METRIC)),
+            mode=str(getattr(cfg, "early_stop_mode", _DEFAULT_EARLY_STOP_MODE)).lower(),
+            best_value=None,
+            patience=self._resolve_optional_int(getattr(cfg, "early_stop_patience", _DEFAULT_EARLY_STOP_PATIENCE)),
+            bad_epochs=0,
+        )
+
+        self._validate_early_stop_mode()
+
+        self.last_train_metrics: Dict[str, float] = {}
+        self.last_val_metrics: Dict[str, float] = {}
+
+        self.logger.info(
+            "Initialized BaseTrainer.",
+            context={
+                "stage": self.stage,
+                "device": str(self.device),
+                "is_distributed": self.is_distributed,
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "mixed_precision": bool(self.scaler is not None and self.scaler.is_enabled()),
+                "batch_size": self.batch_size,
+                "grad_accum_steps": self.grad_accum_steps,
+                "effective_batch_size": self.effective_batch_size,
+                "output_root": str(self.output_root),
+            },
+        )
+
+    def fit(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None) -> None:
+        """Run training loop.
+
+        Args:
+            train_loader: Training dataloader.
+            val_loader: Optional validation dataloader.
+        """
+        if not isinstance(train_loader, DataLoader):
+            raise TrainerConfigError(f"train_loader must be DataLoader, got {type(train_loader).__name__}.")
+        if len(train_loader) == 0:
+            raise TrainerConfigError("train_loader is empty.")
+        if val_loader is not None and not isinstance(val_loader, DataLoader):
+            raise TrainerConfigError(f"val_loader must be DataLoader or None, got {type(val_loader).__name__}.")
+
+        if self.optimizer is None:
+            raise TrainerStateError(
+                "optimizer is not set. Subclass must set self.optimizer before calling fit()."
+            )
+
+        self.model.train()
+        train_start_time: float = time.time()
+
+        for epoch in range(self.current_epoch, self.epochs):
+            self.current_epoch = epoch
+            epoch_start_time: float = time.time()
+
+            if self.is_distributed and hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                try:
+                    train_loader.sampler.set_epoch(epoch)
+                except Exception:
+                    pass
+
+            train_metrics: Dict[str, float] = self._run_train_epoch(train_loader=train_loader)
+            self.last_train_metrics = dict(train_metrics)
+
+            val_metrics: Dict[str, float] = {}
+            should_run_val: bool = bool(val_loader is not None)
+            if should_run_val:
+                val_metrics = self._run_validation(val_loader=val_loader)
+                self.last_val_metrics = dict(val_metrics)
+
+            epoch_time_sec: float = float(time.time() - epoch_start_time)
+            summary_context: Dict[str, Any] = {
+                "epoch": int(epoch),
+                "global_step": int(self.global_step),
+                "epoch_time_sec": epoch_time_sec,
+                "train_metrics": train_metrics,
+            }
+            if val_metrics:
+                summary_context["val_metrics"] = val_metrics
+
+            self.logger.info("Completed epoch.", context=summary_context)
+
+            self._save_periodic_checkpoint(epoch=epoch)
+
+            if self._should_stop_early(val_metrics=val_metrics):
+                self.logger.warning(
+                    "Early stopping triggered.",
+                    context={
+                        "epoch": int(epoch),
+                        "monitor": self.early_stopping.monitor,
+                        "best_value": self.early_stopping.best_value,
+                        "bad_epochs": self.early_stopping.bad_epochs,
+                        "patience": self.early_stopping.patience,
+                    },
+                )
+                break
+
+        # Final checkpoint.
+        final_ckpt_path: Path = self._default_checkpoint_path()
+        self.save_checkpoint(path=str(final_ckpt_path))
+
+        total_time_sec: float = float(time.time() - train_start_time)
+        self.logger.write_summary(
+            extra={
+                "stage": self.stage,
+                "epochs_completed": int(self.current_epoch + 1),
+                "global_step": int(self.global_step),
+                "total_time_sec": total_time_sec,
+                "final_checkpoint": str(final_ckpt_path),
+            },
+            save=True,
+        )
+        self.logger.close(write_final_summary=True)
+
+    def train_step(self, batch: dict) -> dict:
+        """Run a single training step.
+
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("Subclasses must implement train_step(batch).")
+
+    def validate_step(self, batch: dict) -> dict:
+        """Run a single validation step.
+
+        Subclasses should override this method when validation is used.
+        """
+        raise NotImplementedError("Subclasses must implement validate_step(batch).")
+
+    def save_checkpoint(self, path: str) -> None:
+        """Save checkpoint with model/training states."""
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("path must be a non-empty string.")
+
+        if self.optimizer is None:
+            raise TrainerStateError("Cannot save checkpoint without optimizer state.")
+
+        state: Dict[str, Any] = build_checkpoint_state(
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            ema_teacher_state_dict=self._export_optional_ema_state(),
+            epoch=int(self.current_epoch),
+            global_step=int(self.global_step),
+            config_snapshot=self._config_snapshot(),
+            runtime_metadata=self._runtime_metadata(),
+            extra_state={
+                "micro_step": int(self.micro_step),
+                "stage": self.stage,
+                "early_stopping": {
+                    "monitor": self.early_stopping.monitor,
+                    "mode": self.early_stopping.mode,
+                    "best_value": self.early_stopping.best_value,
+                    "patience": self.early_stopping.patience,
+                    "bad_epochs": self.early_stopping.bad_epochs,
+                },
+            },
+        )
+
+        saved_path: Optional[Path] = save_checkpoint_file(
+            state=state,
+            path=path,
+            is_main_process_flag=self.is_main_process,
+        )
+
+        if self.is_distributed:
+            dist.barrier()
+
+        if self.is_main_process:
+            self.logger.log_checkpoint(
+                checkpoint_path=str(saved_path if saved_path is not None else path),
+                epoch=int(self.current_epoch),
+                global_step=int(self.global_step),
+                is_best=False,
+                context={"stage": self.stage},
+            )
+
+    def load_checkpoint(self, path: str) -> None:
+        """Load checkpoint and restore training state."""
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("path must be a non-empty string.")
+
+        checkpoint: Dict[str, Any] = load_checkpoint_file(path=path, map_location="cpu")
+
+        model_state: Any = checkpoint.get("model_state_dict")
+        if not isinstance(model_state, Mapping):
+            raise TrainerStateError("Checkpoint missing 'model_state_dict'.")
+        self.model.load_state_dict(model_state, strict=True)
+
+        optimizer_restored: bool = False
+        if self.optimizer is not None and "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            optimizer_restored = True
+
+        scheduler_restored: bool = False
+        if self.scheduler is not None and "scheduler_state_dict" in checkpoint and hasattr(self.scheduler, "load_state_dict"):
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            scheduler_restored = True
+
+        scaler_restored: bool = False
+        if self.scaler is not None and "scaler_state_dict" in checkpoint and hasattr(self.scaler, "load_state_dict"):
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            scaler_restored = True
+
+        self.current_epoch = int(checkpoint.get("epoch", 0))
+        self.global_step = int(checkpoint.get("global_step", 0))
+
+        extra_state: Any = checkpoint.get("extra_state", {})
+        if isinstance(extra_state, Mapping):
+            self.micro_step = int(extra_state.get("micro_step", 0))
+            early_state: Any = extra_state.get("early_stopping", {})
+            if isinstance(early_state, Mapping):
+                best_value_raw: Any = early_state.get("best_value")
+                best_value: Optional[float]
+                if best_value_raw is None:
+                    best_value = None
+                else:
+                    best_value = float(best_value_raw)
+
+                patience_raw: Any = early_state.get("patience")
+                patience: Optional[int] = None if patience_raw is None else int(patience_raw)
+
+                self.early_stopping = EarlyStoppingState(
+                    monitor=str(early_state.get("monitor", self.early_stopping.monitor)),
+                    mode=str(early_state.get("mode", self.early_stopping.mode)),
+                    best_value=best_value,
+                    patience=patience,
+                    bad_epochs=int(early_state.get("bad_epochs", self.early_stopping.bad_epochs)),
+                )
+
+        self._load_optional_ema_state(checkpoint)
+
+        self.logger.log_resume(
+            resumed=True,
+            checkpoint_path=path,
+            start_epoch=int(self.current_epoch),
+            global_step=int(self.global_step),
+            optimizer_restored=optimizer_restored,
+            scaler_restored=scaler_restored,
+        )
+        if scheduler_restored:
+            self.logger.info("Scheduler state restored from checkpoint.")
+
+    # ------------------------------------------------------------------
+    # Internal loop methods
+    # ------------------------------------------------------------------
+    def _run_train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
+        if self.optimizer is None:
+            raise TrainerStateError("optimizer is not set.")
+
+        self.model.train()
+
+        aggregated_metrics: Dict[str, float] = {}
+        aggregated_counts: Dict[str, int] = {}
+
+        for batch_index, batch in enumerate(train_loader):
+            self.micro_step += 1
+
+            is_accum_boundary: bool = bool(((batch_index + 1) % self.grad_accum_steps) == 0)
+            is_last_batch: bool = bool((batch_index + 1) == len(train_loader))
+            should_step: bool = bool(is_accum_boundary or is_last_batch)
+
+            with self._no_sync_context(should_sync=should_step):
+                metrics: Dict[str, Any] = self._run_train_micro_step(batch=batch, should_step=should_step)
+
+            reduced_metrics: Dict[str, float] = self._reduce_metrics(metrics)
+            self._accumulate_epoch_metrics(aggregated_metrics, aggregated_counts, reduced_metrics)
+
+            if self.is_main_process and ((self.micro_step % self.log_every_n_steps) == 0 or should_step):
+                self.logger.log_metrics(
+                    metrics=reduced_metrics,
+                    split="train",
+                    epoch=int(self.current_epoch),
+                    global_step=int(self.global_step),
+                    context={
+                        "micro_step": int(self.micro_step),
+                        "batch_index": int(batch_index),
+                        "should_step": bool(should_step),
+                    },
+                )
+
+            if should_step and self.is_main_process and (self.global_step > 0) and ((self.global_step % self.save_every_n_steps) == 0):
+                periodic_path: Path = self.run_dirs["checkpoints"] / f"step_{self.global_step}.ckpt"
+                self.save_checkpoint(path=str(periodic_path))
+
+        epoch_metrics: Dict[str, float] = self._finalize_epoch_metrics(aggregated_metrics, aggregated_counts)
+        return epoch_metrics
+
+    def _run_train_micro_step(self, batch: Any, should_step: bool) -> Dict[str, Any]:
+        if self.optimizer is None:
+            raise TrainerStateError("optimizer is not set.")
+
+        batch_on_device: Any = move_to_device(batch=batch, device=self.device, non_blocking=True)
+
+        autocast_enabled: bool = bool(self.scaler is not None and self.scaler.is_enabled())
+        autocast_dtype: torch.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+
+        with autocast(enabled=autocast_enabled, dtype=autocast_dtype):
+            step_outputs: Dict[str, Any] = self.train_step(batch_on_device)
+
+        if not isinstance(step_outputs, Mapping):
+            raise TrainerStateError(
+                f"train_step must return a mapping, got {type(step_outputs).__name__}."
+            )
+        if "loss" not in step_outputs:
+            raise TrainerStateError("train_step output must contain key 'loss'.")
+
+        raw_loss_obj: Any = step_outputs["loss"]
+        if not isinstance(raw_loss_obj, torch.Tensor):
+            raise TrainerStateError(
+                f"train_step['loss'] must be torch.Tensor, got {type(raw_loss_obj).__name__}."
+            )
+        if raw_loss_obj.ndim != 0:
+            raise TrainerStateError(
+                f"train_step['loss'] must be scalar tensor, got shape {tuple(raw_loss_obj.shape)}."
+            )
+
+        if not torch.isfinite(raw_loss_obj):
+            raise TrainerStateError("Encountered non-finite training loss.")
+
+        scaled_loss_for_backward: torch.Tensor = raw_loss_obj / float(self.grad_accum_steps)
+
+        if self.scaler is not None and self.scaler.is_enabled():
+            self.scaler.scale(scaled_loss_for_backward).backward()
+        else:
+            scaled_loss_for_backward.backward()
+
+        if should_step:
+            if self.max_grad_norm is not None and self.max_grad_norm > 0.0:
+                if self.scaler is not None and self.scaler.is_enabled():
+                    self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=float(self.max_grad_norm))
+
+            if self.scaler is not None and self.scaler.is_enabled():
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+
+            self.optimizer.zero_grad(set_to_none=True)
+
+            if self.scheduler is not None and hasattr(self.scheduler, "step"):
+                self.scheduler.step()
+
+            self.global_step += 1
+            self._on_optimizer_step()
+
+        # Expose logging metrics.
+        metrics: Dict[str, Any] = dict(step_outputs)
+        metrics["loss"] = raw_loss_obj.detach()
+        metrics["loss_backward"] = scaled_loss_for_backward.detach()
+        metrics["global_step"] = float(self.global_step)
+        return metrics
+
+    def _run_validation(self, val_loader: DataLoader) -> Dict[str, float]:
+        self.model.eval()
+
+        aggregated_metrics: Dict[str, float] = {}
+        aggregated_counts: Dict[str, int] = {}
+
+        with torch.no_grad():
+            for batch_index, batch in enumerate(val_loader):
+                batch_on_device: Any = move_to_device(batch=batch, device=self.device, non_blocking=True)
+
+                autocast_enabled: bool = bool(self.scaler is not None and self.scaler.is_enabled())
+                autocast_dtype: torch.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+
+                with autocast(enabled=autocast_enabled, dtype=autocast_dtype):
+                    outputs: Dict[str, Any] = self.validate_step(batch_on_device)
+
+                if not isinstance(outputs, Mapping):
+                    raise TrainerStateError(
+                        f"validate_step must return a mapping, got {type(outputs).__name__}."
+                    )
+
+                reduced: Dict[str, float] = self._reduce_metrics(outputs)
+                self._accumulate_epoch_metrics(aggregated_metrics, aggregated_counts, reduced)
+
+                if self.is_main_process and ((batch_index + 1) % self.log_every_n_steps == 0):
+                    self.logger.log_metrics(
+                        metrics=reduced,
+                        split="val",
+                        epoch=int(self.current_epoch),
+                        global_step=int(self.global_step),
+                        context={"batch_index": int(batch_index)},
+                    )
+
+        epoch_metrics: Dict[str, float] = self._finalize_epoch_metrics(aggregated_metrics, aggregated_counts)
+
+        if self.is_main_process and len(epoch_metrics) > 0:
+            self.logger.log_metrics(
+                metrics=epoch_metrics,
+                split="val",
+                epoch=int(self.current_epoch),
+                global_step=int(self.global_step),
+                context={"epoch_summary": True},
+            )
+
+        self.model.train()
+        return epoch_metrics
+
+    # ------------------------------------------------------------------
+    # Hooks for subclasses
+    # ------------------------------------------------------------------
+    def _on_optimizer_step(self) -> None:
+        """Optional hook called after each optimizer step."""
+
+    def _export_optional_ema_state(self) -> Optional[Mapping[str, Any]]:
+        """Optional hook for stage-specific EMA teacher state export."""
+        if hasattr(self, "ema_teacher") and isinstance(getattr(self, "ema_teacher"), torch.nn.Module):
+            ema_model: torch.nn.Module = getattr(self, "ema_teacher")
+            return ema_model.state_dict()
+        return None
+
+    def _load_optional_ema_state(self, checkpoint: Mapping[str, Any]) -> None:
+        """Optional hook for stage-specific EMA teacher state restore."""
+        raw_ema: Any = checkpoint.get("ema_teacher_state_dict")
+        if not isinstance(raw_ema, Mapping):
+            return
+
+        if hasattr(self, "ema_teacher") and isinstance(getattr(self, "ema_teacher"), torch.nn.Module):
+            ema_model: torch.nn.Module = getattr(self, "ema_teacher")
+            ema_model.load_state_dict(raw_ema, strict=False)
+
+    # ------------------------------------------------------------------
+    # Utilities
+    # ------------------------------------------------------------------
+    def _validate_basic_cfg(self) -> None:
+        if self.epochs <= 0:
+            raise TrainerConfigError("cfg.epochs must be > 0.")
+        if self.batch_size <= 0:
+            raise TrainerConfigError("cfg.batch_size must be > 0.")
+        if self.grad_accum_steps <= 0:
+            raise TrainerConfigError("cfg.grad_accum_steps must be > 0.")
+        if self.effective_batch_size <= 0:
+            raise TrainerConfigError("cfg.effective_batch_size must be > 0.")
+
+    def _resolve_device(self) -> torch.device:
+        requested: str = str(getattr(self.cfg, "device", _DEFAULT_DEVICE))
+        if requested.startswith("cuda") and torch.cuda.is_available():
+            return torch.device(requested)
+        if requested == "cpu":
+            return torch.device("cpu")
+        return torch.device(_DEFAULT_DEVICE)
+
+    def _resolve_output_root(self) -> Path:
+        candidate: Any = getattr(self.cfg, "output_root", None)
+        if candidate is None:
+            candidate = os.environ.get("TITAN_OUTPUT_ROOT", _DEFAULT_OUTPUT_ROOT)
+        return Path(str(candidate)).expanduser().resolve()
+
+    def _resolve_seed(self) -> int:
+        raw_seed: Any = getattr(self.cfg, "seed", None)
+        if raw_seed is None:
+            raw_seed = os.environ.get("TITAN_SEED", str(_DEFAULT_SEED))
+        seed_value: int = int(raw_seed)
+        if seed_value < 0:
+            raise TrainerConfigError("seed must be >= 0.")
+        return seed_value
+
+    @staticmethod
+    def _resolve_positive_int(value: Any, fallback: int) -> int:
+        if value is None:
+            return int(fallback)
+        value_int: int = int(value)
+        if value_int <= 0:
+            raise TrainerConfigError(f"Expected positive integer, got {value_int}.")
+        return value_int
+
+    @staticmethod
+    def _resolve_optional_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        value_int: int = int(value)
+        if value_int < 0:
+            raise TrainerConfigError(f"Expected optional int >= 0, got {value_int}.")
+        return value_int
+
+    @staticmethod
+    def _resolve_optional_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        value_float: float = float(value)
+        if value_float < 0.0:
+            raise TrainerConfigError(f"Expected optional float >= 0.0, got {value_float}.")
+        return value_float
+
+    def _validate_early_stop_mode(self) -> None:
+        mode: str = self.early_stopping.mode
+        if mode not in {"min", "max"}:
+            raise TrainerConfigError(
+                f"early_stop_mode must be 'min' or 'max', got {mode!r}."
+            )
+
+    def _config_snapshot(self) -> Dict[str, Any]:
+        if hasattr(self.cfg, "model_dump") and callable(self.cfg.model_dump):
+            cfg_dict: Dict[str, Any] = dict(self.cfg.model_dump())
+        elif hasattr(self.cfg, "dict") and callable(self.cfg.dict):
+            cfg_dict = dict(self.cfg.dict())
+        else:
+            cfg_dict = dict(vars(self.cfg))
+
+        cfg_dict["paper_constants"] = {
+            "patch_size_px": _PATCH_SIZE_PX,
+            "magnification": _MAGNIFICATION,
+            "feature_dim": _FEATURE_DIM,
+            "stage1_region_grid": list(_STAGE1_REGION_GRID),
+            "stage1_global_views": _STAGE1_GLOBAL_VIEWS,
+            "stage1_global_grid": list(_STAGE1_GLOBAL_GRID),
+            "stage1_local_views": _STAGE1_LOCAL_VIEWS,
+            "stage1_local_grid": list(_STAGE1_LOCAL_GRID),
+            "stage3_crop_grid": list(_STAGE3_CROP_GRID),
+        }
+        return cfg_dict
+
+    def _runtime_metadata(self) -> Dict[str, Any]:
+        return {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "stage": self.stage,
+            "device": str(self.device),
+            "rank": self.rank,
+            "local_rank": self.local_rank,
+            "world_size": self.world_size,
+            "is_distributed": self.is_distributed,
+            "torch_version": torch.__version__,
+            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_version": torch.version.cuda,
+            "patch_size_px": _PATCH_SIZE_PX,
+            "magnification": _MAGNIFICATION,
+            "feature_dim": _FEATURE_DIM,
+        }
+
+    def _default_checkpoint_path(self) -> Path:
+        if self.stage == "stage1_titan_v":
+            filename: str = _STAGE1_CHECKPOINT_NAME
+        elif self.stage == "stage2_roi_caption_alignment":
+            filename = _STAGE2_CHECKPOINT_NAME
+        elif self.stage == "stage3_wsi_report_alignment":
+            filename = _STAGE3_CHECKPOINT_NAME
+        else:
+            filename = f"{self.stage}.ckpt"
+        return self.run_dirs["checkpoints"] / filename
+
+    def _save_periodic_checkpoint(self, epoch: int) -> None:
+        path: Path = self.run_dirs["checkpoints"] / f"epoch_{epoch:04d}.ckpt"
+        self.save_checkpoint(path=str(path))
+
+    def _build_run_id(self, prefix: str) -> str:
+        ts: str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return f"{prefix}_{self.stage}_{ts}"
+
+    @contextmanager
+    def _no_sync_context(self, should_sync: bool) -> Iterator[None]:
+        if should_sync:
+            yield
+            return
+
+        no_sync_fn: Any = getattr(self.model, "no_sync", None)
+        if callable(no_sync_fn):
+            with no_sync_fn():
+                yield
+            return
+
+        yield
+
+    def _reduce_metrics(self, metrics: Mapping[str, Any]) -> Dict[str, float]:
+        reduced: Dict[str, float] = {}
+        for key, value in metrics.items():
+            scalar: Optional[float] = self._coerce_metric_to_float(value)
+            if scalar is None:
+                continue
+            reduced[str(key)] = self._distributed_mean(scalar)
+        return reduced
+
+    def _coerce_metric_to_float(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+
+        if isinstance(value, (int, float, bool)):
+            return float(value)
+
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            if value.ndim == 0 or value.numel() == 1:
+                return float(value.detach().cpu().item())
+            return float(value.detach().cpu().float().mean().item())
+
+        try:
+            array = to_numpy(value)
+        except Exception:
+            return None
+
+        if array.size == 0:
+            return None
+        return float(array.mean())
+
+    def _distributed_mean(self, value: float) -> float:
+        if not self.is_distributed:
+            return float(value)
+
+        tensor: torch.Tensor = torch.tensor(value, device=self.device, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor = tensor / float(self.world_size)
+        return float(tensor.item())
+
+    @staticmethod
+    def _accumulate_epoch_metrics(
+        metric_sums: Dict[str, float],
+        metric_counts: Dict[str, int],
+        values: Mapping[str, float],
+    ) -> None:
+        for key, value in values.items():
+            metric_sums[key] = float(metric_sums.get(key, 0.0) + float(value))
+            metric_counts[key] = int(metric_counts.get(key, 0) + 1)
+
+    @staticmethod
+    def _finalize_epoch_metrics(metric_sums: Mapping[str, float], metric_counts: Mapping[str, int]) -> Dict[str, float]:
+        finalized: Dict[str, float] = {}
+        for key, total in metric_sums.items():
+            count: int = int(metric_counts.get(key, 0))
+            if count <= 0:
+                continue
+            finalized[key] = float(total) / float(count)
+        return finalized
+
+    def _should_stop_early(self, val_metrics: Mapping[str, float]) -> bool:
+        patience: Optional[int] = self.early_stopping.patience
+        if patience is None:
+            return False
+
+        monitor: str = self.early_stopping.monitor
+        if monitor not in val_metrics:
+            return False
+
+        current: float = float(val_metrics[monitor])
+        best: Optional[float] = self.early_stopping.best_value
+
+        improved: bool
+        if best is None:
+            improved = True
+        elif self.early_stopping.mode == "min":
+            improved = bool(current < best)
+        else:
+            improved = bool(current > best)
+
+        if improved:
+            self.early_stopping = EarlyStoppingState(
+                monitor=self.early_stopping.monitor,
+                mode=self.early_stopping.mode,
+                best_value=current,
+                patience=self.early_stopping.patience,
+                bad_epochs=0,
+            )
+            if self.is_main_process:
+                best_path: Path = self.run_dirs["checkpoints"] / "best.ckpt"
+                self.save_checkpoint(path=str(best_path))
+            return False
+
+        new_bad_epochs: int = int(self.early_stopping.bad_epochs + 1)
+        self.early_stopping = EarlyStoppingState(
+            monitor=self.early_stopping.monitor,
+            mode=self.early_stopping.mode,
+            best_value=self.early_stopping.best_value,
+            patience=self.early_stopping.patience,
+            bad_epochs=new_bad_epochs,
+        )
+        return bool(new_bad_epochs >= patience)
+
+
+__all__ = [
+    "BaseTrainerError",
+    "TrainerConfigError",
+    "TrainerStateError",
+    "EarlyStoppingState",
+    "BaseTrainer",
+]
+```

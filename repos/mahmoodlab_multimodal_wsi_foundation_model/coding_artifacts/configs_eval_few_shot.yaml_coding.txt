@@ -1,0 +1,105 @@
+## Code: configs/eval/few_shot.yaml
+```python
+# configs/eval/few_shot.yaml
+# Few-shot evaluation configuration for TITAN-style frozen slide embeddings.
+# Values are bound to the provided config.yaml. Any missing paper details are
+# represented with explicit, safe defaults.
+
+eval:
+  name: few_shot
+  enabled: true
+  task_type: classification
+
+  runtime:
+    python_version: "3.9.16"
+    pytorch_version: "2.0.1"
+    cuda_version: "11.8"
+    deterministic: true
+
+  hardware:
+    gpus: 1
+    gpu_type: "NVIDIA 3090 24GB"
+    num_workers: 4
+    pin_memory: true
+
+  data:
+    patch_size_px: 512
+    magnification: "20x"
+    patch_feature_dim: 768
+
+    # Shared artifact contract used across this project.
+    artifacts:
+      features_filename: "features.h5"
+      grid_filename: "grid.pt"
+      splits_filename: "splits.csv"
+
+    # Split policy for few-shot protocol: support is sampled from train split,
+    # evaluation is performed on a fixed test split.
+    split_policy:
+      support_split: "train"
+      query_split: "test"
+      use_validation_split: false
+
+  model:
+    # Few-shot evaluation runs on frozen embeddings.
+    embedding_dim: 768
+    encoder_checkpoint: "titan_final.ckpt"
+    freeze_backbone: true
+
+  protocol:
+    shots: [1, 2, 4, 8, 16, 32]
+    runs: 50
+    sample_with_replacement: false
+
+    # Paper rule: if class has fewer than K samples, use all samples of class.
+    use_all_if_class_below_k: true
+
+    # Deterministic seed for reproducibility across runs.
+    base_seed: 42
+
+  preprocessing:
+    center_embeddings: true
+    l2_normalize_embeddings: true
+
+    # Center/L2 are fitted on support set of each run and reused on query/test.
+    fit_statistics_on_support_only: true
+
+  modes:
+    # Primary few-shot mode from paper-aligned protocol.
+    simpleshot:
+      enabled: true
+      distance: "euclidean"
+      prototype_aggregation: "mean"
+
+    # Optional comparability mode; no validation available in few-shot.
+    linear_probe:
+      enabled: true
+      method: "scikit-learn logistic regression (L-BFGS)"
+      l2_regularization: 1.0
+      max_iter: 1000
+
+  metrics:
+    multiclass:
+      - "balanced_accuracy"
+      - "weighted_f1"
+    binary:
+      - "balanced_accuracy"
+      - "auroc"
+
+    aggregate:
+      report_mean_std_over_runs: true
+      bootstrap_samples: 1000
+
+  io:
+    output_dir: "./outputs/eval/few_shot"
+    save_per_run_records: true
+    per_run_filename: "few_shot_runs.jsonl"
+    summary_filename: "few_shot_summary.csv"
+    write_json: true
+    write_csv: true
+
+  constraints:
+    require_embedding_dim_match: true
+    require_test_split_fixed_across_runs: true
+    require_support_sampling_from_train_only: true
+```

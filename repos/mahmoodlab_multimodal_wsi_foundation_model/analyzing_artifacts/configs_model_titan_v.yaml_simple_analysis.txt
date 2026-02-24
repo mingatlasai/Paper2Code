@@ -1,0 +1,8 @@
+Implemented the logic analysis in:
+
+- [configs/model/titan_v.yaml](/Users/mingatlas/Projects/Paper2Code/configs/model/titan_v.yaml)
+
+It is YAML-valid and aligned to:
+- the paper’s TITAN-V/stage-1 methodology,
+- your fixed design interfaces (without adding new public methods),
+- and only explicit values from `config.yaml` (with unresolved paper details kept explicitly unresolved).

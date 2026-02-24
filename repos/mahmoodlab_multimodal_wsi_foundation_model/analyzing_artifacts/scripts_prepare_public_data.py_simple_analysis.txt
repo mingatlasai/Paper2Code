@@ -1,0 +1,7 @@
+Created a full logic-analysis document in [scripts/prepare_public_data.py](/Users/mingatlas/Projects/Paper2Code/scripts/prepare_public_data.py).
+
+It is structured for implementation and aligned to the paper, the provided design interfaces, the task constraints, and `config.yaml`, with emphasis on:
+- exact config-bound constants (512 patch, 20x, 768-d, 16x16/64x64 compatibility),
+- end-to-end idempotent artifact preparation flow,
+- strict artifact contracts (`features.h5`, `grid.pt`, `splits.csv`, optional `pairs.jsonl`),
+- deterministic/reproducible behavior and explicit handling of unresolved paper details.

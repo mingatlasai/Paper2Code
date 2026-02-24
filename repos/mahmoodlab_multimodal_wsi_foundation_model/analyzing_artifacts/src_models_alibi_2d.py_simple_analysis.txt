@@ -1,0 +1,10 @@
+Implemented the requested logic analysis in [src/models/alibi_2d.py](/Users/mingatlas/Projects/Paper2Code/src/models/alibi_2d.py).
+
+It is now a paper- and `config.yaml`-aligned specification for 2D ALiBi covering:
+- Required class interface (`__init__`, `build_bias`, `apply`) per design
+- Euclidean-distance ALiBi math contract
+- Tensor shape contracts and broadcasting rules
+- Validation/error-handling rules
+- Numerical/performance considerations for long contexts
+- Reproducibility constraints and unit-test mapping
+- Explicit handling of unknown supplementary hyperparameters (kept configurable, not invented)

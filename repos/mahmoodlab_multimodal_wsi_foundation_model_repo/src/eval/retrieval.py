@@ -1,0 +1,691 @@
+"""Retrieval evaluation for TITAN slide and multimodal embeddings.
+
+This module implements design-locked retrieval interfaces:
+- Evaluator.run_slide_retrieval(query, db, yq, ydb) -> dict
+- Evaluator.run_cross_modal_retrieval(slide_emb, report_emb, labels) -> dict
+
+Protocol alignment:
+- Unimodal slide retrieval:
+  - Database-centered + L2-normalized embeddings
+  - Euclidean ranking
+  - Metrics: Acc@1/3/5, MVAcc@5
+- Cross-modal retrieval:
+  - L2-normalized slide/report embeddings
+  - Cosine similarity ranking
+  - Metrics: Recall@1/3/5/10, mean recall (both directions)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+
+
+# -----------------------------------------------------------------------------
+# Config-locked constants from provided config.yaml.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE_PX: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+_SLIDE_RETRIEVAL_K: Tuple[int, ...] = (1, 3, 5)
+_CROSS_MODAL_RECALL_K: Tuple[int, ...] = (1, 3, 5, 10)
+_MAJORITY_VOTE_K: int = 5
+_MAJORITY_TIE_BREAK: str = "lowest_distance_sum"
+
+_DEFAULT_EPS: float = 1.0e-12
+
+
+class RetrievalError(RuntimeError):
+    """Base exception for retrieval evaluation failures."""
+
+
+class RetrievalSchemaError(RetrievalError):
+    """Raised when retrieval input/output contracts are violated."""
+
+
+@dataclass(frozen=True)
+class _PreparedUnimodal:
+    """Prepared unimodal retrieval inputs."""
+
+    query: np.ndarray  # [Nq, D], centered+normalized
+    database: np.ndarray  # [Nd, D], centered+normalized
+    yq_encoded: np.ndarray  # [Nq]
+    ydb_encoded: np.ndarray  # [Nd]
+    classes: np.ndarray  # [C]
+
+
+@dataclass(frozen=True)
+class _PreparedCrossModal:
+    """Prepared cross-modal retrieval inputs."""
+
+    slide: np.ndarray  # [N, D], normalized
+    report: np.ndarray  # [N, D], normalized
+    labels_encoded: np.ndarray  # [N]
+    classes: np.ndarray  # [C]
+
+
+class RetrievalEvaluator:
+    """Retrieval evaluator with deterministic ranking and strict schema checks."""
+
+    def __init__(
+        self,
+        slide_retrieval_k: Sequence[int] = _SLIDE_RETRIEVAL_K,
+        cross_modal_recall_k: Sequence[int] = _CROSS_MODAL_RECALL_K,
+        majority_vote_k: int = _MAJORITY_VOTE_K,
+        majority_vote_tie_break: str = _MAJORITY_TIE_BREAK,
+        embedding_service: Optional[Any] = None,
+        eps: float = _DEFAULT_EPS,
+    ) -> None:
+        if not isinstance(slide_retrieval_k, Sequence) or isinstance(slide_retrieval_k, (str, bytes)):
+            raise TypeError("slide_retrieval_k must be a sequence of integers.")
+        slide_k_tuple: Tuple[int, ...] = tuple(int(value) for value in slide_retrieval_k)
+        if slide_k_tuple != _SLIDE_RETRIEVAL_K:
+            raise ValueError(
+                f"slide_retrieval_k must be {list(_SLIDE_RETRIEVAL_K)}, got {list(slide_k_tuple)}."
+            )
+
+        if not isinstance(cross_modal_recall_k, Sequence) or isinstance(cross_modal_recall_k, (str, bytes)):
+            raise TypeError("cross_modal_recall_k must be a sequence of integers.")
+        cross_k_tuple: Tuple[int, ...] = tuple(int(value) for value in cross_modal_recall_k)
+        if cross_k_tuple != _CROSS_MODAL_RECALL_K:
+            raise ValueError(
+                "cross_modal_recall_k must be "
+                f"{list(_CROSS_MODAL_RECALL_K)}, got {list(cross_k_tuple)}."
+            )
+
+        if isinstance(majority_vote_k, bool) or not isinstance(majority_vote_k, int):
+            raise TypeError("majority_vote_k must be an integer.")
+        if majority_vote_k != _MAJORITY_VOTE_K:
+            raise ValueError(f"majority_vote_k must be {_MAJORITY_VOTE_K}, got {majority_vote_k}.")
+
+        tie_break_value: str = str(majority_vote_tie_break).strip().lower()
+        if tie_break_value != _MAJORITY_TIE_BREAK:
+            raise ValueError(
+                "majority_vote_tie_break must be "
+                f"'{_MAJORITY_TIE_BREAK}', got '{majority_vote_tie_break}'."
+            )
+
+        if embedding_service is not None:
+            center_fn: Any = getattr(embedding_service, "center_and_l2", None)
+            if not callable(center_fn):
+                raise TypeError(
+                    "embedding_service must implement callable center_and_l2(x, mean_vec=None)."
+                )
+
+        if not isinstance(eps, (int, float)):
+            raise TypeError("eps must be numeric.")
+        eps_value: float = float(eps)
+        if eps_value <= 0.0:
+            raise ValueError("eps must be > 0.")
+
+        self.slide_retrieval_k: Tuple[int, ...] = slide_k_tuple
+        self.cross_modal_recall_k: Tuple[int, ...] = cross_k_tuple
+        self.majority_vote_k: int = int(majority_vote_k)
+        self.majority_vote_tie_break: str = tie_break_value
+        self.embedding_service: Optional[Any] = embedding_service
+        self.eps: float = eps_value
+
+        self.patch_size_px: int = _PATCH_SIZE_PX
+        self.magnification: str = _MAGNIFICATION
+        self.feature_dim: int = _FEATURE_DIM
+        self.stage1_region_grid: Tuple[int, int] = _STAGE1_REGION_GRID
+        self.stage3_crop_grid: Tuple[int, int] = _STAGE3_CROP_GRID
+
+    def run_slide_retrieval(
+        self,
+        query: np.ndarray,
+        db: np.ndarray,
+        yq: np.ndarray,
+        ydb: np.ndarray,
+    ) -> dict:
+        """Run unimodal slide retrieval.
+
+        Args:
+            query: Query embeddings [Nq, 768].
+            db: Database embeddings [Nd, 768].
+            yq: Query labels [Nq].
+            ydb: Database labels [Nd].
+
+        Returns:
+            Dictionary with Acc@1/3/5 and MVAcc@5 metrics and protocol metadata.
+        """
+        prepared: _PreparedUnimodal = self._prepare_unimodal(
+            query=query,
+            db=db,
+            yq=yq,
+            ydb=ydb,
+        )
+
+        n_query: int = int(prepared.query.shape[0])
+        n_database: int = int(prepared.database.shape[0])
+        k_required: int = max(max(self.slide_retrieval_k), self.majority_vote_k)
+        if k_required > n_database:
+            raise RetrievalSchemaError(
+                "Database size is smaller than required retrieval K. "
+                f"required={k_required}, database={n_database}."
+            )
+
+        dist_matrix: np.ndarray = self._pairwise_euclidean(prepared.query, prepared.database)
+
+        # Deterministic top-K selection with tie-break on candidate index.
+        top_indices: np.ndarray = self._topk_indices_by_distance(
+            matrix=dist_matrix,
+            k=k_required,
+        )
+
+        metrics: Dict[str, float] = {}
+        for k_value in self.slide_retrieval_k:
+            topk_idx: np.ndarray = top_indices[:, : int(k_value)]
+            topk_labels: np.ndarray = prepared.ydb_encoded[topk_idx]
+            success: np.ndarray = np.any(
+                topk_labels == prepared.yq_encoded.reshape(-1, 1),
+                axis=1,
+            )
+            metrics[f"acc_at_{int(k_value)}"] = float(np.mean(success.astype(np.float64)))
+
+        mv_success, tie_count = self._compute_majority_vote_success(
+            top_indices=top_indices[:, : self.majority_vote_k],
+            top_distances=dist_matrix[np.arange(n_query).reshape(-1, 1), top_indices[:, : self.majority_vote_k]],
+            yq=prepared.yq_encoded,
+            ydb=prepared.ydb_encoded,
+        )
+        metrics[f"mvacc_at_{self.majority_vote_k}"] = float(np.mean(mv_success.astype(np.float64)))
+
+        return {
+            "task": "slide_retrieval",
+            "input": {
+                "num_queries": int(n_query),
+                "num_database": int(n_database),
+                "embedding_dim": int(self.feature_dim),
+                "num_classes_union": int(prepared.classes.shape[0]),
+                "classes": [str(value) for value in prepared.classes.tolist()],
+            },
+            "protocol": {
+                "distance": "euclidean",
+                "preprocessing": {
+                    "center_embeddings": True,
+                    "l2_normalize_embeddings": True,
+                    "fit_center_on_database_only": True,
+                },
+                "k_values": [int(value) for value in self.slide_retrieval_k],
+                "majority_vote_k": int(self.majority_vote_k),
+                "majority_vote_tie_break": str(self.majority_vote_tie_break),
+            },
+            "metrics": metrics,
+            "diagnostics": {
+                "mv_tie_count": int(tie_count),
+            },
+        }
+
+    def run_cross_modal_retrieval(
+        self,
+        slide_emb: np.ndarray,
+        report_emb: np.ndarray,
+        labels: np.ndarray,
+    ) -> dict:
+        """Run cross-modal retrieval in both directions.
+
+        Args:
+            slide_emb: Slide embeddings [N, 768].
+            report_emb: Report embeddings [N, 768].
+            labels: Class labels aligned with paired slide/report rows [N].
+
+        Returns:
+            Dictionary containing slide->report and report->slide Recall@K metrics.
+        """
+        prepared: _PreparedCrossModal = self._prepare_cross_modal(
+            slide_emb=slide_emb,
+            report_emb=report_emb,
+            labels=labels,
+        )
+
+        n_items: int = int(prepared.slide.shape[0])
+        max_k: int = max(self.cross_modal_recall_k)
+        if max_k > n_items:
+            raise RetrievalSchemaError(
+                "Number of paired items is smaller than required recall K. "
+                f"required={max_k}, available={n_items}."
+            )
+
+        similarity: np.ndarray = np.matmul(prepared.slide, prepared.report.T)
+        if similarity.ndim != 2:
+            raise RetrievalSchemaError(
+                f"Cross-modal similarity must be rank-2 [N,N], got {tuple(similarity.shape)}."
+            )
+
+        slide_to_report: Dict[str, Any] = self._run_cross_modal_direction(
+            score_matrix=similarity,
+            query_labels=prepared.labels_encoded,
+            candidate_labels=prepared.labels_encoded,
+            k_values=self.cross_modal_recall_k,
+            direction_name="slide_to_report",
+        )
+        report_to_slide: Dict[str, Any] = self._run_cross_modal_direction(
+            score_matrix=similarity.T,
+            query_labels=prepared.labels_encoded,
+            candidate_labels=prepared.labels_encoded,
+            k_values=self.cross_modal_recall_k,
+            direction_name="report_to_slide",
+        )
+
+        return {
+            "task": "cross_modal_retrieval",
+            "input": {
+                "num_pairs": int(n_items),
+                "embedding_dim": int(self.feature_dim),
+                "num_classes": int(prepared.classes.shape[0]),
+                "classes": [str(value) for value in prepared.classes.tolist()],
+            },
+            "protocol": {
+                "similarity": "cosine",
+                "preprocessing": {
+                    "l2_normalize_slide_embeddings": True,
+                    "l2_normalize_text_embeddings": True,
+                    "center_slide_embeddings": False,
+                    "center_text_embeddings": False,
+                },
+                "recall_k_values": [int(value) for value in self.cross_modal_recall_k],
+                "directions": ["slide_to_report", "report_to_slide"],
+                "class_based_success": True,
+            },
+            "slide_to_report": slide_to_report,
+            "report_to_slide": report_to_slide,
+        }
+
+    def _prepare_unimodal(
+        self,
+        query: Any,
+        db: Any,
+        yq: Any,
+        ydb: Any,
+    ) -> _PreparedUnimodal:
+        query_np: np.ndarray = self._validate_embeddings(query, name="query")
+        db_np: np.ndarray = self._validate_embeddings(db, name="db")
+        yq_np: np.ndarray = self._validate_labels(yq, expected_n=int(query_np.shape[0]), name="yq")
+        ydb_np: np.ndarray = self._validate_labels(ydb, expected_n=int(db_np.shape[0]), name="ydb")
+
+        # Encode labels across union to guarantee shared class index space.
+        encoder: LabelEncoder = LabelEncoder()
+        encoder.fit(np.concatenate([yq_np, ydb_np], axis=0))
+        yq_encoded: np.ndarray = encoder.transform(yq_np)
+        ydb_encoded: np.ndarray = encoder.transform(ydb_np)
+
+        db_proc, mean_vec = self._center_and_l2(db_np, mean_vec=None)
+        query_proc, _ = self._center_and_l2(query_np, mean_vec=mean_vec)
+
+        return _PreparedUnimodal(
+            query=query_proc,
+            database=db_proc,
+            yq_encoded=yq_encoded.astype(np.int64, copy=False),
+            ydb_encoded=ydb_encoded.astype(np.int64, copy=False),
+            classes=np.asarray(encoder.classes_),
+        )
+
+    def _prepare_cross_modal(
+        self,
+        slide_emb: Any,
+        report_emb: Any,
+        labels: Any,
+    ) -> _PreparedCrossModal:
+        slide_np: np.ndarray = self._validate_embeddings(slide_emb, name="slide_emb")
+        report_np: np.ndarray = self._validate_embeddings(report_emb, name="report_emb")
+
+        if int(slide_np.shape[0]) != int(report_np.shape[0]):
+            raise RetrievalSchemaError(
+                "slide_emb and report_emb must have same number of rows for paired retrieval. "
+                f"Got {slide_np.shape[0]} vs {report_np.shape[0]}."
+            )
+
+        labels_np: np.ndarray = self._validate_labels(
+            labels,
+            expected_n=int(slide_np.shape[0]),
+            name="labels",
+        )
+
+        encoder: LabelEncoder = LabelEncoder()
+        labels_encoded: np.ndarray = encoder.fit_transform(labels_np).astype(np.int64, copy=False)
+
+        slide_norm: np.ndarray = self._l2_normalize_rows(slide_np)
+        report_norm: np.ndarray = self._l2_normalize_rows(report_np)
+
+        return _PreparedCrossModal(
+            slide=slide_norm,
+            report=report_norm,
+            labels_encoded=labels_encoded,
+            classes=np.asarray(encoder.classes_),
+        )
+
+    def _run_cross_modal_direction(
+        self,
+        score_matrix: np.ndarray,
+        query_labels: np.ndarray,
+        candidate_labels: np.ndarray,
+        k_values: Sequence[int],
+        direction_name: str,
+    ) -> Dict[str, Any]:
+        if score_matrix.ndim != 2:
+            raise RetrievalSchemaError(
+                f"{direction_name}: score_matrix must be rank-2, got {tuple(score_matrix.shape)}."
+            )
+
+        n_query: int = int(score_matrix.shape[0])
+        n_candidates: int = int(score_matrix.shape[1])
+        if int(query_labels.shape[0]) != n_query:
+            raise RetrievalSchemaError(
+                f"{direction_name}: query_labels length mismatch ({query_labels.shape[0]} != {n_query})."
+            )
+        if int(candidate_labels.shape[0]) != n_candidates:
+            raise RetrievalSchemaError(
+                f"{direction_name}: candidate_labels length mismatch ({candidate_labels.shape[0]} != {n_candidates})."
+            )
+
+        max_k: int = int(max(int(value) for value in k_values))
+        top_indices: np.ndarray = self._topk_indices_by_similarity(score_matrix, k=max_k)
+
+        metric_values: Dict[str, float] = {}
+        recalls: List[float] = []
+        for k_value in k_values:
+            idx: np.ndarray = top_indices[:, : int(k_value)]
+            retrieved_labels: np.ndarray = candidate_labels[idx]
+            success: np.ndarray = np.any(
+                retrieved_labels == query_labels.reshape(-1, 1),
+                axis=1,
+            )
+            recall_k: float = float(np.mean(success.astype(np.float64)))
+            metric_values[f"recall_at_{int(k_value)}"] = recall_k
+            recalls.append(recall_k)
+
+        metric_values["mean_recall"] = float(np.mean(np.asarray(recalls, dtype=np.float64)))
+
+        return {
+            "direction": str(direction_name),
+            "num_queries": int(n_query),
+            "num_candidates": int(n_candidates),
+            "metrics": metric_values,
+        }
+
+    def _compute_majority_vote_success(
+        self,
+        top_indices: np.ndarray,
+        top_distances: np.ndarray,
+        yq: np.ndarray,
+        ydb: np.ndarray,
+    ) -> Tuple[np.ndarray, int]:
+        if top_indices.ndim != 2 or top_distances.ndim != 2:
+            raise RetrievalSchemaError(
+                "top_indices and top_distances must both be rank-2 arrays for majority vote."
+            )
+        if top_indices.shape != top_distances.shape:
+            raise RetrievalSchemaError(
+                "top_indices and top_distances shapes must match. "
+                f"Got {tuple(top_indices.shape)} vs {tuple(top_distances.shape)}."
+            )
+        if int(yq.shape[0]) != int(top_indices.shape[0]):
+            raise RetrievalSchemaError(
+                "yq length must match number of query rows in top_indices."
+            )
+
+        n_query: int = int(top_indices.shape[0])
+        success: np.ndarray = np.zeros((n_query,), dtype=np.bool_)
+        tie_count: int = 0
+
+        for query_idx in range(n_query):
+            db_idx: np.ndarray = top_indices[query_idx]
+            db_labels: np.ndarray = ydb[db_idx]
+            db_dist: np.ndarray = top_distances[query_idx]
+
+            counts: np.ndarray = np.bincount(db_labels.astype(np.int64, copy=False))
+            max_count: int = int(np.max(counts))
+            tied_labels: np.ndarray = np.where(counts == max_count)[0]
+
+            if int(tied_labels.shape[0]) == 1:
+                winner: int = int(tied_labels[0])
+            else:
+                tie_count += 1
+                # Tie-break rule required by config: lowest distance sum; then lowest class id.
+                distance_sum_by_class: Dict[int, float] = {}
+                for class_id in tied_labels.tolist():
+                    cls_mask: np.ndarray = db_labels == int(class_id)
+                    cls_dist: np.ndarray = db_dist[cls_mask]
+                    distance_sum_by_class[int(class_id)] = float(np.sum(cls_dist, dtype=np.float64))
+
+                winner = sorted(
+                    [int(value) for value in tied_labels.tolist()],
+                    key=lambda class_id: (distance_sum_by_class[class_id], class_id),
+                )[0]
+
+            success[query_idx] = bool(int(yq[query_idx]) == int(winner))
+
+        return success, tie_count
+
+    @staticmethod
+    def _pairwise_euclidean(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        if a.ndim != 2 or b.ndim != 2:
+            raise RetrievalSchemaError(
+                f"pairwise_euclidean expects rank-2 arrays, got {a.shape} and {b.shape}."
+            )
+        if int(a.shape[1]) != int(b.shape[1]):
+            raise RetrievalSchemaError(
+                "pairwise_euclidean feature dimension mismatch: "
+                f"{a.shape[1]} vs {b.shape[1]}."
+            )
+
+        a2: np.ndarray = np.sum(a * a, axis=1, keepdims=True)
+        b2: np.ndarray = np.sum(b * b, axis=1, keepdims=True).T
+        sq: np.ndarray = a2 + b2 - (2.0 * np.matmul(a, b.T))
+        sq = np.maximum(sq, 0.0)
+        return np.sqrt(sq, dtype=np.float64)
+
+    @staticmethod
+    def _topk_indices_by_distance(matrix: np.ndarray, k: int) -> np.ndarray:
+        """Top-k by ascending distance, deterministic tie break on candidate index."""
+        if matrix.ndim != 2:
+            raise RetrievalSchemaError(
+                f"Distance matrix must be rank-2 [Nq,Nd], got {tuple(matrix.shape)}."
+            )
+        n_query: int = int(matrix.shape[0])
+        n_candidates: int = int(matrix.shape[1])
+        if k <= 0:
+            raise RetrievalSchemaError(f"k must be > 0, got {k}.")
+        if k > n_candidates:
+            raise RetrievalSchemaError(
+                f"k cannot exceed number of candidates ({n_candidates}), got {k}."
+            )
+
+        candidate_indices: np.ndarray = np.arange(n_candidates, dtype=np.int64)
+        out: np.ndarray = np.zeros((n_query, k), dtype=np.int64)
+
+        approx_topk: np.ndarray = np.argpartition(matrix, kth=k - 1, axis=1)[:, :k]
+        for row_idx in range(n_query):
+            row_candidates: np.ndarray = approx_topk[row_idx]
+            row_distances: np.ndarray = matrix[row_idx, row_candidates]
+            order: np.ndarray = np.lexsort((row_candidates, row_distances))
+            out[row_idx] = row_candidates[order]
+
+        # Ensure deterministic full sort for small-k rows if equal distances spill from argpartition.
+        # We check if any candidate outside approx set has same distance as kth; if so, do full stable sort.
+        for row_idx in range(n_query):
+            kth_distance: float = float(matrix[row_idx, out[row_idx, -1]])
+            if np.any(np.isclose(matrix[row_idx], kth_distance, rtol=0.0, atol=0.0)):
+                full_order: np.ndarray = np.lexsort((candidate_indices, matrix[row_idx]))
+                out[row_idx] = full_order[:k]
+
+        return out
+
+    @staticmethod
+    def _topk_indices_by_similarity(matrix: np.ndarray, k: int) -> np.ndarray:
+        """Top-k by descending similarity, deterministic tie break on candidate index."""
+        if matrix.ndim != 2:
+            raise RetrievalSchemaError(
+                f"Similarity matrix must be rank-2 [Nq,Nd], got {tuple(matrix.shape)}."
+            )
+        n_query: int = int(matrix.shape[0])
+        n_candidates: int = int(matrix.shape[1])
+        if k <= 0:
+            raise RetrievalSchemaError(f"k must be > 0, got {k}.")
+        if k > n_candidates:
+            raise RetrievalSchemaError(
+                f"k cannot exceed number of candidates ({n_candidates}), got {k}."
+            )
+
+        candidate_indices: np.ndarray = np.arange(n_candidates, dtype=np.int64)
+        out: np.ndarray = np.zeros((n_query, k), dtype=np.int64)
+
+        approx_topk: np.ndarray = np.argpartition(-matrix, kth=k - 1, axis=1)[:, :k]
+        for row_idx in range(n_query):
+            row_candidates: np.ndarray = approx_topk[row_idx]
+            row_scores: np.ndarray = matrix[row_idx, row_candidates]
+            order: np.ndarray = np.lexsort((row_candidates, -row_scores))
+            out[row_idx] = row_candidates[order]
+
+        for row_idx in range(n_query):
+            kth_score: float = float(matrix[row_idx, out[row_idx, -1]])
+            if np.any(np.isclose(matrix[row_idx], kth_score, rtol=0.0, atol=0.0)):
+                full_order: np.ndarray = np.lexsort((candidate_indices, -matrix[row_idx]))
+                out[row_idx] = full_order[:k]
+
+        return out
+
+    def _center_and_l2(self, x: np.ndarray, mean_vec: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+        if self.embedding_service is not None:
+            centered, mean_used = self.embedding_service.center_and_l2(x=x, mean_vec=mean_vec)
+            centered_np: np.ndarray = np.asarray(centered, dtype=np.float32)
+            mean_np: np.ndarray = np.asarray(mean_used, dtype=np.float32)
+            if centered_np.shape != x.shape:
+                raise RetrievalSchemaError(
+                    "embedding_service.center_and_l2 returned invalid output shape. "
+                    f"Expected {x.shape}, got {centered_np.shape}."
+                )
+            if mean_np.ndim != 1 or int(mean_np.shape[0]) != int(x.shape[1]):
+                raise RetrievalSchemaError(
+                    "embedding_service.center_and_l2 returned invalid mean vector shape. "
+                    f"Expected ({x.shape[1]},), got {mean_np.shape}."
+                )
+            return centered_np, mean_np
+
+        matrix: np.ndarray = np.asarray(x, dtype=np.float32)
+        if matrix.ndim != 2:
+            raise RetrievalSchemaError(
+                f"center_and_l2 expects rank-2 input [N,D], got {tuple(matrix.shape)}."
+            )
+        if not np.isfinite(matrix).all():
+            raise RetrievalSchemaError("center_and_l2 input contains NaN/Inf values.")
+
+        used_mean: np.ndarray
+        if mean_vec is None:
+            used_mean = np.mean(matrix, axis=0, dtype=np.float64).astype(np.float32, copy=False)
+        else:
+            used_mean = np.asarray(mean_vec, dtype=np.float32)
+            if used_mean.ndim != 1 or int(used_mean.shape[0]) != int(matrix.shape[1]):
+                raise RetrievalSchemaError(
+                    "mean_vec must have shape [D]. "
+                    f"Expected ({matrix.shape[1]},), got {used_mean.shape}."
+                )
+
+        centered: np.ndarray = matrix - used_mean.reshape(1, -1)
+        norms: np.ndarray = np.linalg.norm(centered, ord=2, axis=1, keepdims=True)
+        norms = np.maximum(norms, float(self.eps)).astype(np.float32, copy=False)
+        normalized: np.ndarray = centered / norms
+
+        if not np.isfinite(normalized).all():
+            raise RetrievalSchemaError("center_and_l2 produced NaN/Inf values.")
+
+        return normalized.astype(np.float32, copy=False), used_mean.astype(np.float32, copy=False)
+
+    def _l2_normalize_rows(self, x: np.ndarray) -> np.ndarray:
+        matrix: np.ndarray = np.asarray(x, dtype=np.float32)
+        if matrix.ndim != 2:
+            raise RetrievalSchemaError(
+                f"l2_normalize_rows expects rank-2 [N,D], got {tuple(matrix.shape)}."
+            )
+        if not np.isfinite(matrix).all():
+            raise RetrievalSchemaError("l2_normalize_rows input contains NaN/Inf values.")
+
+        norms: np.ndarray = np.linalg.norm(matrix, ord=2, axis=1, keepdims=True)
+        norms = np.maximum(norms, float(self.eps)).astype(np.float32, copy=False)
+        normalized: np.ndarray = matrix / norms
+        if not np.isfinite(normalized).all():
+            raise RetrievalSchemaError("l2_normalize_rows produced NaN/Inf values.")
+        return normalized.astype(np.float32, copy=False)
+
+    def _validate_embeddings(self, value: Any, name: str) -> np.ndarray:
+        if not isinstance(value, np.ndarray):
+            value = np.asarray(value)
+        matrix: np.ndarray = np.asarray(value, dtype=np.float64)
+
+        if matrix.ndim != 2:
+            raise RetrievalSchemaError(f"{name} must be rank-2 [N,D], got {tuple(matrix.shape)}.")
+        if int(matrix.shape[0]) <= 0:
+            raise RetrievalSchemaError(f"{name} must contain at least one row.")
+        if int(matrix.shape[1]) != self.feature_dim:
+            raise RetrievalSchemaError(
+                f"{name} second dimension must be {self.feature_dim}, got {int(matrix.shape[1])}."
+            )
+        if not np.isfinite(matrix).all():
+            raise RetrievalSchemaError(f"{name} contains NaN/Inf values.")
+
+        return matrix.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _validate_labels(value: Any, expected_n: int, name: str) -> np.ndarray:
+        if not isinstance(value, np.ndarray):
+            value = np.asarray(value)
+        labels: np.ndarray = np.asarray(value)
+
+        if labels.ndim != 1:
+            raise RetrievalSchemaError(f"{name} must be rank-1 [N], got {tuple(labels.shape)}.")
+        if int(labels.shape[0]) != int(expected_n):
+            raise RetrievalSchemaError(
+                f"{name} length must match expected_n={expected_n}, got {int(labels.shape[0])}."
+            )
+        if int(labels.shape[0]) <= 0:
+            raise RetrievalSchemaError(f"{name} cannot be empty.")
+
+        return labels
+
+
+class Evaluator(RetrievalEvaluator):
+    """Design-compat alias exposing required method names."""
+
+
+# Convenience functional APIs.
+def run_slide_retrieval(
+    query: np.ndarray,
+    db: np.ndarray,
+    yq: np.ndarray,
+    ydb: np.ndarray,
+) -> dict:
+    """Run unimodal slide retrieval with default config-aligned evaluator."""
+    evaluator: RetrievalEvaluator = RetrievalEvaluator()
+    return evaluator.run_slide_retrieval(query=query, db=db, yq=yq, ydb=ydb)
+
+
+def run_cross_modal_retrieval(
+    slide_emb: np.ndarray,
+    report_emb: np.ndarray,
+    labels: np.ndarray,
+) -> dict:
+    """Run cross-modal retrieval with default config-aligned evaluator."""
+    evaluator: RetrievalEvaluator = RetrievalEvaluator()
+    return evaluator.run_cross_modal_retrieval(
+        slide_emb=slide_emb,
+        report_emb=report_emb,
+        labels=labels,
+    )
+
+
+__all__ = [
+    "RetrievalError",
+    "RetrievalSchemaError",
+    "RetrievalEvaluator",
+    "Evaluator",
+    "run_slide_retrieval",
+    "run_cross_modal_retrieval",
+]

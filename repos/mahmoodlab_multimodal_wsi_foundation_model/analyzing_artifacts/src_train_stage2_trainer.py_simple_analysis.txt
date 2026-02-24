@@ -1,0 +1,9 @@
+Added the Stage-2 logic analysis to [src/train/stage2_trainer.py](/Users/mingatlas/Projects/Paper2Code/src/train/stage2_trainer.py).
+
+It is aligned to the paper/design/config constraints and covers:
+- Stage-2 role and interface contract
+- Config-bound constants only (no invented hyperparameters)
+- `train_step` flow for CoCa contrastive + caption objectives
+- Effective batch arithmetic (`196 * 8 * 2 = 3136`)
+- Stage-1 checkpoint initialization and Stage-3 handoff requirements
+- Invariants, failure modes, and implementation checklist

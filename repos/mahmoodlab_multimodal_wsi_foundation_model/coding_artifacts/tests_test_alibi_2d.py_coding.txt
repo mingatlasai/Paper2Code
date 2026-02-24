@@ -1,0 +1,202 @@
+## Code: tests/test_alibi_2d.py
+```python
+"""Unit tests for 2D ALiBi attention bias.
+
+These tests validate the design-locked interface in ``src/models/alibi_2d.py``:
+- ``ALiBi2D.__init__(num_heads: int, slopes: torch.Tensor)``
+- ``ALiBi2D.build_bias(coords_xy: torch.Tensor) -> torch.Tensor``
+- ``ALiBi2D.apply(attn_scores: torch.Tensor, bias: torch.Tensor) -> torch.Tensor``
+
+Config-locked constants used by this test module:
+- number of heads: 12
+- coordinate semantics: 2D Euclidean distance in patch-grid space
+"""
+
+from __future__ import annotations
+
+from typing import Final
+
+import pytest
+import torch
+
+from src.models.alibi_2d import ALiBi2D
+
+
+_NUM_HEADS: Final[int] = 12
+_ATOL: Final[float] = 1e-6
+_RTOL: Final[float] = 1e-6
+
+
+def _build_module(num_heads: int = _NUM_HEADS) -> ALiBi2D:
+    """Create an ALiBi2D instance with strictly positive deterministic slopes."""
+    slopes: torch.Tensor = torch.linspace(0.1, 1.2, steps=num_heads, dtype=torch.float32)
+    module: ALiBi2D = ALiBi2D(num_heads=num_heads, slopes=slopes)
+    return module
+
+
+def test_build_bias_shape_unbatched() -> None:
+    """build_bias should return [H, T, T] for unbatched [T, 2] coordinates."""
+    module: ALiBi2D = _build_module()
+    coords_xy: torch.Tensor = torch.tensor(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [2.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    bias: torch.Tensor = module.build_bias(coords_xy=coords_xy)
+
+    assert tuple(bias.shape) == (_NUM_HEADS, 4, 4)
+    assert bias.dtype == torch.float32
+
+
+def test_build_bias_shape_batched() -> None:
+    """build_bias should return [B, H, T, T] for batched [B, T, 2] coordinates."""
+    module: ALiBi2D = _build_module()
+    coords_xy: torch.Tensor = torch.tensor(
+        [
+            [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+            [[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    bias: torch.Tensor = module.build_bias(coords_xy=coords_xy)
+
+    assert tuple(bias.shape) == (2, _NUM_HEADS, 3, 3)
+    assert bias.dtype == torch.float32
+
+
+def test_build_bias_diagonal_is_zero_and_matrix_is_symmetric() -> None:
+    """Euclidean ALiBi bias must be zero on diagonal and symmetric over token pairs."""
+    module: ALiBi2D = _build_module()
+    coords_xy: torch.Tensor = torch.tensor(
+        [[0.0, 0.0], [1.0, 2.0], [3.0, 1.0], [5.0, 4.0]],
+        dtype=torch.float32,
+    )
+
+    bias: torch.Tensor = module.build_bias(coords_xy=coords_xy)
+
+    diagonal: torch.Tensor = torch.diagonal(bias, offset=0, dim1=-2, dim2=-1)
+    assert torch.allclose(
+        diagonal,
+        torch.zeros_like(diagonal),
+        atol=_ATOL,
+        rtol=_RTOL,
+    )
+
+    bias_transposed: torch.Tensor = bias.transpose(-1, -2)
+    assert torch.allclose(bias, bias_transposed, atol=_ATOL, rtol=_RTOL)
+
+
+def test_build_bias_monotonicity_for_increasing_distance() -> None:
+    """For positive slopes, farther keys must receive more negative bias."""
+    module: ALiBi2D = _build_module()
+
+    # Query token at index 0 is at origin.
+    # Distances to indices 1/2/3 are 1, 2, 3 respectively.
+    coords_xy: torch.Tensor = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]],
+        dtype=torch.float32,
+    )
+
+    bias: torch.Tensor = module.build_bias(coords_xy=coords_xy)
+
+    head_index: int = 0
+    near_value: float = float(bias[head_index, 0, 1].item())
+    mid_value: float = float(bias[head_index, 0, 2].item())
+    far_value: float = float(bias[head_index, 0, 3].item())
+
+    assert near_value <= 0.0
+    assert mid_value <= 0.0
+    assert far_value <= 0.0
+
+    assert near_value > mid_value
+    assert mid_value > far_value
+
+
+def test_apply_additive_integration_with_broadcast_bias() -> None:
+    """apply should correctly broadcast [H,T,T] bias over batch dimension."""
+    module: ALiBi2D = _build_module()
+    batch_size: int = 3
+    num_tokens: int = 4
+
+    coords_xy: torch.Tensor = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        dtype=torch.float32,
+    )
+    bias: torch.Tensor = module.build_bias(coords_xy=coords_xy)  # [H, T, T]
+
+    attn_scores: torch.Tensor = torch.arange(
+        batch_size * _NUM_HEADS * num_tokens * num_tokens,
+        dtype=torch.float32,
+    ).reshape(batch_size, _NUM_HEADS, num_tokens, num_tokens)
+
+    output: torch.Tensor = module.apply(attn_scores=attn_scores, bias=bias)
+    expected: torch.Tensor = attn_scores + bias.unsqueeze(0)
+
+    assert tuple(output.shape) == tuple(attn_scores.shape)
+    assert output.dtype == attn_scores.dtype
+    assert torch.allclose(output, expected, atol=_ATOL, rtol=_RTOL)
+
+
+def test_apply_additive_integration_with_batched_bias() -> None:
+    """apply should add [B,H,T,T] bias without shape changes."""
+    module: ALiBi2D = _build_module()
+    batch_size: int = 2
+    num_tokens: int = 3
+
+    coords_xy: torch.Tensor = torch.tensor(
+        [
+            [[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]],
+            [[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]],
+        ],
+        dtype=torch.float32,
+    )
+    bias: torch.Tensor = module.build_bias(coords_xy=coords_xy)  # [B, H, T, T]
+
+    attn_scores: torch.Tensor = torch.full(
+        size=(batch_size, _NUM_HEADS, num_tokens, num_tokens),
+        fill_value=0.5,
+        dtype=torch.float32,
+    )
+
+    output: torch.Tensor = module.apply(attn_scores=attn_scores, bias=bias)
+    expected: torch.Tensor = attn_scores + bias
+
+    assert tuple(output.shape) == (batch_size, _NUM_HEADS, num_tokens, num_tokens)
+    assert torch.allclose(output, expected, atol=_ATOL, rtol=_RTOL)
+
+
+@pytest.mark.parametrize(
+    "num_heads,slopes",
+    [
+        (0, torch.tensor([0.1], dtype=torch.float32)),
+        (_NUM_HEADS, torch.ones((_NUM_HEADS - 1,), dtype=torch.float32)),
+        (_NUM_HEADS, torch.tensor([0.1] * (_NUM_HEADS - 1) + [-0.1], dtype=torch.float32)),
+    ],
+)
+def test_init_rejects_invalid_inputs(num_heads: int, slopes: torch.Tensor) -> None:
+    """Constructor should reject invalid num_heads/slopes contracts."""
+    with pytest.raises((TypeError, ValueError)):
+        _ = ALiBi2D(num_heads=num_heads, slopes=slopes)
+
+
+def test_apply_rejects_invalid_bias_shape() -> None:
+    """apply should fail on bias shapes incompatible with attention scores."""
+    module: ALiBi2D = _build_module()
+    attn_scores: torch.Tensor = torch.zeros((2, _NUM_HEADS, 4, 4), dtype=torch.float32)
+
+    # Invalid 3D bias with wrong token dimension.
+    bad_bias_3d: torch.Tensor = torch.zeros((_NUM_HEADS, 5, 5), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        _ = module.apply(attn_scores=attn_scores, bias=bad_bias_3d)
+
+    # Invalid 4D bias with unsupported batch dimension.
+    bad_bias_4d: torch.Tensor = torch.zeros((3, _NUM_HEADS, 4, 4), dtype=torch.float32)
+    with pytest.raises(ValueError):
+        _ = module.apply(attn_scores=attn_scores, bias=bad_bias_4d)
+```

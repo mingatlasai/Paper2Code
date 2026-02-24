@@ -1,0 +1,8 @@
+Created the requested logic analysis in [configs/eval/zero_shot.yaml](/Users/mingatlas/Projects/Paper2Code/configs/eval/zero_shot.yaml).
+
+It is structured to match your existing eval-analysis format and is strictly bound to the provided paper/design/task/config constraints, including:
+- zero-shot inference equation and embedding normalization logic
+- required design interfaces only (no extra public APIs)
+- config-bound constants (e.g., 768-d embeddings, ViT 6/12/64/3072, patch size 512, 20x)
+- prompt-ensemble handling, metric mapping, split/reporting rules
+- fidelity checks, failure modes, unresolved supplementary gaps, and validation checklist

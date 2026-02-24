@@ -1,0 +1,8 @@
+Implemented the logic analysis in [src/data/collate.py](/Users/mingatlas/Projects/Paper2Code/src/data/collate.py).
+
+It now provides a full, config-grounded collate design for:
+1. `train_stage1` iBOT batching (`2x14x14` global + `10x6x6` local views).
+2. `train_stage2`/`train_stage3` multimodal batching (grid + padded text + masks).
+3. Eval-time variable-grid batching with strict mask/metadata alignment.
+
+It also documents invariants, failure modes, shape contracts, and testing targets to guide code implementation without changing the approved architecture/design.

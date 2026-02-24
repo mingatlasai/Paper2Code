@@ -1,0 +1,46 @@
+## Code: configs/eval/linear_probe.yaml
+```yaml
+## configs/eval/linear_probe.yaml
+name: "linear_probe"
+
+enabled: true
+method: "scikit-learn_logistic_regression"
+solver: "lbfgs"
+penalty: "l2"
+
+hyperparameter_search:
+  enabled: true
+  regularization_l2:
+    count: 45
+    min: 1.0e-6
+    max: 10.0
+    spacing: "log"
+  selection_metric: "validation_loss"
+
+fit:
+  max_iter: 500
+  use_validation_split: true
+
+fallback_no_validation_or_few_shot:
+  enabled: true
+  regularization_l2: 1.0
+  max_iter: 1000
+
+input_preprocess:
+  center_embeddings: true
+  l2_normalize_embeddings: true
+
+metrics:
+  multiclass:
+    - "balanced_accuracy"
+    - "weighted_f1"
+  binary:
+    - "balanced_accuracy"
+    - "auroc"
+
+artifacts:
+  save_predictions: true
+  save_probabilities: true
+  save_metrics_json: true
+  save_per_class_report: true
+```

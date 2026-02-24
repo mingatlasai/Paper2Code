@@ -1,0 +1,14 @@
+Implemented the requested logic analysis in [src/core/utils.py](/Users/mingatlas/Projects/Paper2Code/src/core/utils.py).
+
+It now contains a structured, paper-aligned plan for `utils.py` covering:
+- seeding and deterministic behavior
+- distributed init/cleanup and rank-safe writes
+- device/tensor helpers
+- filesystem/path helpers
+- checkpoint save/load/resume contract (`titan_v.ckpt`, `titan_stage2.ckpt`, `titan_final.ckpt`)
+- JSON/CSV/JSONL artifact writers
+- runtime metadata + reproducibility validation against `config.yaml`
+- failure modes and stage-wise integration map
+- minimal function inventory for implementation
+
+No executable code was added yet, only analysis as requested.

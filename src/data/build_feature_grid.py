@@ -1,0 +1,404 @@
+"""Feature-grid construction and cropping for TITAN reproduction.
+
+This module converts sparse patch features into dense 2D feature grids,
+builds background masks, and exposes deterministic/random crop utilities used
+by stage-1 and stage-3 pipelines.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+import numpy as np
+import torch
+
+
+# -----------------------------------------------------------------------------
+# Paper/config-locked constants from config.yaml.
+# -----------------------------------------------------------------------------
+_PATCH_SIZE: int = 512
+_MAGNIFICATION: str = "20x"
+_FEATURE_DIM: int = 768
+_STAGE1_REGION_GRID: Tuple[int, int] = (16, 16)
+_STAGE3_CROP_GRID: Tuple[int, int] = (64, 64)
+
+
+class FeatureGridError(RuntimeError):
+    """Base exception for feature-grid operations."""
+
+
+class FeatureGridValidationError(FeatureGridError):
+    """Raised when features/coords/grid contracts are violated."""
+
+
+@dataclass(frozen=True)
+class FeatureGrid:
+    """Dense slide feature-grid container.
+
+    Attributes:
+        features: Tensor with shape [H, W, D], where D=768.
+        coords_xy: Tensor with shape [H, W, 2], level-0 pixel anchors.
+        valid_mask: Bool tensor with shape [H, W]. True means tissue token.
+        slide_id: Optional identifier.
+    """
+
+    features: torch.Tensor
+    coords_xy: torch.Tensor
+    valid_mask: torch.Tensor
+    slide_id: str = ""
+
+    def __post_init__(self) -> None:
+        """Validate tensor shape/type invariants."""
+        if not isinstance(self.features, torch.Tensor):
+            raise FeatureGridValidationError("features must be a torch.Tensor.")
+        if not isinstance(self.coords_xy, torch.Tensor):
+            raise FeatureGridValidationError("coords_xy must be a torch.Tensor.")
+        if not isinstance(self.valid_mask, torch.Tensor):
+            raise FeatureGridValidationError("valid_mask must be a torch.Tensor.")
+
+        if self.features.ndim != 3:
+            raise FeatureGridValidationError(
+                f"features must have shape [H, W, D], got {tuple(self.features.shape)}."
+            )
+        if self.coords_xy.ndim != 3:
+            raise FeatureGridValidationError(
+                f"coords_xy must have shape [H, W, 2], got {tuple(self.coords_xy.shape)}."
+            )
+        if self.valid_mask.ndim != 2:
+            raise FeatureGridValidationError(
+                f"valid_mask must have shape [H, W], got {tuple(self.valid_mask.shape)}."
+            )
+
+        height: int = int(self.features.shape[0])
+        width: int = int(self.features.shape[1])
+        feat_dim: int = int(self.features.shape[2])
+
+        if height <= 0 or width <= 0:
+            raise FeatureGridValidationError(
+                f"Feature grid spatial shape must be positive, got H={height}, W={width}."
+            )
+        if feat_dim != _FEATURE_DIM:
+            raise FeatureGridValidationError(
+                f"Feature dim must be {_FEATURE_DIM}, got {feat_dim}."
+            )
+
+        if tuple(self.coords_xy.shape[:2]) != (height, width) or int(self.coords_xy.shape[2]) != 2:
+            raise FeatureGridValidationError(
+                "coords_xy must align with features spatial shape and have last dim=2. "
+                f"Got coords_xy={tuple(self.coords_xy.shape)}, features={tuple(self.features.shape)}."
+            )
+
+        if tuple(self.valid_mask.shape) != (height, width):
+            raise FeatureGridValidationError(
+                "valid_mask must align with feature spatial shape. "
+                f"Got valid_mask={tuple(self.valid_mask.shape)}, features={tuple(self.features.shape)}."
+            )
+
+    def to(self, device: str) -> "FeatureGrid":
+        """Move tensors to target device and return a new FeatureGrid."""
+        target_device: torch.device = torch.device(device)
+        return FeatureGrid(
+            features=self.features.to(target_device),
+            coords_xy=self.coords_xy.to(target_device),
+            valid_mask=self.valid_mask.to(target_device),
+            slide_id=self.slide_id,
+        )
+
+
+class FeatureGridBuilder:
+    """Build and crop dense feature grids from sparse patch artifacts."""
+
+    def __init__(self, patch_size: int = _PATCH_SIZE) -> None:
+        """Initialize builder with strict patch-size contract.
+
+        Args:
+            patch_size: Patch size in pixels. Must be 512 for this reproduction.
+        """
+        if isinstance(patch_size, bool) or not isinstance(patch_size, (int, np.integer)):
+            raise TypeError(f"patch_size must be an integer, got {type(patch_size).__name__}.")
+        patch_size_int: int = int(patch_size)
+        if patch_size_int != _PATCH_SIZE:
+            raise FeatureGridValidationError(
+                f"patch_size must be {_PATCH_SIZE} per config.yaml, got {patch_size_int}."
+            )
+
+        self.patch_size: int = patch_size_int
+        self.feature_dim: int = _FEATURE_DIM
+        self.magnification: str = _MAGNIFICATION
+
+    def build_grid(self, feats: np.ndarray, coords: np.ndarray) -> FeatureGrid:
+        """Build a dense FeatureGrid from sparse features and coordinates.
+
+        Args:
+            feats: Array with shape [N, 768].
+            coords: Array with shape [N, 2] containing (x, y) level-0 anchors.
+
+        Returns:
+            Dense FeatureGrid with shapes:
+                - features: [H, W, 768]
+                - coords_xy: [H, W, 2]
+                - valid_mask: [H, W]
+        """
+        feats_np: np.ndarray = self._validate_feats(feats)
+        coords_np: np.ndarray = self._validate_coords(coords, expected_rows=feats_np.shape[0])
+
+        if feats_np.shape[0] == 0:
+            raise FeatureGridValidationError("Cannot build grid from empty features/coords arrays.")
+
+        gx: np.ndarray = coords_np[:, 0] // self.patch_size
+        gy: np.ndarray = coords_np[:, 1] // self.patch_size
+
+        min_gx: int = int(gx.min())
+        max_gx: int = int(gx.max())
+        min_gy: int = int(gy.min())
+        max_gy: int = int(gy.max())
+
+        width: int = max_gx - min_gx + 1
+        height: int = max_gy - min_gy + 1
+
+        if width <= 0 or height <= 0:
+            raise FeatureGridValidationError(f"Invalid grid shape derived from coords: H={height}, W={width}.")
+
+        features_grid: np.ndarray = np.zeros((height, width, self.feature_dim), dtype=np.float32)
+        valid_mask: np.ndarray = np.zeros((height, width), dtype=np.bool_)
+
+        # Fill dense coordinate grid for all cells using the same spatial origin.
+        x_axis: np.ndarray = (
+            np.arange(width, dtype=np.int64).reshape(1, width) + np.int64(min_gx)
+        ) * np.int64(self.patch_size)
+        y_axis: np.ndarray = (
+            np.arange(height, dtype=np.int64).reshape(height, 1) + np.int64(min_gy)
+        ) * np.int64(self.patch_size)
+        coords_grid: np.ndarray = np.zeros((height, width, 2), dtype=np.int64)
+        coords_grid[:, :, 0] = np.broadcast_to(x_axis, (height, width))
+        coords_grid[:, :, 1] = np.broadcast_to(y_axis, (height, width))
+
+        local_x: np.ndarray = (gx - min_gx).astype(np.int64, copy=False)
+        local_y: np.ndarray = (gy - min_gy).astype(np.int64, copy=False)
+
+        flat_local: np.ndarray = local_y * np.int64(width) + local_x
+        if np.unique(flat_local).shape[0] != flat_local.shape[0]:
+            raise FeatureGridValidationError("Duplicate coordinates detected; each patch anchor must be unique.")
+
+        features_grid[local_y, local_x, :] = feats_np
+        valid_mask[local_y, local_x] = True
+
+        if int(valid_mask.sum()) != int(feats_np.shape[0]):
+            raise FeatureGridValidationError(
+                "Valid-mask population mismatch after scatter. "
+                f"mask_true={int(valid_mask.sum())}, expected={int(feats_np.shape[0])}."
+            )
+
+        return FeatureGrid(
+            features=torch.from_numpy(features_grid),
+            coords_xy=torch.from_numpy(coords_grid),
+            valid_mask=torch.from_numpy(valid_mask),
+            slide_id="",
+        )
+
+    def build_background_mask(self, coords: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+        """Build background mask for a target grid shape.
+
+        Args:
+            coords: Array with shape [N, 2] in level-0 coordinates.
+            shape: Target grid shape (H, W).
+
+        Returns:
+            Boolean background mask with shape (H, W), where True means background.
+        """
+        if not isinstance(shape, tuple) or len(shape) != 2:
+            raise TypeError("shape must be tuple[int, int].")
+        crop_h, crop_w = shape
+        if isinstance(crop_h, bool) or isinstance(crop_w, bool):
+            raise TypeError("shape values must be integers.")
+        if not isinstance(crop_h, (int, np.integer)) or not isinstance(crop_w, (int, np.integer)):
+            raise TypeError("shape values must be integers.")
+        height: int = int(crop_h)
+        width: int = int(crop_w)
+        if height <= 0 or width <= 0:
+            raise ValueError(f"shape must be positive, got {shape}.")
+
+        coords_np: np.ndarray = self._validate_coords(coords, expected_rows=None)
+        valid_mask: np.ndarray = np.zeros((height, width), dtype=np.bool_)
+
+        if coords_np.shape[0] == 0:
+            return np.ones((height, width), dtype=np.bool_)
+
+        gx: np.ndarray = coords_np[:, 0] // self.patch_size
+        gy: np.ndarray = coords_np[:, 1] // self.patch_size
+
+        min_gx: int = int(gx.min())
+        min_gy: int = int(gy.min())
+
+        local_x: np.ndarray = (gx - min_gx).astype(np.int64, copy=False)
+        local_y: np.ndarray = (gy - min_gy).astype(np.int64, copy=False)
+
+        in_bounds: np.ndarray = (
+            (local_x >= 0)
+            & (local_x < np.int64(width))
+            & (local_y >= 0)
+            & (local_y < np.int64(height))
+        )
+
+        if np.any(in_bounds):
+            valid_mask[local_y[in_bounds], local_x[in_bounds]] = True
+
+        background_mask: np.ndarray = ~valid_mask
+        return background_mask
+
+    def crop_grid(self, grid: FeatureGrid, crop_hw: tuple[int, int], random: bool = True) -> FeatureGrid:
+        """Crop a dense FeatureGrid.
+
+        Args:
+            grid: Input feature grid.
+            crop_hw: Crop size (H, W) in grid cells.
+            random: If True, sample a random top-left anchor. Otherwise use (0, 0).
+
+        Returns:
+            Cropped FeatureGrid.
+        """
+        if not isinstance(grid, FeatureGrid):
+            raise TypeError(f"grid must be FeatureGrid, got {type(grid).__name__}.")
+
+        crop_h, crop_w = self._validate_crop_hw(crop_hw)
+
+        grid_h: int = int(grid.features.shape[0])
+        grid_w: int = int(grid.features.shape[1])
+
+        if crop_h > grid_h or crop_w > grid_w:
+            raise FeatureGridValidationError(
+                f"Requested crop {crop_hw} exceeds grid shape {(grid_h, grid_w)}."
+            )
+
+        max_y: int = grid_h - crop_h
+        max_x: int = grid_w - crop_w
+
+        if random:
+            start_y: int = int(np.random.randint(0, max_y + 1))
+            start_x: int = int(np.random.randint(0, max_x + 1))
+        else:
+            start_y = 0
+            start_x = 0
+
+        end_y: int = start_y + crop_h
+        end_x: int = start_x + crop_w
+
+        cropped_features: torch.Tensor = grid.features[start_y:end_y, start_x:end_x, :].clone()
+        cropped_coords: torch.Tensor = grid.coords_xy[start_y:end_y, start_x:end_x, :].clone()
+        cropped_valid: torch.Tensor = grid.valid_mask[start_y:end_y, start_x:end_x].clone()
+
+        if tuple(cropped_features.shape[:2]) != (crop_h, crop_w):
+            raise FeatureGridValidationError(
+                "Internal crop shape mismatch for features: "
+                f"got {tuple(cropped_features.shape[:2])}, expected {(crop_h, crop_w)}."
+            )
+
+        return FeatureGrid(
+            features=cropped_features,
+            coords_xy=cropped_coords,
+            valid_mask=cropped_valid,
+            slide_id=grid.slide_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal validation helpers.
+    # ------------------------------------------------------------------
+    def _validate_feats(self, feats: np.ndarray) -> np.ndarray:
+        if not isinstance(feats, np.ndarray):
+            raise TypeError(f"feats must be np.ndarray, got {type(feats).__name__}.")
+        if feats.ndim != 2:
+            raise FeatureGridValidationError(f"feats must have shape [N, D], got {feats.shape}.")
+        if int(feats.shape[1]) != self.feature_dim:
+            raise FeatureGridValidationError(
+                f"Feature dimension must be {self.feature_dim}, got {int(feats.shape[1])}."
+            )
+
+        if np.issubdtype(feats.dtype, np.floating):
+            feats_np: np.ndarray = np.asarray(feats, dtype=np.float32)
+        elif np.issubdtype(feats.dtype, np.integer):
+            feats_np = np.asarray(feats, dtype=np.float32)
+        else:
+            raise TypeError(f"Unsupported feats dtype: {feats.dtype}.")
+
+        if not np.isfinite(feats_np).all():
+            raise FeatureGridValidationError("feats contains NaN/Inf values.")
+
+        return feats_np
+
+    def _validate_coords(self, coords: np.ndarray, expected_rows: Optional[int]) -> np.ndarray:
+        if not isinstance(coords, np.ndarray):
+            raise TypeError(f"coords must be np.ndarray, got {type(coords).__name__}.")
+        if coords.ndim != 2:
+            raise FeatureGridValidationError(f"coords must have shape [N, 2], got {coords.shape}.")
+        if int(coords.shape[1]) != 2:
+            raise FeatureGridValidationError(
+                f"coords second dimension must be 2, got {int(coords.shape[1])}."
+            )
+
+        if expected_rows is not None and int(coords.shape[0]) != int(expected_rows):
+            raise FeatureGridValidationError(
+                f"coords row count {int(coords.shape[0])} does not match expected {int(expected_rows)}."
+            )
+
+        if np.issubdtype(coords.dtype, np.integer):
+            coords_np: np.ndarray = np.asarray(coords, dtype=np.int64)
+        elif np.issubdtype(coords.dtype, np.floating):
+            if not np.all(np.equal(coords, np.floor(coords))):
+                raise FeatureGridValidationError("coords float array must contain integer-valued entries.")
+            coords_np = np.asarray(coords, dtype=np.int64)
+        else:
+            raise TypeError(f"Unsupported coords dtype: {coords.dtype}.")
+
+        if coords_np.shape[0] == 0:
+            return coords_np
+
+        if np.any(coords_np < 0):
+            raise FeatureGridValidationError("coords must be non-negative.")
+
+        if np.any(coords_np[:, 0] % np.int64(self.patch_size) != 0):
+            raise FeatureGridValidationError(
+                f"All x coordinates must be multiples of patch_size={self.patch_size}."
+            )
+        if np.any(coords_np[:, 1] % np.int64(self.patch_size) != 0):
+            raise FeatureGridValidationError(
+                f"All y coordinates must be multiples of patch_size={self.patch_size}."
+            )
+
+        return coords_np
+
+    @staticmethod
+    def _validate_crop_hw(crop_hw: tuple[int, int]) -> Tuple[int, int]:
+        if not isinstance(crop_hw, tuple) or len(crop_hw) != 2:
+            raise TypeError("crop_hw must be tuple[int, int].")
+
+        crop_h_raw, crop_w_raw = crop_hw
+        if isinstance(crop_h_raw, bool) or isinstance(crop_w_raw, bool):
+            raise TypeError("crop_hw values must be integers.")
+        if not isinstance(crop_h_raw, (int, np.integer)) or not isinstance(crop_w_raw, (int, np.integer)):
+            raise TypeError("crop_hw values must be integers.")
+
+        crop_h: int = int(crop_h_raw)
+        crop_w: int = int(crop_w_raw)
+        if crop_h <= 0 or crop_w <= 0:
+            raise ValueError(f"crop_hw values must be > 0, got {crop_hw}.")
+
+        return crop_h, crop_w
+
+    @staticmethod
+    def default_stage1_crop_hw() -> Tuple[int, int]:
+        """Return stage-1 default crop shape from config constants."""
+        return _STAGE1_REGION_GRID
+
+    @staticmethod
+    def default_stage3_crop_hw() -> Tuple[int, int]:
+        """Return stage-3 default crop shape from config constants."""
+        return _STAGE3_CROP_GRID
+
+
+__all__ = [
+    "FeatureGridError",
+    "FeatureGridValidationError",
+    "FeatureGrid",
+    "FeatureGridBuilder",
+]

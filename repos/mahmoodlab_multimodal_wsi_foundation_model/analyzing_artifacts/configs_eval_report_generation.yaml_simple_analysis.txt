@@ -1,0 +1,5 @@
+Created the logic analysis in:
+
+- [configs/eval/report_generation.yaml](/Users/mingatlas/Projects/Paper2Code/configs/eval/report_generation.yaml)
+
+It is aligned to the paper, your design interfaces, and `config.yaml` (including fixed decoding `beam_search`, `num_beams=5`, `num_beam_groups=1`, and metrics `METEOR/ROUGE-1/BLEU-1`).

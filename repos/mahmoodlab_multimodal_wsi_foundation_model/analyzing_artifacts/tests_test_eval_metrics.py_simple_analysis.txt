@@ -1,0 +1,6 @@
+Implemented the logic analysis in [tests/test_eval_metrics.py](/Users/mingatlas/Projects/Paper2Code/tests/test_eval_metrics.py).
+
+It is analysis-only (no executable tests yet) and is aligned to:
+- the paper’s evaluation definitions,
+- your design interfaces (`Evaluator`/`EmbeddingService`),
+- and `config.yaml` constraints (K lists, decoding settings, embedding dimension, runtime bounds).

@@ -1,0 +1,6 @@
+Implemented the logic analysis in [src/eval/few_shot.py](/Users/mingatlas/Projects/Paper2Code/src/eval/few_shot.py).
+
+It is now a structured, config-bound analysis (no code) aligned to:
+- the paper’s few-shot protocol (`K={1,2,4,8,16,32}`, `50` runs),
+- the provided design interfaces (`Evaluator.run_few_shot`, `EmbeddingService.center_and_l2`),
+- and the supplied `config.yaml` constraints (including few-shot linear default `L2=1`, `max_iter=1000`).

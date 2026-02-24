@@ -1,0 +1,8 @@
+Added the requested logic analysis to [src/data/tile_wsi.py](/Users/mingatlas/Projects/Paper2Code/src/data/tile_wsi.py).
+
+It is analysis-only (no implementation code) and is aligned to:
+- paper preprocessing order (segmentation -> non-overlapping 512x512 tiling at 20x -> feature extraction),
+- `config.yaml` constants,
+- fixed design interface for `WSITiler`,
+- determinism/reproducibility and artifact contracts,
+- explicit handling of unresolved paper details as configurable (not invented).

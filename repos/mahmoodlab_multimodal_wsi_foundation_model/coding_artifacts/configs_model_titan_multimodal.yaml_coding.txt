@@ -1,0 +1,153 @@
+## Code: configs/model/titan_multimodal.yaml
+```yaml
+# configs/model/titan_multimodal.yaml
+# TITAN multimodal (stage-2/3 CoCa) model configuration.
+# All concrete values are bound to the provided config.yaml.
+
+model:
+  name: titan
+  variant: multimodal
+  architecture: coca_multimodal
+  framework: CoCa
+
+  vision_backbone:
+    architecture: titan_encoder
+    init_from_checkpoint: titan_v.ckpt
+    strict_load: true
+
+    input:
+      patch_feature_dim: 768
+      patch_size_px: 512
+      magnification: "20x"
+      coordinate_unit_px: 512
+
+    encoder:
+      embed_dim: 768
+      num_layers: 6
+      num_heads: 12
+      head_dim: 64
+      mlp_dim: 3072
+      use_alibi_2d: true
+      positional_encoding: "2D ALiBi (Euclidean-distance based bias)"
+
+      # Geometry derived from provided configuration.
+      max_tokens_stage2_train: 256   # 16 x 16
+      max_tokens_stage3_train: 4096  # 64 x 64
+      max_tokens_eval: 4096          # 64 x 64
+
+    alibi_2d:
+      enabled: true
+      distance_metric: euclidean
+      coordinate_normalization: divide_by_patch_size
+      patch_size_px: 512
+
+      # Supplementary detail not available in provided text/config.
+      slopes: null
+
+  multimodal:
+    # CoCa design: one global contrastive query and 128 reconstruction queries.
+    contrastive_queries: 1
+    reconstruction_queries: 128
+
+    text_encoder:
+      source: "CONCHv1.5 pretrained text encoder"
+      num_layers: 12
+      embed_dim: 768
+      hidden_dim: 3072
+      pretrained: true
+
+      # Not specified in provided config.yaml.
+      tokenizer_name: null
+      vocab_size: null
+      max_length: null
+
+    text_decoder:
+      source: "CONCHv1.5 pretrained multimodal decoder"
+      num_layers: 12
+      embed_dim: 768
+      hidden_dim: 3072
+      pretrained: true
+
+      # Not specified in provided config.yaml.
+      vocab_size: null
+      max_length: null
+
+    losses:
+      # Stage-2/3 use contrastive + generative objectives.
+      use_contrastive_loss: true
+      use_captioning_loss: true
+
+      # Exact weighting is in supplementary details, not in provided config.
+      contrastive_weight: null
+      captioning_weight: null
+
+  stages:
+    stage2:
+      name: stage2_roi_caption_alignment
+      objective: "CoCa contrastive + generative alignment on ROI-caption pairs"
+      num_pairs: 423122
+
+      input_geometry:
+        roi_region_size_px: 8192
+        roi_region_grid_size: [16, 16]
+
+      training:
+        gpus: 8
+        gpu_type: "NVIDIA A100 80GB"
+        local_batch_size_per_gpu: 196
+        gradient_accumulation_steps: 2
+        effective_batch_size: 3136
+
+      optimizer:
+        learning_rate: null
+        weight_decay: null
+        betas: null
+        scheduler: null
+        warmup: null
+
+      checkpoint:
+        save_name: titan_stage2.ckpt
+
+    stage3:
+      name: stage3_wsi_report_alignment
+      objective: "CoCa contrastive + generative alignment on WSI-report pairs"
+      num_pairs: 182862
+
+      input_geometry:
+        wsi_crop_grid_size: [64, 64]
+        wsi_crop_size_px: 32768
+
+      training:
+        gpus: 8
+        gpu_type: "NVIDIA A100 80GB"
+        local_batch_size_per_gpu: 16
+        gradient_accumulation_steps: 2
+        effective_batch_size: 256
+
+      vision_backbone_optimization:
+        use_smaller_learning_rate: true
+        use_smaller_weight_decay: true
+        use_slow_warmup: true
+
+      optimizer:
+        learning_rate: null
+        weight_decay: null
+        betas: null
+        scheduler: null
+        warmup: null
+
+      checkpoint:
+        init_from_checkpoint: titan_stage2.ckpt
+        save_name: titan_final.ckpt
+
+  generation:
+    decoding: beam_search
+    num_beams: 5
+    num_beam_groups: 1
+
+  constraints:
+    require_vision_text_embed_dim_match: true
+    require_heads_times_head_dim_equals_embed_dim: true
+    require_stage2_effective_batch_consistency: true
+    require_stage3_effective_batch_consistency: true
+```

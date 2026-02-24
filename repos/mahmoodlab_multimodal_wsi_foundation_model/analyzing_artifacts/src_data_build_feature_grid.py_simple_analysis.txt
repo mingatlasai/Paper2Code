@@ -1,0 +1,10 @@
+Implemented the requested logic analysis in:
+
+- [src/data/build_feature_grid.py](/Users/mingatlas/Projects/Paper2Code/src/data/build_feature_grid.py)
+
+It now contains a structured, paper-aligned analysis covering:
+- sparse `(x, y, feat)` to dense 2D grid mapping,
+- background/valid mask construction,
+- stage-1 `16x16` and stage-3 `64x64` crop logic,
+- strict config-bound invariants from `config.yaml`,
+- failure modes, reproducibility constraints, and test implications.
