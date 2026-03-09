@@ -1,66 +1,55 @@
-import json
-import re
-import os
+from __future__ import annotations
+
 import argparse
+import os
 import shutil
-from utils import extract_planning, content_to_json, format_json_data
 
-parser = argparse.ArgumentParser()
+from pipeline_utils import (
+    ensure_config_sections,
+    load_planning_bundle,
+    read_text_file,
+    write_text_file,
+)
+from utils import format_json_data
 
-parser.add_argument('--paper_name',type=str)
-parser.add_argument('--output_dir',type=str, default="")
 
-args    = parser.parse_args()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--paper_name", type=str)
+    parser.add_argument("--output_dir", type=str, default="")
+    return parser.parse_args()
 
-output_dir = args.output_dir
 
-with open(f'{output_dir}/planning_trajectories.json', encoding='utf8') as f:
-    traj = json.load(f)
+def main() -> None:
+    args = parse_args()
+    planning_bundle = load_planning_bundle(args.output_dir, prefer_refined=True)
+    planning_outputs = planning_bundle.get("planning_outputs", {})
+    assumptions = planning_bundle.get("assumptions", [])
 
-yaml_raw_content = ""
-for turn_idx, turn in enumerate(traj):
-        if turn_idx == 8:
-            yaml_raw_content = turn['content']   
+    config_yaml = planning_outputs.get("config_yaml", "")
+    if not config_yaml:
+        config_yaml = read_text_file(os.path.join(args.output_dir, "planning_config.yaml"), "")
+    config_yaml = ensure_config_sections(config_yaml, assumptions)
 
-if "</think>" in yaml_raw_content:
-    yaml_raw_content = yaml_raw_content.split("</think>")[-1]
+    planning_config_path = os.path.join(args.output_dir, "planning_config.yaml")
+    write_text_file(planning_config_path, config_yaml)
 
-match = re.search(r"```yaml\n(.*?)\n```", yaml_raw_content, re.DOTALL)
-if match:
-    yaml_content = match.group(1)
-    with open(f'{output_dir}/planning_config.yaml', 'w', encoding='utf8') as f:
-        f.write(yaml_content)
-else:
-    # print("No YAML content found.")
-    match2 = re.search(r"```yaml\\n(.*?)\\n```", yaml_raw_content, re.DOTALL)
-    if match2:
-        yaml_content = match2.group(1)
-        with open(f'{output_dir}/planning_config.yaml', 'w', encoding='utf8') as f:
-            f.write(yaml_content)
-    else:
-        print("No YAML content found.")
+    artifact_output_dir = os.path.join(args.output_dir, "planning_artifacts")
+    os.makedirs(artifact_output_dir, exist_ok=True)
 
-# ---------------------------------------
+    overall_plan = planning_outputs.get("overview_plan", "")
+    architecture_design = planning_outputs.get("architecture_design", {})
+    logic_design = planning_outputs.get("logic_design", {})
 
-artifact_output_dir=f"{output_dir}/planning_artifacts"
+    with open(os.path.join(artifact_output_dir, "1.1_overall_plan.txt"), "w", encoding="utf-8") as handle:
+        handle.write(overall_plan)
+    with open(os.path.join(artifact_output_dir, "1.2_arch_design.txt"), "w", encoding="utf-8") as handle:
+        handle.write(format_json_data(architecture_design) if architecture_design else "")
+    with open(os.path.join(artifact_output_dir, "1.3_logic_design.txt"), "w", encoding="utf-8") as handle:
+        handle.write(format_json_data(logic_design) if logic_design else "")
 
-os.makedirs(artifact_output_dir, exist_ok=True)
+    shutil.copy(planning_config_path, os.path.join(artifact_output_dir, "1.4_config.yaml"))
 
-context_lst = extract_planning(f'{output_dir}/planning_trajectories.json')
 
-arch_design = content_to_json(context_lst[1])
-logic_design = content_to_json(context_lst[2])
-
-formatted_arch_design = format_json_data(arch_design)
-formatted_logic_design = format_json_data(logic_design)
-
-with open(f"{artifact_output_dir}/1.1_overall_plan.txt", "w", encoding="utf-8") as f:
-    f.write(context_lst[0])
-
-with open(f"{artifact_output_dir}/1.2_arch_design.txt", "w", encoding="utf-8") as f:
-    f.write(formatted_arch_design)
-
-with open(f"{artifact_output_dir}/1.3_logic_design.txt", "w", encoding="utf-8") as f:
-    f.write(formatted_logic_design)
-
-shutil.copy(f"{output_dir}/planning_config.yaml", f"{artifact_output_dir}/1.4_config.yaml")
+if __name__ == "__main__":
+    main()

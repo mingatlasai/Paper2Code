@@ -3,6 +3,10 @@
 # export P2C_CLAUDE_CMD="claude -p"
 
 MODEL_NAME="codex"
+PIPELINE_MODE="${P2C_PIPELINE_MODE:-original}"
+PROMPT_SET="${P2C_PROMPT_SET:-${PIPELINE_MODE}}"
+MAX_REPAIR_ATTEMPTS="${P2C_MAX_REPAIR_ATTEMPTS:-2}"
+PYTHON_BIN="${P2C_PYTHON_BIN:-python3}"
 
 PAPER_NAME="Transformer"
 PDF_LATEX_CLEANED_PATH="../examples/Transformer_cleaned.tex" # _cleaned.tex
@@ -16,31 +20,86 @@ echo $PAPER_NAME
 
 echo "------- PaperCoder -------"
 
-python ../codes/1_planning.py \
+if [[ "${PIPELINE_MODE}" == "enhanced" ]]; then
+${PYTHON_BIN} ../codes/structured_extraction.py \
     --paper_name $PAPER_NAME \
     --gpt_version ${MODEL_NAME} \
     --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
     --paper_format LaTeX \
-    --output_dir ${OUTPUT_DIR}
+    --output_dir ${OUTPUT_DIR} \
+    --prompt_set ${PROMPT_SET}
+fi
+
+${PYTHON_BIN} ../codes/1_planning.py \
+    --paper_name $PAPER_NAME \
+    --gpt_version ${MODEL_NAME} \
+    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
+    --paper_format LaTeX \
+    --output_dir ${OUTPUT_DIR} \
+    --pipeline_mode ${PIPELINE_MODE} \
+    --prompt_set ${PROMPT_SET}
+
+if [[ "${PIPELINE_MODE}" == "enhanced" ]]; then
+${PYTHON_BIN} ../codes/planning_verifier.py \
+    --paper_name $PAPER_NAME \
+    --gpt_version ${MODEL_NAME} \
+    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
+    --paper_format LaTeX \
+    --output_dir ${OUTPUT_DIR} \
+    --prompt_set ${PROMPT_SET}
+
+${PYTHON_BIN} ../codes/planning_refiner.py \
+    --output_dir ${OUTPUT_DIR} \
+    --gpt_version ${MODEL_NAME} \
+    --prompt_set ${PROMPT_SET}
+fi
 
 
-python ../codes/1.1_extract_config.py \
+${PYTHON_BIN} ../codes/1.1_extract_config.py \
     --paper_name $PAPER_NAME \
     --output_dir ${OUTPUT_DIR}
 
 cp -rp ${OUTPUT_DIR}/planning_config.yaml ${OUTPUT_REPO_DIR}/config.yaml
 
-python ../codes/2_analyzing.py \
+${PYTHON_BIN} ../codes/2_analyzing.py \
     --paper_name $PAPER_NAME \
     --gpt_version ${MODEL_NAME} \
     --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
     --paper_format LaTeX \
-    --output_dir ${OUTPUT_DIR}
+    --output_dir ${OUTPUT_DIR} \
+    --pipeline_mode ${PIPELINE_MODE} \
+    --prompt_set ${PROMPT_SET}
 
-python ../codes/3_coding.py  \
+${PYTHON_BIN} ../codes/3_coding.py  \
     --paper_name $PAPER_NAME \
     --gpt_version ${MODEL_NAME} \
     --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
     --paper_format LaTeX \
     --output_dir ${OUTPUT_DIR} \
     --output_repo_dir ${OUTPUT_REPO_DIR} \
+    --pipeline_mode ${PIPELINE_MODE} \
+    --prompt_set ${PROMPT_SET}
+
+if [[ "${PIPELINE_MODE}" == "enhanced" ]]; then
+${PYTHON_BIN} ../codes/execution_test.py \
+    --output_dir ${OUTPUT_DIR} \
+    --output_repo_dir ${OUTPUT_REPO_DIR}
+
+for attempt in $(seq 1 ${MAX_REPAIR_ATTEMPTS}); do
+    EXECUTION_STATUS=$(${PYTHON_BIN} -c "import json,sys; print(json.load(open(sys.argv[1], 'r', encoding='utf-8')).get('status', 'failed'))" "${OUTPUT_DIR}/execution_test_report.json")
+    if [[ "${EXECUTION_STATUS}" == "passed" ]]; then
+        break
+    fi
+
+    ${PYTHON_BIN} ../codes/repair_agent.py \
+        --output_dir ${OUTPUT_DIR} \
+        --output_repo_dir ${OUTPUT_REPO_DIR} \
+        --gpt_version ${MODEL_NAME} \
+        --max_attempts ${MAX_REPAIR_ATTEMPTS} \
+        --attempt_index ${attempt}
+
+    ${PYTHON_BIN} ../codes/execution_test.py \
+        --output_dir ${OUTPUT_DIR} \
+        --output_repo_dir ${OUTPUT_REPO_DIR}
+done
+fi

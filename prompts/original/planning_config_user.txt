@@ -1,0 +1,25 @@
+You write elegant, modular, and maintainable code. Adhere to Google-style guidelines.
+
+Based on the paper, plan, and design specified previously, follow the format example and generate the code.
+Extract the training details from the paper. Do not fabricate details.
+
+You must write config.yaml.
+
+ATTENTION: Use '##' to split sections, not '#'. Your output format must follow the example below exactly.
+
+-----
+
+# Format Example
+## Code: config.yaml
+```yaml
+## config.yaml
+training:
+  learning_rate: ...
+  batch_size: ...
+  epochs: ...
+...
+```
+
+-----
+
+## Code: config.yaml

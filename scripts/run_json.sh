@@ -1,39 +1,46 @@
-MODEL_NAME="deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
-TP_SIZE=2
+# export P2C_PROVIDER="codex"  # or "claude"
+# export P2C_CODEX_CMD="codex exec"
+# export P2C_CLAUDE_CMD="claude -p"
+
+MODEL_NAME="codex"
 PIPELINE_MODE="${P2C_PIPELINE_MODE:-original}"
 PROMPT_SET="${P2C_PROMPT_SET:-${PIPELINE_MODE}}"
 MAX_REPAIR_ATTEMPTS="${P2C_MAX_REPAIR_ATTEMPTS:-2}"
 PYTHON_BIN="${P2C_PYTHON_BIN:-python3}"
 
 PAPER_NAME="Transformer"
-PDF_LATEX_CLEANED_PATH="../examples/Transformer_cleaned.tex" # _cleaned.tex
-OUTPUT_DIR="../outputs/Transformer_dscoder"
-OUTPUT_REPO_DIR="../outputs/Transformer_dscoder_repo"
+PDF_PATH="../examples/Transformer.pdf" # .pdf
+PDF_JSON_PATH="../examples/Transformer.json" # .json
+PDF_JSON_CLEANED_PATH="../examples/Transformer_cleaned.json" # _cleaned.json
+OUTPUT_DIR="../outputs/Transformer"
+OUTPUT_REPO_DIR="../outputs/Transformer_repo"
 
 mkdir -p $OUTPUT_DIR
 mkdir -p $OUTPUT_REPO_DIR
 
 echo $PAPER_NAME
 
+echo "------- Preprocess -------"
+
+${PYTHON_BIN} ../codes/0_pdf_process.py \
+    --input_json_path ${PDF_JSON_PATH} \
+    --output_json_path ${PDF_JSON_CLEANED_PATH} \
+
+
 echo "------- PaperCoder -------"
 
 if [[ "${PIPELINE_MODE}" == "enhanced" ]]; then
 ${PYTHON_BIN} ../codes/structured_extraction.py \
     --paper_name $PAPER_NAME \
-    --model_name ${MODEL_NAME} \
-    --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --gpt_version ${MODEL_NAME} \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --prompt_set ${PROMPT_SET}
 fi
-
-${PYTHON_BIN} ../codes/1_planning_llm.py \
+${PYTHON_BIN} ../codes/1_planning.py \
     --paper_name $PAPER_NAME \
-    --model_name ${MODEL_NAME} \
-    --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --gpt_version ${MODEL_NAME} \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --pipeline_mode ${PIPELINE_MODE} \
     --prompt_set ${PROMPT_SET}
@@ -41,19 +48,17 @@ ${PYTHON_BIN} ../codes/1_planning_llm.py \
 if [[ "${PIPELINE_MODE}" == "enhanced" ]]; then
 ${PYTHON_BIN} ../codes/planning_verifier.py \
     --paper_name $PAPER_NAME \
-    --model_name ${MODEL_NAME} \
-    --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --gpt_version ${MODEL_NAME} \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --prompt_set ${PROMPT_SET}
 
 ${PYTHON_BIN} ../codes/planning_refiner.py \
     --output_dir ${OUTPUT_DIR} \
-    --model_name ${MODEL_NAME} \
-    --tp_size ${TP_SIZE} \
+    --gpt_version ${MODEL_NAME} \
     --prompt_set ${PROMPT_SET}
 fi
+
 
 ${PYTHON_BIN} ../codes/1.1_extract_config.py \
     --paper_name $PAPER_NAME \
@@ -61,22 +66,18 @@ ${PYTHON_BIN} ../codes/1.1_extract_config.py \
 
 cp -rp ${OUTPUT_DIR}/planning_config.yaml ${OUTPUT_REPO_DIR}/config.yaml
 
-${PYTHON_BIN} ../codes/2_analyzing_llm.py \
+${PYTHON_BIN} ../codes/2_analyzing.py \
     --paper_name $PAPER_NAME \
-    --model_name ${MODEL_NAME} \
-    --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --gpt_version ${MODEL_NAME} \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --pipeline_mode ${PIPELINE_MODE} \
     --prompt_set ${PROMPT_SET}
 
-${PYTHON_BIN} ../codes/3_coding_llm.py  \
+${PYTHON_BIN} ../codes/3_coding.py  \
     --paper_name $PAPER_NAME \
-    --model_name ${MODEL_NAME} \
-    --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --gpt_version ${MODEL_NAME} \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --output_repo_dir ${OUTPUT_REPO_DIR} \
     --pipeline_mode ${PIPELINE_MODE} \
@@ -96,8 +97,7 @@ for attempt in $(seq 1 ${MAX_REPAIR_ATTEMPTS}); do
     ${PYTHON_BIN} ../codes/repair_agent.py \
         --output_dir ${OUTPUT_DIR} \
         --output_repo_dir ${OUTPUT_REPO_DIR} \
-        --model_name ${MODEL_NAME} \
-        --tp_size ${TP_SIZE} \
+        --gpt_version ${MODEL_NAME} \
         --max_attempts ${MAX_REPAIR_ATTEMPTS} \
         --attempt_index ${attempt}
 

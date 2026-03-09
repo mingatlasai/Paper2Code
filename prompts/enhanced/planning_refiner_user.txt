@@ -1,0 +1,22 @@
+## Original Planning Bundle
+{{PLANNING_BUNDLE}}
+
+-----
+
+## Planning Review
+{{PLANNING_REVIEW}}
+
+Output format:
+[REFINED_PLANNING]
+{
+  "overview_plan": "",
+  "architecture_design": {},
+  "logic_design": {},
+  "config_yaml": "",
+  "assumptions": [],
+  "unclear_items": [],
+  "changes_made": []
+}
+[/REFINED_PLANNING]
+
+Keep the original plan when no material fix is needed.

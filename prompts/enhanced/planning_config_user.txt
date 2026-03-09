@@ -1,0 +1,18 @@
+Write `config.yaml` using only paper-supported values and explicit assumptions.
+
+The config must include:
+- dataset
+- model
+- training
+- evaluation
+- logging
+- checkpoint
+- seeds
+- assumptions
+
+Format exactly:
+## Code: config.yaml
+```yaml
+## config.yaml
+...
+```

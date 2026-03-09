@@ -1,0 +1,19 @@
+Break the design into implementation tasks with dependency order and verification coverage.
+
+Output format:
+[CONTENT]
+{
+  "Required packages": [],
+  "Required Other language third-party packages": [],
+  "Logic Analysis": [],
+  "Task list": [],
+  "Full API spec": "",
+  "Shared Knowledge": "",
+  "Assumptions": ["ASSUMPTION A1: ..."],
+  "Anything UNCLEAR": ""
+}
+[/CONTENT]
+
+Requirements:
+- Detect missing training steps, missing evaluation steps, and dependency risks.
+- Include explicit assumptions and unclear items.

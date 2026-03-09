@@ -1,0 +1,17 @@
+## Paper
+{{PAPER}}
+
+## Task
+1. We want to reproduce the method described in the attached paper.
+2. The authors did not release any official code, so we have to plan our own implementation.
+3. Before writing any Python code, please outline a comprehensive plan that covers:
+   - Key details from the paper's Methodology.
+   - Important aspects of Experiments, including dataset requirements, experimental settings, hyperparameters, or evaluation metrics.
+4. The plan should be as detailed and informative as possible to help us write the final code later.
+
+## Requirements
+- You don't need to provide the actual code yet; focus on a thorough, clear strategy.
+- If something is unclear from the paper, mention it explicitly.
+
+## Instruction
+The response should give us a strong roadmap, making it easier to write the code later.

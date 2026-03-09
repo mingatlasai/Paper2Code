@@ -1,0 +1,41 @@
+## Paper
+{{PAPER}}
+
+-----
+
+## Overview of the plan
+{{OVERVIEW_PLAN}}
+
+-----
+
+## Design
+{{ARCHITECTURE_DESIGN}}
+
+-----
+
+## Task
+{{LOGIC_DESIGN}}
+
+-----
+
+## Configuration file
+```yaml
+{{CONFIG_YAML}}
+```
+
+-----
+
+## Assumptions
+{{ASSUMPTIONS}}
+
+-----
+
+## Instruction
+Conduct a Logic Analysis to assist in writing the code, based on the paper, the plan, the design, the task and the configuration file.
+You DON'T need to provide the actual code yet; focus on a thorough, clear analysis.
+
+{{FILE_DIRECTIVE}}
+
+-----
+
+## Logic Analysis: {{TODO_FILE_NAME}}

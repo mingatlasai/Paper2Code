@@ -1,0 +1,64 @@
+# Context
+## Paper
+{{PAPER}}
+
+-----
+
+## Overview of the plan
+{{OVERVIEW_PLAN}}
+
+-----
+
+## Design
+{{ARCHITECTURE_DESIGN}}
+
+-----
+
+## Task
+{{LOGIC_DESIGN}}
+
+-----
+
+## Configuration file
+```yaml
+{{CONFIG_YAML}}
+```
+
+-----
+
+## Assumptions
+{{ASSUMPTIONS}}
+
+-----
+
+## Code Files
+{{CODE_FILES}}
+
+-----
+
+# Format example
+## Code: {{TODO_FILE_NAME}}
+```python
+## {{TODO_FILE_NAME}}
+...
+```
+
+-----
+
+# Instruction
+Based on the paper, plan, design, task, analysis, assumptions, and configuration file, follow the format example and write the code.
+
+We have {{DONE_FILE_LIST}}.
+Next, you must write only the "{{TODO_FILE_NAME}}".
+1. Only one file.
+2. Implement complete, reliable code.
+3. Set defaults for settings when needed.
+4. Follow the existing design.
+5. Do not miss required classes or functions.
+6. Import dependencies before use.
+7. Do not leave TODO markers.
+8. Use configuration from config.yaml and keep assumptions explicit.
+
+{{DETAILED_LOGIC_ANALYSIS}}
+
+## Code: {{TODO_FILE_NAME}}

@@ -1,0 +1,52 @@
+# Context
+## Paper
+{{PAPER}}
+
+-----
+
+## Structured Extraction
+{{STRUCTURED_PAPER}}
+
+-----
+
+## Active Planning Bundle
+{{ACTIVE_PLANNING_BUNDLE}}
+
+-----
+
+## Configuration file
+```yaml
+{{CONFIG_YAML}}
+```
+
+-----
+
+## Assumptions
+{{ASSUMPTIONS}}
+
+-----
+
+## Code Files
+{{CODE_FILES}}
+
+-----
+
+## Detailed Logic Analysis
+{{DETAILED_LOGIC_ANALYSIS}}
+
+-----
+
+# Format example
+## Code: {{TODO_FILE_NAME}}
+```python
+## {{TODO_FILE_NAME}}
+...
+```
+
+-----
+
+# Instruction
+Write only `{{TODO_FILE_NAME}}`.
+Respect the active plan, explicit assumptions, and config. Keep the implementation complete and executable.
+
+## Code: {{TODO_FILE_NAME}}

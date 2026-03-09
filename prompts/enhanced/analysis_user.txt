@@ -1,0 +1,32 @@
+## Paper
+{{PAPER}}
+
+-----
+
+## Structured Extraction
+{{STRUCTURED_PAPER}}
+
+-----
+
+## Active Planning Bundle
+{{ACTIVE_PLANNING_BUNDLE}}
+
+-----
+
+## Configuration file
+```yaml
+{{CONFIG_YAML}}
+```
+
+-----
+
+## Assumptions
+{{ASSUMPTIONS}}
+
+-----
+
+## Instruction
+Produce file-level analysis for `{{TODO_FILE_NAME}}`.
+Highlight dependencies, expected APIs, execution risks, and assumption-sensitive behavior.
+
+{{FILE_DIRECTIVE}}

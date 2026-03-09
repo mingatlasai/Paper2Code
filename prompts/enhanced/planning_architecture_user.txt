@@ -1,0 +1,18 @@
+Use the paper and structured extraction to design a concise but complete software architecture for reproducing the paper.
+
+Output format:
+[CONTENT]
+{
+  "Implementation approach": "...",
+  "File list": ["main.py"],
+  "Data structures and interfaces": "mermaid classDiagram",
+  "Program call flow": "mermaid sequenceDiagram",
+  "Assumptions": ["ASSUMPTION A1: ..."],
+  "Anything UNCLEAR": "..."
+}
+[/CONTENT]
+
+Requirements:
+- Keep architecture simple.
+- Ensure the file list supports training, evaluation, logging, checkpointing, and seed control.
+- Track assumptions explicitly.

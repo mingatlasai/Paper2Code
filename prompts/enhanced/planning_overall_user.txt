@@ -1,0 +1,15 @@
+## Paper
+{{PAPER}}
+
+-----
+
+## Structured Extraction
+{{STRUCTURED_PAPER}}
+
+## Task
+Produce a detailed reproduction plan that covers methodology, experiments, datasets, model components, training objective, metrics, dependencies, and evaluation flow.
+
+Requirements:
+- Explicitly list assumptions using `ASSUMPTION A1: ...`.
+- Explicitly list unclear items.
+- Preserve baseline behavior and avoid unnecessary redesign.

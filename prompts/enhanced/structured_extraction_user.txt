@@ -1,0 +1,31 @@
+## Paper
+{{PAPER}}
+
+## Task
+Extract a structured implementation summary for the paper.
+
+Required fields:
+- model_components
+- training_objective
+- datasets
+- metrics
+- training_protocol
+- referenced_algorithms
+- assumptions
+- unclear_items
+
+Format:
+[STRUCTURED_PAPER]
+{
+  "model_components": [],
+  "training_objective": [],
+  "datasets": [],
+  "metrics": [],
+  "training_protocol": [],
+  "referenced_algorithms": [],
+  "assumptions": [],
+  "unclear_items": []
+}
+[/STRUCTURED_PAPER]
+
+Use `ASSUMPTION A1: ...` style for assumptions.

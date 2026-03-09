@@ -1,0 +1,50 @@
+Your goal is to break down tasks according to PRD and technical design, generate a task list, and analyze task dependencies.
+
+Now break down tasks according to the existing design, generate a task list, and analyze task dependencies.
+The Logic Analysis should consider both file dependencies and implementation details.
+
+-----
+
+## Format Example
+[CONTENT]
+{
+    "Required packages": [
+        "numpy==1.21.0",
+        "torch==1.9.0"
+    ],
+    "Required Other language third-party packages": [
+        "No third-party dependencies required"
+    ],
+    "Logic Analysis": [
+        [
+            "dataset_loader.py",
+            "Handles loading and preprocessing."
+        ]
+    ],
+    "Task list": [
+        "dataset_loader.py",
+        "model.py",
+        "trainer.py",
+        "evaluation.py",
+        "main.py"
+    ],
+    "Full API spec": "",
+    "Shared Knowledge": "Shared configuration and utilities.",
+    "Anything UNCLEAR": "Clarifications needed."
+}
+[/CONTENT]
+
+## Nodes
+- Required packages: requirements.txt style.
+- Required Other language third-party packages: specify non-Python packages or say none.
+- Logic Analysis: list files and detailed dependency descriptions.
+- Task list: filenames in dependency order.
+- Full API spec: OpenAPI 3.0 if needed, else empty.
+- Shared Knowledge: common utilities/configuration.
+- Anything UNCLEAR: unresolved questions.
+
+## Constraint
+Format: output wrapped inside [CONTENT][/CONTENT] like the format example, nothing else.
+
+## Action
+Follow the node instructions and ensure the output matches the format example.

@@ -24,14 +24,19 @@ Our method outperforms strong baselines on both Paper2Code and PaperBench and pr
 
 ### Using Codex / Claude Code
 - Set `P2C_PROVIDER` to either `codex` or `claude`.
+- `P2C_PIPELINE_MODE=original` preserves the baseline three-stage pipeline.
+- `P2C_PIPELINE_MODE=enhanced` enables structured extraction, planning verification/refinement, execution testing, and bounded repair.
+- If `python` points to Python 2 on your machine, set `P2C_PYTHON_BIN=python3`.
 
 ```bash
 export P2C_PROVIDER="codex"  # or "claude"
 export P2C_CODEX_CMD="codex exec"
 export P2C_CLAUDE_CMD="claude -p"
+export P2C_PIPELINE_MODE="original"  # or "enhanced"
+export P2C_PYTHON_BIN="python3"
 
 cd scripts
-bash run.sh
+bash run_json.sh
 ```
 
 ### Using Open Source Models with vLLM
@@ -40,9 +45,11 @@ bash run.sh
 
 ```bash
 pip install vllm
+export P2C_PIPELINE_MODE="original"  # or "enhanced"
+export P2C_PYTHON_BIN="python3"
 
 cd scripts
-bash run_llm.sh
+bash run_json_llm.sh
 ```
 
 ### Output Folder Structure (Only Important Files)
@@ -51,6 +58,7 @@ outputs
 ├── Transformer
 │   ├── analyzing_artifacts
 │   ├── coding_artifacts
+│   ├── enhanced_artifacts
 │   └── planning_artifacts
 └── Transformer_repo # Final output repository
 ```
@@ -117,9 +125,11 @@ python ./s2orc-doc2json/doc2json/grobid2json/process_pdf.py \
 export P2C_PROVIDER="codex"  # or "claude"
 export P2C_CODEX_CMD="codex exec"
 export P2C_CLAUDE_CMD="claude -p"
+export P2C_PIPELINE_MODE="original"  # or "enhanced"
+export P2C_PYTHON_BIN="python3"
 
 cd scripts
-bash run.sh
+bash run_json.sh
 ```
 
 ```bash
@@ -127,6 +137,8 @@ bash run.sh
 export P2C_PROVIDER="codex"  # or "claude"
 export P2C_CODEX_CMD="codex exec"
 export P2C_CLAUDE_CMD="claude -p"
+export P2C_PIPELINE_MODE="original"  # or "enhanced"
+export P2C_PYTHON_BIN="python3"
 
 cd scripts
 bash run_latex.sh
@@ -138,15 +150,34 @@ bash run_latex.sh
 
 ```bash
 # Using the PDF-based JSON format of the paper
+export P2C_PIPELINE_MODE="original"  # or "enhanced"
+export P2C_PYTHON_BIN="python3"
+
 cd scripts
-bash run_llm.sh
+bash run_json_llm.sh
 ```
 
 ```bash
 # Using the LaTeX source of the paper
+export P2C_PIPELINE_MODE="original"  # or "enhanced"
+export P2C_PYTHON_BIN="python3"
+
 cd scripts
 bash run_latex_llm.sh
+
+### Runner Naming
+- `scripts/run_pdf.sh`: PDF-first Codex/Claude pipeline
+- `scripts/run_json.sh`: JSON-first Codex/Claude pipeline
+- `scripts/run_latex.sh`: LaTeX-first Codex/Claude pipeline
+- `scripts/run_json_llm.sh`: JSON-first open-source model pipeline
+- `scripts/run_latex_llm.sh`: LaTeX-first open-source model pipeline
+- The old names `scripts/run.sh`, `scripts/run_llm.sh`, and `scripts/run_molecular_codex.sh` remain as compatibility wrappers.
 ```
+
+### Prompt Sets
+- `prompts/original`: baseline planning, analysis, and coding prompts.
+- `prompts/enhanced`: structured extraction, planning verification/refinement, and assumption-aware enhanced prompts.
+- `P2C_PROMPT_SET` can be used to override the prompt set explicitly. By default it follows `P2C_PIPELINE_MODE`.
 
 ---
 

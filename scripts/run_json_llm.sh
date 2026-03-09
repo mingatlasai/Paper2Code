@@ -6,7 +6,9 @@ MAX_REPAIR_ATTEMPTS="${P2C_MAX_REPAIR_ATTEMPTS:-2}"
 PYTHON_BIN="${P2C_PYTHON_BIN:-python3}"
 
 PAPER_NAME="Transformer"
-PDF_LATEX_CLEANED_PATH="../examples/Transformer_cleaned.tex" # _cleaned.tex
+PDF_PATH="../examples/Transformer.pdf" # .pdf
+PDF_JSON_PATH="../examples/Transformer.json" # .json
+PDF_JSON_CLEANED_PATH="../examples/Transformer_cleaned.json" # _cleaned.json
 OUTPUT_DIR="../outputs/Transformer_dscoder"
 OUTPUT_REPO_DIR="../outputs/Transformer_dscoder_repo"
 
@@ -15,6 +17,13 @@ mkdir -p $OUTPUT_REPO_DIR
 
 echo $PAPER_NAME
 
+echo "------- Preprocess -------"
+
+${PYTHON_BIN} ../codes/0_pdf_process.py \
+    --input_json_path ${PDF_JSON_PATH} \
+    --output_json_path ${PDF_JSON_CLEANED_PATH} \
+
+
 echo "------- PaperCoder -------"
 
 if [[ "${PIPELINE_MODE}" == "enhanced" ]]; then
@@ -22,8 +31,7 @@ ${PYTHON_BIN} ../codes/structured_extraction.py \
     --paper_name $PAPER_NAME \
     --model_name ${MODEL_NAME} \
     --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --prompt_set ${PROMPT_SET}
 fi
@@ -32,8 +40,7 @@ ${PYTHON_BIN} ../codes/1_planning_llm.py \
     --paper_name $PAPER_NAME \
     --model_name ${MODEL_NAME} \
     --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --pipeline_mode ${PIPELINE_MODE} \
     --prompt_set ${PROMPT_SET}
@@ -43,8 +50,7 @@ ${PYTHON_BIN} ../codes/planning_verifier.py \
     --paper_name $PAPER_NAME \
     --model_name ${MODEL_NAME} \
     --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --prompt_set ${PROMPT_SET}
 
@@ -65,8 +71,7 @@ ${PYTHON_BIN} ../codes/2_analyzing_llm.py \
     --paper_name $PAPER_NAME \
     --model_name ${MODEL_NAME} \
     --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --pipeline_mode ${PIPELINE_MODE} \
     --prompt_set ${PROMPT_SET}
@@ -75,8 +80,7 @@ ${PYTHON_BIN} ../codes/3_coding_llm.py  \
     --paper_name $PAPER_NAME \
     --model_name ${MODEL_NAME} \
     --tp_size ${TP_SIZE} \
-    --pdf_latex_path ${PDF_LATEX_CLEANED_PATH} \
-    --paper_format LaTeX \
+    --pdf_json_path ${PDF_JSON_CLEANED_PATH} \
     --output_dir ${OUTPUT_DIR} \
     --output_repo_dir ${OUTPUT_REPO_DIR} \
     --pipeline_mode ${PIPELINE_MODE} \

@@ -1,0 +1,36 @@
+Your goal is to create a concise, usable, and complete software system design for reproducing the paper's method. Use appropriate open-source libraries and keep the overall architecture simple.
+
+Based on the plan for reproducing the paper's main method, please design a concise, usable, and complete software system.
+Keep the architecture simple and make effective use of open-source libraries.
+
+-----
+
+## Format Example
+[CONTENT]
+{
+    "Implementation approach": "We will ...",
+    "File list": [
+        "main.py",
+        "dataset_loader.py",
+        "model.py",
+        "trainer.py",
+        "evaluation.py"
+    ],
+    "Data structures and interfaces": "Use mermaid classDiagram syntax.",
+    "Program call flow": "Use sequenceDiagram syntax.",
+    "Anything UNCLEAR": "List ambiguities."
+}
+[/CONTENT]
+
+## Nodes
+- Implementation approach: summarize the solution strategy.
+- File list: relative paths only. ALWAYS include main.py or app.py.
+- Data structures and interfaces: detailed mermaid classDiagram.
+- Program call flow: detailed mermaid sequenceDiagram.
+- Anything UNCLEAR: mention ambiguities.
+
+## Constraint
+Format: output wrapped inside [CONTENT][/CONTENT] like the format example, nothing else.
+
+## Action
+Follow the instructions for the nodes, generate the output, and ensure it follows the format example.
